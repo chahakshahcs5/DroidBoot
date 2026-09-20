@@ -10,7 +10,7 @@
 #include "../xhci/xhci.h"
 
 #define MAX_OS_ENTRIES 8
-#define MAX_PERSISTENCE_PROFILES 4
+#define MAX_PERSISTENCE_PROFILES 8
 
 typedef struct {
     char     profile_name[32]; // e.g. "Work Profile", "Personal Profile", "Clean Disposable"
@@ -60,6 +60,8 @@ typedef struct os_registry {
 } os_registry_t;
 
 void os_registry_init(os_registry_t *reg);
+
+int  os_add_custom_profile(os_entry_t *entry, const char *name, const char *filename, uint64_t size_bytes);
 
 int  os_scan_all_storages(boot_info_t *boot_info,
                           xhci_controller_t *xhci,

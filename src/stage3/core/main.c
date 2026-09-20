@@ -20,6 +20,7 @@
 #include "../bios/vbe.h"
 #include "../bios/bios_disk.h"
 #include "../image/os_scanner.h"
+#include "../adb/adb.h"
 
 static xhci_controller_t xhci_ctrl;
 static usb_device_t      detected_usb_dev;
@@ -566,6 +567,14 @@ void c_main(boot_info_t *boot_info) {
                     vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
                     log_info("STAGE3", "Phase 4 USB Enumeration Successfully Verified!");
                     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+                    if (current_dev.has_adb) {
+                        log_info("STAGE3", "Port %u: Android ADB interface detected! Initializing Strategy A root handshake...", p);
+                        adb_session_t adb_sess;
+                        if (adb_init_session(&current_dev, &adb_sess) == 0) {
+                            adb_trigger_mass_storage(&adb_sess, NULL);
+                        }
+                    }
 
                     if (current_dev.has_msc) {
                         log_info("STAGE3", "Port %u: USB Mass Storage Block Storage registered.", p);

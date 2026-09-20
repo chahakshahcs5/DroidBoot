@@ -206,8 +206,50 @@ void menu_show_diagnostics(boot_info_t *boot_info, xhci_controller_t *xhci,
     printk("=== END DIAGNOSTICS ===\n\n");
 }
 
+uint64_t menu_prompt_profile_size(void) {
+    // Drain input
+    while (poll_input_char() != -1) {
+        for (int w = 0; w < 100; w++) io_wait();
+    }
+
+    vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+    printk("\n======================================================================\n");
+    printk("  PERSISTENCE OVERLAY CAPACITY SELECTOR\n");
+    printk("======================================================================\n");
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    printk("Select virtual storage capacity (allocated as sparse file on phone):\n");
+    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    printk("  [1] 2 GB  (Light - Web browsing, documents, config files)\n");
+    printk("  [2] 4 GB  (Standard - Recommended for general use & software)\n");
+    printk("  [3] 8 GB  (Developer - Large IDEs, compilers, Docker tools)\n");
+    printk("  [4] 16 GB (Heavy Workstation - Full Linux software space)\n");
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    printk("  * Sparse allocation: Initially consumes only ~35 MB on phone!\n");
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    printk("\n[SIZE] Select persistence capacity [1-4]: ");
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+    while (1) {
+        int ch = poll_input_char();
+        if (ch == '1') {
+            printk("1 (2 GB)\n[SIZE] Allocated 2 GB sparse overlay capacity.\n\n");
+            return (uint64_t)2 * 1024 * 1024 * 1024;
+        } else if (ch == '2') {
+            printk("2 (4 GB)\n[SIZE] Allocated 4 GB standard overlay capacity.\n\n");
+            return (uint64_t)4 * 1024 * 1024 * 1024;
+        } else if (ch == '3') {
+            printk("3 (8 GB)\n[SIZE] Allocated 8 GB developer overlay capacity.\n\n");
+            return (uint64_t)8 * 1024 * 1024 * 1024;
+        } else if (ch == '4') {
+            printk("4 (16 GB)\n[SIZE] Allocated 16 GB workstation overlay capacity.\n\n");
+            return (uint64_t)16 * 1024 * 1024 * 1024;
+        }
+        for (int w = 0; w < 1000; w++) io_wait();
+    }
+}
+
 int menu_select_persistence_profile(os_entry_t *entry) {
-    if (!entry || entry->profile_count <= 1) return 0;
+    if (!entry) return 0;
 
     // Drain any leftover input characters from previous menu selection
     while (poll_input_char() != -1) {
@@ -234,8 +276,15 @@ int menu_select_persistence_profile(os_entry_t *entry) {
         }
     }
 
+    // Additional option: Create New Custom Profile
+    uint32_t create_opt = entry->profile_count + 1;
+    vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+    printk("  [%u] [+] Create New Custom Profile...\n", create_opt);
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    printk("      * Choose custom virtual capacity (2GB, 4GB, 8GB, 16GB)\n");
+
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-    printk("\n[PROFILE] Select persistence profile [1-%u]: ", entry->profile_count);
+    printk("\n[PROFILE] Select persistence profile [1-%u]: ", create_opt);
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
     // Wait indefinitely for explicit user selection (zero auto-selection)
@@ -246,6 +295,21 @@ int menu_select_persistence_profile(os_entry_t *entry) {
             printk("%c\n[PROFILE] User selected [%d]: %s\n\n",
                    ch, selected + 1, entry->profiles[selected].profile_name);
             return selected;
+        }
+        if (ch == '0' + (int)create_opt) {
+            printk("%c\n[PROFILE] User selected [%d]: Create New Custom Profile\n",
+                   ch, create_opt);
+            uint64_t chosen_size = menu_prompt_profile_size();
+            uint32_t mb = (uint32_t)(chosen_size / 1024 / 1024);
+            char prof_name[32];
+            snprintf(prof_name, sizeof(prof_name), "Custom Profile (%u MB)", mb);
+            char prof_file[64];
+            snprintf(prof_file, sizeof(prof_file), "custom_%uMB.casper-rw", mb);
+            int new_idx = os_add_custom_profile(entry, prof_name, prof_file, chosen_size);
+            if (new_idx >= 0) {
+                return new_idx;
+            }
+            return 0;
         }
         for (int w = 0; w < 1000; w++) io_wait();
     }

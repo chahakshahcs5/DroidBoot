@@ -170,6 +170,17 @@ static void populate_os_persistence_profiles(os_entry_t *entry) {
     }
 }
 
+int os_add_custom_profile(os_entry_t *entry, const char *name, const char *filename, uint64_t size_bytes) {
+    if (!entry || entry->profile_count >= MAX_PERSISTENCE_PROFILES) return -1;
+
+    persistence_profile_t *p = &entry->profiles[entry->profile_count++];
+    copy_str(p->profile_name, name ? name : "Custom Profile", sizeof(p->profile_name));
+    copy_str(p->filename, filename ? filename : "custom.casper-rw", sizeof(p->filename));
+    p->file_size = size_bytes;
+    p->is_clean_session = false;
+    return (int)(entry->profile_count - 1);
+}
+
 // -----------------------------------------------------------------------------
 // 1. Scan USB Block Storage (MSC) - Approach 1: On-Demand Direct Block Access
 // -----------------------------------------------------------------------------

@@ -272,11 +272,13 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
     // 7. Parse Interfaces and Endpoints
     out_dev->has_mtp = false;
     out_dev->has_msc = false;
+    out_dev->has_adb = false;
     uint8_t *ptr = out_dev->config_buf;
     uint8_t *end = ptr + total_len;
 
     bool current_is_mtp = false;
     bool current_is_msc = false;
+    bool current_is_adb = false;
     uint8_t cur_iface_num = 0;
 
     while (ptr + 2 <= end) {
@@ -299,9 +301,15 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
             bool is_msc = (iface->bInterfaceClass == USB_CLASS_MASS_STORAGE &&
                            iface->bInterfaceProtocol == 0x50);
 
+            // Check if ADB: Vendor-Specific (0xFF / 0x42 / 0x01)
+            bool is_adb = (iface->bInterfaceClass == USB_CLASS_VENDOR_SPECIFIC &&
+                           iface->bInterfaceSubClass == USB_SUBCLASS_ADB &&
+                           iface->bInterfaceProtocol == USB_PROTO_ADB);
+
             if (is_std_mtp || is_android_mtp) {
                 current_is_mtp = true;
                 current_is_msc = false;
+                current_is_adb = false;
                 out_dev->has_mtp = true;
                 out_dev->mtp_iface_num = cur_iface_num;
                 log_info("USB", "  Interface %u: %s MTP INTERFACE (Class=0x%02X, Subclass=0x%02X, Proto=0x%02X)",
@@ -310,13 +318,23 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
             } else if (is_msc) {
                 current_is_mtp = false;
                 current_is_msc = true;
+                current_is_adb = false;
                 out_dev->has_msc = true;
                 out_dev->msc_iface_num = cur_iface_num;
                 log_info("USB", "  Interface %u: USB MASS STORAGE (Class=0x08, Subclass=0x%02X, Proto=0x50)",
                          cur_iface_num, iface->bInterfaceSubClass);
+            } else if (is_adb) {
+                current_is_mtp = false;
+                current_is_msc = false;
+                current_is_adb = true;
+                out_dev->has_adb = true;
+                out_dev->adb_iface_num = cur_iface_num;
+                log_info("USB", "  Interface %u: ANDROID ADB INTERFACE (Class=0xFF, Subclass=0x42, Proto=0x01)",
+                         cur_iface_num);
             } else {
                 current_is_mtp = false;
                 current_is_msc = false;
+                current_is_adb = false;
                 log_info("USB", "  Interface %u: Class=0x%02X, Subclass=0x%02X, Protocol=0x%02X",
                          cur_iface_num, iface->bInterfaceClass, iface->bInterfaceSubClass, iface->bInterfaceProtocol);
             }
@@ -347,6 +365,16 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
                     out_dev->msc_bulk_out_ep = ep_addr;
                     out_dev->msc_bulk_out_max_packet = ep_max_pkt;
                     log_info("MSC", "    -> MSC Bulk OUT Endpoint: 0x%02X (MaxPacket: %u)", ep_addr, ep_max_pkt);
+                }
+            } else if (current_is_adb && ep_type == 2) {
+                if (ep_addr & 0x80) {
+                    out_dev->adb_bulk_in_ep = ep_addr;
+                    out_dev->adb_bulk_in_max_packet = ep_max_pkt;
+                    log_info("ADB", "    -> ADB Bulk IN Endpoint:  0x%02X (MaxPacket: %u)", ep_addr, ep_max_pkt);
+                } else {
+                    out_dev->adb_bulk_out_ep = ep_addr;
+                    out_dev->adb_bulk_out_max_packet = ep_max_pkt;
+                    log_info("ADB", "    -> ADB Bulk OUT Endpoint: 0x%02X (MaxPacket: %u)", ep_addr, ep_max_pkt);
                 }
             }
         }
@@ -482,6 +510,15 @@ int usb_configure_mtp_endpoints(usb_device_t *dev) {
     return usb_configure_bulk_endpoints(dev,
                                         dev->mtp_bulk_in_ep, dev->mtp_bulk_in_max_packet,
                                         dev->mtp_bulk_out_ep, dev->mtp_bulk_out_max_packet);
+}
+
+int usb_configure_adb_endpoints(usb_device_t *dev) {
+    if (!dev || !dev->has_adb) return -1;
+    log_info("USB", "Configuring ADB Bulk Endpoints: IN=0x%02X, OUT=0x%02X...",
+             dev->adb_bulk_in_ep, dev->adb_bulk_out_ep);
+    return usb_configure_bulk_endpoints(dev,
+                                        dev->adb_bulk_in_ep, dev->adb_bulk_in_max_packet,
+                                        dev->adb_bulk_out_ep, dev->adb_bulk_out_max_packet);
 }
 
 int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t len, uint32_t *transferred_out) {

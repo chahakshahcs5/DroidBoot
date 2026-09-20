@@ -27,7 +27,8 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
 
 menu_selection_t menu_wait_selection(const os_registry_t *registry);
 
-int  menu_select_persistence_profile(os_entry_t *entry);
+int      menu_select_persistence_profile(os_entry_t *entry);
+uint64_t menu_prompt_profile_size(void);
 
 void menu_show_diagnostics(boot_info_t *boot_info, xhci_controller_t *xhci,
                            usb_device_t *usb_dev, mtp_session_t *mtp_session);
