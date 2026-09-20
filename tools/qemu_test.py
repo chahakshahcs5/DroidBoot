@@ -59,6 +59,7 @@ def main():
 
     qemu_cmd = [
         "qemu-system-x86_64",
+        "-snapshot",
         "-drive", f"file={BOOT_IMG},format=raw,if=ide",
         "-device", "qemu-xhci,id=xhci",
         "-device", "usb-tablet,bus=xhci.0",

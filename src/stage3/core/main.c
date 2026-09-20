@@ -185,6 +185,7 @@ void c_main(boot_info_t *boot_info) {
             // Multi-pass debounce & poll loop (up to 3 seconds) for Android USB PHY negotiation
             log_info("XHCI", "Waiting for Android phone to connect and stabilize on root hub...");
             bool mtp_found = false;
+            uint32_t probed_ports = 0;
 
             for (int poll_iter = 0; poll_iter < 30 && !mtp_found; poll_iter++) {
                 if (poll_iter > 0) {
@@ -195,6 +196,8 @@ void c_main(boot_info_t *boot_info) {
                 xhci_poll_ports(&xhci_ctrl);
 
                 for (uint8_t p = 1; p <= xhci_ctrl.max_ports; p++) {
+                    if (probed_ports & (1U << p)) continue; // Already successfully enumerated
+
                     uintptr_t port_reg = xhci_ctrl.op_regs + XHCI_OP_PORTS_BASE + (p - 1) * 0x10;
                     uint32_t portsc = *(volatile uint32_t *)port_reg;
 
@@ -204,6 +207,11 @@ void c_main(boot_info_t *boot_info) {
                         log_info("STAGE3", "Probing USB device on Port %u...", p);
                         int probe_res = usb_probe_port(&xhci_ctrl, p, &current_dev);
                         if (probe_res == 0) {
+                            probed_ports |= (1U << p);
+                            vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                            log_info("STAGE3", "Phase 4 USB Enumeration Successfully Verified!");
+                            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
                             if (current_dev.has_mtp) {
                                 detected_usb_dev = current_dev;
                                 log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
