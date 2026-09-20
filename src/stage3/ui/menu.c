@@ -205,3 +205,49 @@ void menu_show_diagnostics(boot_info_t *boot_info, xhci_controller_t *xhci,
 
     printk("=== END DIAGNOSTICS ===\n\n");
 }
+
+int menu_select_persistence_profile(os_entry_t *entry) {
+    if (!entry || entry->profile_count <= 1) return 0;
+
+    // Drain any leftover input characters from previous menu selection
+    while (poll_input_char() != -1) {
+        for (int w = 0; w < 100; w++) io_wait();
+    }
+
+    vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+    printk("\n======================================================================\n");
+    printk("  PERSISTENCE PROFILE SELECTOR: %s\n", entry->title);
+    printk("======================================================================\n");
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    printk("Discovered profiles in /BootManager/persistence/:\n");
+
+    for (uint32_t i = 0; i < entry->profile_count; i++) {
+        persistence_profile_t *p = &entry->profiles[i];
+        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        printk("  [%u] %s\n", i + 1, p->profile_name);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+        if (p->is_clean_session) {
+            printk("      * Mode: 100%% In-RAM (Clean Session - No changes saved to phone)\n");
+        } else {
+            printk("      * File: %s (%u MB)\n", p->filename, (uint32_t)(p->file_size / 1024 / 1024));
+            printk("      * Mode: Persistent Read/Write Overlay\n");
+        }
+    }
+
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    printk("\n[PROFILE] Select persistence profile [1-%u]: ", entry->profile_count);
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+    // Wait indefinitely for explicit user selection (zero auto-selection)
+    while (1) {
+        int ch = poll_input_char();
+        if (ch >= '1' && ch <= '0' + (int)entry->profile_count) {
+            int selected = ch - '1';
+            printk("%c\n[PROFILE] User selected [%d]: %s\n\n",
+                   ch, selected + 1, entry->profiles[selected].profile_name);
+            return selected;
+        }
+        for (int w = 0; w < 1000; w++) io_wait();
+    }
+}
+

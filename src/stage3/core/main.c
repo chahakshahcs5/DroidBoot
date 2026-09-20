@@ -132,7 +132,7 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
     }
 }
 
-static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info) {
+static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const persistence_profile_t *prof) {
     log_info("BOOT", "Attempting boot from USB Block Storage on Port %u...", dev->port_num);
     boot_source_t *msc_src = boot_source_msc_create(dev);
     if (!msc_src) {
@@ -144,61 +144,64 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info) {
     iso_boot_files_t iso_files;
     int r = iso_find_boot_files(msc_src, &iso_files);
     if (r != 0 || !iso_files.found_kernel) {
-        log_error("BOOT", "No bootable Linux kernel or ISO9660 image found on USB block storage!");
+        log_error("BOOT", "No bootable kernel found on USB block device!");
         sound_error_tone();
+        msc_src->close(msc_src);
         return;
     }
 
-    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
     log_info("BOOT", "==========================================================");
     log_info("BOOT", "  BOOTABLE OS DETECTED ON USB BLOCK DEVICE!               ");
-    log_info("BOOT", "  * Distro Type    : %s", iso_files.is_casper ? "Ubuntu / Casper Live (6GB)" : "Alpine / Standard Linux");
+    log_info("BOOT", "  * Distro Type    : %s", iso_files.is_casper ? "Ubuntu / Casper Live (6GB)" : "Linux Live System");
     log_info("BOOT", "  * Kernel LBA     : %u (Size: %u MB)", iso_files.kernel_lba, iso_files.kernel_size / 1024 / 1024);
     log_info("BOOT", "  * Initramfs LBA  : %u (Size: %u MB)", iso_files.initrd_lba, iso_files.initrd_size / 1024 / 1024);
     log_info("BOOT", "  * Mode           : Direct Block Access (0 MB OS in RAM!) ");
+    if (prof) {
+        log_info("BOOT", "  * Persistence    : %s (%s)", prof->profile_name, prof->filename);
+    }
     log_info("BOOT", "==========================================================");
-    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
+    // Read ONLY kernel (16MB) and initrd (91MB) into RAM
     void *kernel_buf = (void *)0x02000000;
     void *initrd_buf = (void *)0x04000000;
 
     log_info("BOOT", "Streaming tiny kernel (%u MB) from block device into RAM...", iso_files.kernel_size / 1024 / 1024);
     msc_src->seek(msc_src, (uint64_t)iso_files.kernel_lba * 2048);
-    uint32_t k_read = msc_src->read(msc_src, kernel_buf, iso_files.kernel_size);
-    if (k_read != iso_files.kernel_size) {
-        log_error("BOOT", "Kernel read incomplete: %u / %u bytes", k_read, iso_files.kernel_size);
-        sound_error_tone();
-        return;
-    }
+    msc_src->read(msc_src, kernel_buf, iso_files.kernel_size);
 
     if (iso_files.found_initrd) {
         log_info("BOOT", "Streaming initramfs (%u MB) from block device into RAM...", iso_files.initrd_size / 1024 / 1024);
         msc_src->seek(msc_src, (uint64_t)iso_files.initrd_lba * 2048);
-        uint32_t i_read = msc_src->read(msc_src, initrd_buf, iso_files.initrd_size);
-        if (i_read != iso_files.initrd_size) {
-            log_error("BOOT", "Initramfs read incomplete: %u / %u bytes", i_read, iso_files.initrd_size);
-            sound_error_tone();
-            return;
-        }
+        msc_src->read(msc_src, initrd_buf, iso_files.initrd_size);
     }
+
+    msc_src->close(msc_src);
 
     linux_kernel_info_t kinfo;
     if (linux_check_kernel_image(kernel_buf, iso_files.kernel_size, &kinfo) != 0) {
-        log_error("BOOT", "Kernel image validation failed!");
+        log_error("BOOT", "Failed to validate kernel image from block device!");
         sound_error_tone();
         return;
     }
 
     // Determine kernel command line:
-    // For Ubuntu / Casper live: boot directly from phone block storage on-demand with persistence
-    // For Alpine on block device: boot with sd-mod, usb-storage and apkovl persistence
     char cmdline[256];
     if (iso_files.is_casper) {
-        snprintf(cmdline, sizeof(cmdline),
-                 "boot=casper persistent console=tty0 quiet splash");
+        if (prof && prof->is_clean_session) {
+            snprintf(cmdline, sizeof(cmdline),
+                     "boot=casper console=tty0 quiet splash");
+        } else {
+            snprintf(cmdline, sizeof(cmdline),
+                     "boot=casper persistent persistent-path=/BootManager/persistence/ console=tty0 quiet splash");
+        }
     } else {
-        snprintf(cmdline, sizeof(cmdline),
-                 "modules=loop,squashfs,sd-mod,usb-storage console=tty0 apkovl=sda1:");
+        if (prof && prof->is_clean_session) {
+            snprintf(cmdline, sizeof(cmdline),
+                     "modules=loop,squashfs,sd-mod,usb-storage console=tty0");
+        } else {
+            snprintf(cmdline, sizeof(cmdline),
+                     "modules=loop,squashfs,sd-mod,usb-storage console=tty0 apkovl=sda1:");
+        }
     }
 
     // Switch to VBE Linear Framebuffer mode (activates HDMI external display & ANSI colors & scrollback)
@@ -245,7 +248,7 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info) {
                     kinfo.code32_start);
 }
 
-static void boot_from_android_mtp(mtp_session_t *session, boot_info_t *boot_info) {
+static void boot_from_android_mtp(mtp_session_t *session, boot_info_t *boot_info, const persistence_profile_t *prof) {
     log_info("BOOT", "Attempting boot from Android Phone (MTP)...");
     if (!session || !session->session_active) {
         log_error("BOOT", "Android MTP session not active!");
@@ -282,6 +285,9 @@ static void boot_from_android_mtp(mtp_session_t *session, boot_info_t *boot_info
     if (iso_find_boot_files(mtp_src, &iso_files) == 0 && iso_files.found_kernel) {
         log_info("BOOT", "Bootable ISO detected! (%s)",
                  iso_files.is_casper ? "Ubuntu / Casper Live" : "Alpine Linux");
+        if (prof) {
+            log_info("BOOT", "  * Persistence    : %s (%s)", prof->profile_name, prof->filename);
+        }
 
         uint32_t total_iso_bytes = (uint32_t)fsize;
         uint8_t *ram_iso = (uint8_t *)LINUX_RAM_ISO_PHYS;
@@ -350,11 +356,17 @@ static void boot_from_android_mtp(mtp_session_t *session, boot_info_t *boot_info
             // Install mBFT table at 0x000E0000 for Alpine memdiskfind
             linux_setup_mbft(LINUX_RAM_ISO_PHYS, total_iso_bytes);
 
-            // Kernel command line: phram + memmap + memdisk + apkovl=sda1: (SD card persistence!)
+            // Kernel command line: phram + memmap + memdisk + (optional) apkovl (persistence)
             char alpine_cmdline[256];
-            snprintf(alpine_cmdline, sizeof(alpine_cmdline),
-                     "modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes console=tty0 loglevel=7 apkovl=sda1:",
-                     LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
+            if (prof && prof->is_clean_session) {
+                snprintf(alpine_cmdline, sizeof(alpine_cmdline),
+                         "modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes console=tty0 loglevel=7",
+                         LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
+            } else {
+                snprintf(alpine_cmdline, sizeof(alpine_cmdline),
+                         "modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes console=tty0 loglevel=7 apkovl=sda1:",
+                         LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
+            }
 
             // Switch to VBE Linear Framebuffer mode
             vbe_mode_info_t vbe_mode = {0};
@@ -381,7 +393,12 @@ static void boot_from_android_mtp(mtp_session_t *session, boot_info_t *boot_info
             log_info("BOOT", "  HANDING OFF TO IN-RAM LINUX WITH SD PERSISTENCE         ");
             log_info("BOOT", "  * In-RAM ISO     : 0x%08X (%u MB, Type 2 RESERVED)     ",
                      LINUX_RAM_ISO_PHYS, total_iso_bytes / 1024 / 1024);
-            log_info("BOOT", "  * Persistence    : apkovl=sda1: (SD card FAT32 overlay) ");
+            if (prof && prof->is_clean_session) {
+                log_info("BOOT", "  * Persistence    : Clean Session (100%% In-RAM, no saved changes)");
+            } else {
+                log_info("BOOT", "  * Persistence    : %s (apkovl=sda1: / /BootManager/persistence/)",
+                         prof ? prof->profile_name : "Default");
+            }
             log_info("BOOT", "==========================================================");
             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
@@ -682,14 +699,21 @@ void c_main(boot_info_t *boot_info) {
             if (choice.os_index < os_reg.count) {
                 os_entry_t *selected = &os_reg.entries[choice.os_index];
                 log_info("BOOT", "Booting selected OS #%u: '%s'...", choice.os_index + 1, selected->title);
+
+                if (selected->profile_count > 1) {
+                    selected->selected_profile = menu_select_persistence_profile(selected);
+                }
+                const persistence_profile_t *prof = (selected->profile_count > 0) ?
+                    &selected->profiles[selected->selected_profile] : NULL;
+
                 if (selected->approach == BOOT_APPROACH_BLOCK_ON_DEMAND) {
                     if (selected->storage_type == OS_STORAGE_BLOCK_USB) {
-                        boot_from_usb_msc(selected->usb_dev, boot_info);
+                        boot_from_usb_msc(selected->usb_dev, boot_info, prof);
                     } else if (selected->storage_type == OS_STORAGE_BLOCK_SD) {
                         boot_from_sd_fat(selected, boot_info);
                     }
                 } else if (selected->approach == BOOT_APPROACH_MTP_IN_RAM) {
-                    boot_from_android_mtp(&active_mtp_session, boot_info);
+                    boot_from_android_mtp(&active_mtp_session, boot_info, prof);
                 }
             }
             break;

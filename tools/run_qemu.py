@@ -134,6 +134,8 @@ def main():
                         help="RAM size for VM (default: 2048M)")
     parser.add_argument("--headless", action="store_true",
                         help="Run without graphical display window")
+    parser.add_argument("--profile", choices=["work", "personal", "clean", ""], default="",
+                        help="Target persistence profile to select at runtime (e.g. 'work', 'personal', 'clean')")
     parser.add_argument("--usb-host", default="",
                         help="Pass-through real physical USB phone (VID:PID, e.g. 2717:ff40)")
 
@@ -153,6 +155,8 @@ def main():
     print("  LAUNCHING DESKTOP QEMU TEST ENVIRONMENT")
     print(f"  Mode       : {args.mode.upper()}")
     print(f"  Target ISO : {iso_path}")
+    if args.profile:
+        print(f"  Profile    : {args.profile.upper()} (Select corresponding profile number in sub-menu)")
     print(f"  Memory     : {args.memory}")
     print(f"  Display    : {'Headless' if args.headless else 'Interactive Graphical Window'}")
     print("=" * 70 + "\n")

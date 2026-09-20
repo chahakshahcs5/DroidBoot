@@ -10,6 +10,15 @@
 #include "../xhci/xhci.h"
 
 #define MAX_OS_ENTRIES 8
+#define MAX_PERSISTENCE_PROFILES 4
+
+typedef struct {
+    char     profile_name[32]; // e.g. "Work Profile", "Personal Profile", "Clean Disposable"
+    char     filename[64];     // e.g. "ubuntu_work.casper-rw", "alpine_dev.apkovl.tar.gz"
+    uint64_t file_size;        // Size in bytes
+    uint32_t mtp_handle;       // PTP handle if MTP
+    bool     is_clean_session; // True for non-persistent disposable session
+} persistence_profile_t;
 
 typedef enum {
     OS_STORAGE_BLOCK_USB,    // USB Mass Storage / Rooted Phone (Approach 1: Direct Block)
@@ -38,6 +47,11 @@ typedef struct os_entry {
     // Approach 2 (MTP in-RAM):
     uint32_t          mtp_handle;
     mtp_session_t    *mtp_session;
+
+    // Multi-profile persistence (/BootManager/persistence/):
+    persistence_profile_t profiles[MAX_PERSISTENCE_PROFILES];
+    uint32_t               profile_count;
+    uint32_t               selected_profile;
 } os_entry_t;
 
 typedef struct os_registry {

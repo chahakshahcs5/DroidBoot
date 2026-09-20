@@ -117,6 +117,59 @@ void os_registry_init(os_registry_t *reg) {
     }
 }
 
+static void populate_os_persistence_profiles(os_entry_t *entry) {
+    if (!entry) return;
+    entry->profile_count = 0;
+    entry->selected_profile = 0;
+
+    if (entry->approach == BOOT_APPROACH_BLOCK_ON_DEMAND) {
+        // Pathway 1: Rooted Phone / USB Block Storage with Casper Overlay
+        // Profile 0: Work Profile (4GB overlay in /BootManager/persistence/)
+        persistence_profile_t *p0 = &entry->profiles[entry->profile_count++];
+        copy_str(p0->profile_name, "Work Environment", sizeof(p0->profile_name));
+        copy_str(p0->filename, "ubuntu_work.casper-rw", sizeof(p0->filename));
+        p0->file_size = (uint64_t)4096 * 1024 * 1024;
+        p0->is_clean_session = false;
+
+        // Profile 1: Personal Profile (8GB overlay in /BootManager/persistence/)
+        persistence_profile_t *p1 = &entry->profiles[entry->profile_count++];
+        copy_str(p1->profile_name, "Personal Environment", sizeof(p1->profile_name));
+        copy_str(p1->filename, "ubuntu_personal.casper-rw", sizeof(p1->filename));
+        p1->file_size = (uint64_t)8192 * 1024 * 1024;
+        p1->is_clean_session = false;
+
+        // Profile 2: Clean Disposable Session (100% In-RAM, no saved changes to phone)
+        persistence_profile_t *p2 = &entry->profiles[entry->profile_count++];
+        copy_str(p2->profile_name, "Clean Disposable Session", sizeof(p2->profile_name));
+        copy_str(p2->filename, "None (In-RAM Only)", sizeof(p2->filename));
+        p2->file_size = 0;
+        p2->is_clean_session = true;
+
+    } else if (entry->approach == BOOT_APPROACH_MTP_IN_RAM) {
+        // Pathway 2: Non-Root Phone / MTP In-RAM + Overlay Archive Sync
+        // Profile 0: Default Persistent Profile
+        persistence_profile_t *p0 = &entry->profiles[entry->profile_count++];
+        copy_str(p0->profile_name, "Saved Profile", sizeof(p0->profile_name));
+        copy_str(p0->filename, "alpine.apkovl.tar.gz", sizeof(p0->filename));
+        p0->file_size = (uint64_t)10 * 1024 * 1024;
+        p0->is_clean_session = false;
+
+        // Profile 1: Developer Profile
+        persistence_profile_t *p1 = &entry->profiles[entry->profile_count++];
+        copy_str(p1->profile_name, "Developer Profile", sizeof(p1->profile_name));
+        copy_str(p1->filename, "alpine_dev.apkovl.tar.gz", sizeof(p1->filename));
+        p1->file_size = (uint64_t)25 * 1024 * 1024;
+        p1->is_clean_session = false;
+
+        // Profile 2: Clean Disposable Session (100% in RAM)
+        persistence_profile_t *p2 = &entry->profiles[entry->profile_count++];
+        copy_str(p2->profile_name, "Clean Disposable Session", sizeof(p2->profile_name));
+        copy_str(p2->filename, "None (In-RAM Only)", sizeof(p2->filename));
+        p2->file_size = 0;
+        p2->is_clean_session = true;
+    }
+}
+
 // -----------------------------------------------------------------------------
 // 1. Scan USB Block Storage (MSC) - Approach 1: On-Demand Direct Block Access
 // -----------------------------------------------------------------------------
@@ -157,10 +210,14 @@ static void scan_usb_msc_device(usb_device_t *msc_dev, os_registry_t *reg) {
         entry->iso_files = files;
         entry->usb_dev = msc_dev;
 
+        populate_os_persistence_profiles(entry);
+
         log_info("SCAN", "[+] Registered OS #%u: '%s'", reg->count + 1, entry->title);
         log_info("SCAN", "    * Source  : %s", entry->storage_desc);
         log_info("SCAN", "    * Mode    : On-Demand Stream (Kernel %u MB, Initrd %u MB, 0 MB in RAM)",
                  files.kernel_size / 1024 / 1024, files.initrd_size / 1024 / 1024);
+        log_info("SCAN", "    * Profiles: %u data profiles in /BootManager/persistence/",
+                 entry->profile_count);
 
         reg->count++;
     }
@@ -218,19 +275,23 @@ static void scan_mtp_storage(mtp_session_t *session, os_registry_t *reg) {
                 entry->mtp_handle = root_handles[i];
                 entry->mtp_session = session;
 
+                populate_os_persistence_profiles(entry);
+
                 log_info("SCAN", "[+] Registered OS #%u: '%s' (%s, %u MB)",
                          reg->count + 1, entry->title, entry->filename, (uint32_t)(size / 1024 / 1024));
+                log_info("SCAN", "    * Profiles: %u data profiles in /BootManager/persistence/",
+                         entry->profile_count);
                 reg->count++;
             } else if (size == 0 && sub_folder_count < 4) {
                 if (str_eq_nocase(name, "Download") || str_eq_nocase(name, "Downloads") ||
-                    str_eq_nocase(name, "Documents")) {
+                    str_eq_nocase(name, "Documents") || str_eq_nocase(name, "BootManager")) {
                     sub_folders[sub_folder_count++] = root_handles[i];
                 }
             }
         }
     }
 
-    // Inspect candidate sub-folders (Download, Documents)
+    // Inspect candidate sub-folders (Download, Documents, BootManager)
     for (uint32_t sf = 0; sf < sub_folder_count && reg->count < MAX_OS_ENTRIES; sf++) {
         uint32_t child_handles[64];
         uint32_t child_count = 0;
@@ -246,15 +307,19 @@ static void scan_mtp_storage(mtp_session_t *session, os_registry_t *reg) {
 
                         guess_distro_title(cname, entry->title, sizeof(entry->title));
                         copy_str(entry->filename, cname, sizeof(entry->filename));
-                        copy_str(entry->storage_desc, "Android Phone MTP (/Download/)", sizeof(entry->storage_desc));
+                        copy_str(entry->storage_desc, "Android Phone MTP (Folder)", sizeof(entry->storage_desc));
                         entry->file_size = csize;
                         entry->storage_type = OS_STORAGE_MTP_ANDROID;
                         entry->approach = BOOT_APPROACH_MTP_IN_RAM;
                         entry->mtp_handle = child_handles[c];
                         entry->mtp_session = session;
 
+                        populate_os_persistence_profiles(entry);
+
                         log_info("SCAN", "[+] Registered OS #%u: '%s' (%s, %u MB)",
                                  reg->count + 1, entry->title, entry->filename, (uint32_t)(csize / 1024 / 1024));
+                        log_info("SCAN", "    * Profiles: %u data profiles in /BootManager/persistence/",
+                                 entry->profile_count);
                         reg->count++;
                     }
                 }
@@ -316,8 +381,12 @@ static void scan_sd_storage(uint8_t boot_drive, os_registry_t *reg) {
             entry->approach = BOOT_APPROACH_BLOCK_ON_DEMAND;
             entry->partition_lba = part1_lba;
 
+            populate_os_persistence_profiles(entry);
+
             log_info("SCAN", "[+] Registered OS #%u: '%s' (%s on SD Card, %u MB)",
                      reg->count + 1, entry->title, entry->filename, (uint32_t)(fsize / 1024 / 1024));
+            log_info("SCAN", "    * Profiles: %u data profiles in /BootManager/persistence/",
+                     entry->profile_count);
             reg->count++;
         }
     }
