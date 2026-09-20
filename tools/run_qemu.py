@@ -131,8 +131,10 @@ def build_qemu_command(mode, iso_path, memory, headless, usb_host):
         print("    * Persistence writes to SD Card FAT32 partition via apkovl=sda1:.")
 
         # In QEMU, preloading an image directly to physical memory at 0x10000000
+        # Also attach as read-only cdrom so Alpine's nlplug-findfs can mount modloop after handoff
         cmd.extend([
-            "-device", "loader,file=" + iso_path + ",addr=0x10000000,force-raw=on"
+            "-device", "loader,file=" + iso_path + ",addr=0x10000000,force-raw=on",
+            "-drive", f"file={iso_path},media=cdrom,readonly=on"
         ])
 
     return cmd
