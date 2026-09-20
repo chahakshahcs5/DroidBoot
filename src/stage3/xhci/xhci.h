@@ -21,6 +21,7 @@ typedef struct xhci_controller {
     uint8_t   max_slots;
     uint16_t  max_intrs;
     uint8_t   max_ports;
+    uint8_t   context_size; // 32 or 64 bytes (from HCCPARAMS1.CSZ)
     uint32_t  max_scratchpad_bufs;
 
     // Device Context Base Address Array (DCBAA)
@@ -43,5 +44,6 @@ void xhci_poll_ports(xhci_controller_t *ctrl);
 int  xhci_reset_port(xhci_controller_t *ctrl, uint8_t port_id);
 int  xhci_send_command(xhci_controller_t *ctrl, xhci_trb_t *cmd, xhci_trb_t *event_out);
 int  xhci_enable_slot(xhci_controller_t *ctrl, uint8_t *slot_id_out);
+void xhci_stop(xhci_controller_t *ctrl);
 
 #endif // XHCI_H

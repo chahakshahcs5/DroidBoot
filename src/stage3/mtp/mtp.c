@@ -5,94 +5,7 @@
 #include "../memory/memory.h"
 #include <stddef.h>
 
-#define BULK_RING_TRBS 64
-
-int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t len, uint32_t *transferred_out) {
-    if (!dev || !data || len == 0) return -1;
-
-    xhci_controller_t *ctrl = dev->ctrl;
-    uint8_t slot_id = dev->slot_id;
-
-    // Determine target endpoint index for Doorbell:
-    // EP0 = 1, EP1 OUT = 2, EP1 IN = 3, EP2 OUT = 4, EP2 IN = 5, ...
-    // Formula: target = (ep_num * 2) + (is_in ? 1 : 0)
-    uint8_t ep_num = ep_addr & 0x0F;
-    bool is_in = (ep_addr & 0x80) != 0;
-    uint32_t doorbell_target = (ep_num * 2) + (is_in ? 1 : 0);
-
-    xhci_trb_t *ring = is_in ? dev->bulk_in_ring : dev->bulk_out_ring;
-    uint32_t *enqueue_idx_ptr = is_in ? &dev->bulk_in_enqueue_idx : &dev->bulk_out_enqueue_idx;
-    uint8_t *cycle_ptr = is_in ? &dev->bulk_in_cycle_state : &dev->bulk_out_cycle_state;
-
-    if (!ring) {
-        log_error("MTP", "Bulk endpoint 0x%02X ring not initialized!", ep_addr);
-        return -2;
-    }
-
-    uint32_t idx = *enqueue_idx_ptr;
-    xhci_trb_t *trb = &ring[idx++];
-    if (idx >= BULK_RING_TRBS - 1) {
-        idx = 0;
-        *cycle_ptr ^= 1;
-    }
-    *enqueue_idx_ptr = idx;
-
-    trb->parameter = (uintptr_t)data;
-    trb->status = len;
-    trb->control = TRB_TYPE(TRB_NORMAL) | TRB_IOC | (*cycle_ptr ? 1U : 0U);
-
-    uintptr_t trb_phys = (uintptr_t)trb;
-
-    // Ring endpoint doorbell
-    uintptr_t db_reg = ctrl->db_regs + slot_id * 4;
-    xhci_write32(db_reg, doorbell_target);
-
-    // Poll Event Ring for Transfer Event
-    int timeout = 20000;
-    while (--timeout > 0) {
-        xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
-        uint32_t cycle = evt->control & 1U;
-
-        if (cycle == ctrl->event_cycle_state) {
-            uint32_t type = (evt->control >> TRB_TYPE_SHIFT) & 0x3F;
-            uint8_t cc = (uint8_t)((evt->status >> 24) & 0xFF);
-            log_info("MTP", "  Event: Type=%u, CC=%u, Param=0x%08X (expect=0x%08X)",
-                     type, cc, (uint32_t)evt->parameter, (uint32_t)trb_phys);
-            if (type == TRB_TRANSFER_EVENT) {
-                if (evt->parameter == trb_phys) {
-                    ctrl->event_dequeue_idx++;
-                    if (ctrl->event_dequeue_idx == XHCI_EVENT_RING_TRBS) {
-                        ctrl->event_dequeue_idx = 0;
-                        ctrl->event_cycle_state ^= 1;
-                    }
-                    uintptr_t intr0 = ctrl->rt_regs + 0x20;
-                    uintptr_t erdp = (uintptr_t)&ctrl->event_ring[ctrl->event_dequeue_idx];
-                    xhci_write64(intr0 + XHCI_INTR_ERDP, erdp | XHCI_ERDP_EHB);
-
-                    uint8_t cc = (uint8_t)((evt->status >> 24) & 0xFF);
-                    uint32_t rem = evt->status & 0xFFFFFF;
-                    if (transferred_out) {
-                        *transferred_out = len - rem;
-                    }
-                    return (cc == TRB_COMPL_SUCCESS || cc == TRB_COMPL_SHORT_TX) ? 0 : (int)cc;
-                }
-            }
-
-            ctrl->event_dequeue_idx++;
-            if (ctrl->event_dequeue_idx == XHCI_EVENT_RING_TRBS) {
-                ctrl->event_dequeue_idx = 0;
-                ctrl->event_cycle_state ^= 1;
-            }
-            uintptr_t intr0 = ctrl->rt_regs + 0x20;
-            uintptr_t erdp = (uintptr_t)&ctrl->event_ring[ctrl->event_dequeue_idx];
-            xhci_write64(intr0 + XHCI_INTR_ERDP, erdp | XHCI_ERDP_EHB);
-        }
-        for (int w = 0; w < 50; w++) io_wait();
-    }
-
-    log_error("MTP", "Bulk transfer timed out on EP 0x%02X!", ep_addr);
-    return -100;
-}
+#include "../usb/usb.h"
 
 static int mtp_send_cmd(mtp_session_t *s, uint16_t opcode, int num_params, uint32_t p1, uint32_t p2, uint32_t p3) {
     ptp_container_t cmd;
@@ -148,6 +61,20 @@ int mtp_init_session(usb_device_t *dev, mtp_session_t *session) {
     return res;
 }
 
+static void mtp_drain_bulk_in(mtp_session_t *session, uint32_t expected_total, uint32_t received_so_far) {
+    if (received_so_far >= expected_total) return;
+    uint32_t remaining = expected_total - received_so_far;
+    static uint8_t drain_buf[1024];
+    while (remaining > 0) {
+        uint32_t to_read = (remaining > sizeof(drain_buf)) ? sizeof(drain_buf) : remaining;
+        uint32_t transferred = 0;
+        int res = usb_bulk_transfer(session->usb_dev, session->usb_dev->mtp_bulk_in_ep, drain_buf, to_read, &transferred);
+        if (res != 0 || transferred == 0) break;
+        if (transferred >= remaining) break;
+        remaining -= transferred;
+    }
+}
+
 int mtp_get_storage_ids(mtp_session_t *session, uint32_t *storage_ids, uint32_t max_ids, uint32_t *out_count) {
     if (!session || !storage_ids || max_ids == 0) return -1;
 
@@ -183,6 +110,8 @@ int mtp_get_storage_ids(mtp_session_t *session, uint32_t *storage_ids, uint32_t 
         session->active_storage_id = storage_ids[0];
     }
 
+    mtp_drain_bulk_in(session, data_cont->length, received);
+
     ptp_container_t resp;
     return mtp_recv_resp(session, &resp);
 }
@@ -212,6 +141,8 @@ int mtp_get_object_handles(mtp_session_t *session, uint32_t storage_id, uint32_t
         handles[i] = hlist[i];
     }
     if (out_count) *out_count = copy_count;
+
+    mtp_drain_bulk_in(session, data_cont->length, received);
 
     ptp_container_t resp;
     return mtp_recv_resp(session, &resp);
@@ -243,10 +174,14 @@ int mtp_get_object_info(mtp_session_t *session, uint32_t handle, char *out_name,
         const uint16_t *chars = (const uint16_t *)(ds + 53);
         uint32_t i = 0;
         for (; i < num_chars && i < max_name_len - 1; i++) {
-            out_name[i] = (char)(chars[i] & 0x7F);
+            char c = (char)(chars[i] & 0x7F);
+            if (c == '\0') break;
+            out_name[i] = c;
         }
         out_name[i] = '\0';
     }
+
+    mtp_drain_bulk_in(session, data_cont->length, received);
 
     ptp_container_t resp;
     return mtp_recv_resp(session, &resp);
@@ -293,6 +228,8 @@ int mtp_get_object(mtp_session_t *session, uint32_t handle, void *out_buf, uint3
 
     if (actual_len) *actual_len = total_read;
 
+    mtp_drain_bulk_in(session, cont->length, total_read + 12);
+
     ptp_container_t resp;
     return mtp_recv_resp(session, &resp);
 }
@@ -338,6 +275,8 @@ int mtp_get_partial_object(mtp_session_t *session, uint32_t handle, uint32_t off
     }
 
     if (actual_len) *actual_len = total_read;
+
+    mtp_drain_bulk_in(session, cont->length, total_read + 12);
 
     ptp_container_t resp;
     return mtp_recv_resp(session, &resp);

@@ -42,6 +42,13 @@ static inline void sound_error_tone(void) {
     sound_beep(330, 300);
 }
 
+// Two short alert beeps prompting user to select File Transfer on phone
+static inline void sound_prompt_tone(void) {
+    sound_beep(988, 60);
+    for (int i = 0; i < 20000; i++) io_wait();
+    sound_beep(988, 60);
+}
+
 // Fanfare when jumping into Linux kernel
 static inline void sound_kernel_jump_tone(void) {
     sound_beep(1046, 60);
@@ -49,6 +56,12 @@ static inline void sound_kernel_jump_tone(void) {
     sound_beep(1318, 60);
     for (int i = 0; i < 20000; i++) io_wait();
     sound_beep(1568, 120);
+}
+
+// Ensure PC speaker is completely muted
+static inline void sound_silence(void) {
+    uint8_t tmp = inb(0x61);
+    outb(0x61, tmp & ~3);
 }
 
 #endif // SOUND_H

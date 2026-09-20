@@ -9,6 +9,7 @@ import sys
 import os
 import struct
 import argparse
+import time
 
 SECTOR_SIZE = 512
 RAW_LOG_LBA = 256
@@ -21,7 +22,7 @@ def read_raw_log(f) -> tuple[dict, str]:
     if len(hdr_data) < 512:
         return None, "Incomplete read at LBA 256"
 
-    magic1, magic2, log_len, flush_count, boot_drive = struct.unpack_from("<IIIII", hdr_data, 0)
+    magic1, magic2, log_len, flush_count, boot_drive, error_count = struct.unpack_from("<IIIIII", hdr_data, 0)
     if magic1 != 0x544F4F42 or magic2 != 0x21474F4C: # "BOOTLOG!"
         return None, f"Raw log magic mismatch: 0x{magic1:08X} 0x{magic2:08X}"
 
@@ -41,6 +42,7 @@ def read_raw_log(f) -> tuple[dict, str]:
         "magic": "BOOTLOG!",
         "log_length": log_len,
         "flush_count": flush_count,
+        "error_count": error_count,
         "boot_drive": f"0x{boot_drive:02X}",
     }
     return stats, text
@@ -131,15 +133,90 @@ def read_fat32_log(f) -> tuple[dict, str]:
     }
     return stats, text
 
+def watch_mode(image_path, use_raw, interval):
+    """Continuously polls the disk image/device for new log content, like 'tail -f'."""
+    print(f"[*] Watching '{image_path}' for new log content (poll every {interval}s, Ctrl+C to stop)...")
+    print("=" * 70)
+
+    last_length = 0
+    last_text = ""
+    first_read = True
+
+    try:
+        while True:
+            try:
+                with open(image_path, "rb") as f:
+                    if use_raw:
+                        stats, text = read_raw_log(f)
+                    else:
+                        stats, text = read_fat32_log(f)
+                        if not stats:
+                            stats, text = read_raw_log(f)
+
+                    if not stats:
+                        if first_read:
+                            print(f"[*] No log data found yet ({text}). Waiting...")
+                            first_read = False
+                        time.sleep(interval)
+                        continue
+
+                    current_length = len(text)
+
+                    if first_read:
+                        # Print header and full content on first successful read
+                        print(f"  Source: {stats['source']}")
+                        if 'flush_count' in stats:
+                            print(f"  Flushes: {stats['flush_count']} | Errors: {stats.get('error_count', 'N/A')}")
+                        print("=" * 70)
+                        print(text, end='')
+                        last_text = text
+                        last_length = current_length
+                        first_read = False
+                    elif current_length > last_length:
+                        # Print only new content
+                        new_content = text[last_length:]
+                        print(new_content, end='', flush=True)
+                        last_text = text
+                        last_length = current_length
+                    elif text != last_text:
+                        # Content changed but didn't grow (re-written from scratch)
+                        print("\n--- LOG RESET DETECTED ---")
+                        print(text, end='')
+                        last_text = text
+                        last_length = current_length
+
+            except PermissionError:
+                if first_read:
+                    print(f"[*] Device busy or permission denied. Retrying...")
+                    first_read = False
+            except OSError as e:
+                if first_read:
+                    print(f"[*] I/O error: {e}. Retrying...")
+                    first_read = False
+
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        print(f"\n\n[*] Watch mode stopped. Last log size: {last_length} bytes.")
+
 def main():
     parser = argparse.ArgumentParser(description="Read persistent boot logs from bootloader media")
     parser.add_argument("image", help="Path to boot.img or drive device (e.g. \\\\.\\PhysicalDrive1 or /dev/sdb)")
     parser.add_argument("--raw", action="store_true", help="Force reading raw sectors at LBA 256")
     parser.add_argument("--output", "-o", help="Save log output to a file")
+    parser.add_argument("--watch", "-w", action="store_true",
+                        help="Watch mode: continuously poll for new log content (like 'tail -f')")
+    parser.add_argument("--interval", type=float, default=1.0,
+                        help="Poll interval in seconds for watch mode (default: 1.0)")
     args = parser.parse_args()
 
     if not os.path.exists(args.image) and not args.image.startswith("\\\\.\\"):
         sys.exit(f"[-] Error: File or device '{args.image}' not found.")
+
+    # Watch mode: continuous polling
+    if args.watch:
+        watch_mode(args.image, args.raw, args.interval)
+        return
 
     try:
         f = open(args.image, "rb")

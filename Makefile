@@ -1,4 +1,4 @@
-NASM        ?= nasm
+NASM        ?= $(shell which nasm 2>/dev/null || echo /mnt/c/Users/chaha/AppData/Local/bin/NASM/nasm.exe)
 CC          ?= gcc
 LD          ?= ld
 OBJCOPY     ?= objcopy
@@ -23,6 +23,7 @@ STAGE3_SRCS_C := $(SRC_DIR)/stage3/core/main.c \
                  $(SRC_DIR)/stage3/pci/pci.c \
                  $(SRC_DIR)/stage3/xhci/xhci.c \
                  $(SRC_DIR)/stage3/usb/usb.c \
+                 $(SRC_DIR)/stage3/usb/usb_msc.c \
                  $(SRC_DIR)/stage3/mtp/mtp.c \
                  $(SRC_DIR)/stage3/filesystem/fat_source.c \
                  $(SRC_DIR)/stage3/mtp/mtp_source.c \

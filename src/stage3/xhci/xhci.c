@@ -70,6 +70,13 @@ static void xhci_bios_handoff(xhci_controller_t *ctrl) {
     }
 }
 
+static inline uint32_t xhci_portsc_clean(uint32_t portsc) {
+    // Clear PED (bit 1), PR (bit 4), and all RW1C change bits (bits 17-23)
+    // Always preserve PP (Port Power, bit 9)
+    uint32_t mask = XHCI_PORT_PED | XHCI_PORT_PR | XHCI_PORT_RW1C_MASK;
+    return (portsc & ~mask) | XHCI_PORT_PP;
+}
+
 int xhci_init(pci_device_t *pci_dev, xhci_controller_t *ctrl) {
     if (!pci_dev || !ctrl) return -1;
 
@@ -98,6 +105,9 @@ int xhci_init(pci_device_t *pci_dev, xhci_controller_t *ctrl) {
     uint32_t sb_lo = (hcsparams2 >> 27) & 0x1F;
     ctrl->max_scratchpad_bufs = (sb_hi << 5) | sb_lo;
 
+    uint32_t hccparams1 = xhci_read32(ctrl->mmio_base + XHCI_CAP_HCCPARAMS1);
+    ctrl->context_size = (hccparams1 & (1U << 2)) ? 64 : 32;
+
     uint32_t dboff = xhci_read32(ctrl->mmio_base + XHCI_CAP_DBOFF) & ~0x3U;
     uint32_t rtsoff = xhci_read32(ctrl->mmio_base + XHCI_CAP_RTSOFF) & ~0x1FU;
 
@@ -105,9 +115,9 @@ int xhci_init(pci_device_t *pci_dev, xhci_controller_t *ctrl) {
     ctrl->db_regs = ctrl->mmio_base + dboff;
     ctrl->rt_regs = ctrl->mmio_base + rtsoff;
 
-    log_info("XHCI", "xHCI Version %u.%u | MaxSlots: %u | MaxPorts: %u | Scratchpads: %u",
+    log_info("XHCI", "xHCI Version %u.%u | MaxSlots: %u | MaxPorts: %u | ContextSize: %u bytes (CSZ=%u)",
              ctrl->hci_version >> 8, (ctrl->hci_version >> 4) & 0xF,
-             ctrl->max_slots, ctrl->max_ports, ctrl->max_scratchpad_bufs);
+             ctrl->max_slots, ctrl->max_ports, ctrl->context_size, (hccparams1 >> 2) & 1);
 
     // 4. BIOS Handoff & Controller Reset
     xhci_bios_handoff(ctrl);
@@ -230,8 +240,7 @@ int xhci_init(pci_device_t *pci_dev, xhci_controller_t *ctrl) {
     for (uint8_t p = 1; p <= ctrl->max_ports; p++) {
         uintptr_t port_reg = ctrl->op_regs + XHCI_OP_PORTS_BASE + (p - 1) * 0x10;
         uint32_t portsc = xhci_read32(port_reg);
-        portsc |= XHCI_PORT_PP;
-        xhci_write32(port_reg, portsc);
+        xhci_write32(port_reg, xhci_portsc_clean(portsc));
     }
     log_info("XHCI", "Root Hub Ports Powered (%u ports).", ctrl->max_ports);
 
@@ -271,23 +280,47 @@ int xhci_reset_port(xhci_controller_t *ctrl, uint8_t port_id) {
     uintptr_t port_reg = ctrl->op_regs + XHCI_OP_PORTS_BASE + (port_id - 1) * 0x10;
     uint32_t portsc = xhci_read32(port_reg);
 
-    // Assert Port Reset
-    portsc &= ~(XHCI_PORT_PLS_MASK); // Preserve link state
-    portsc |= XHCI_PORT_PR;
-    xhci_write32(port_reg, portsc);
+    // If device is not connected, nothing to reset
+    if (!(portsc & XHCI_PORT_CCS)) return -1;
 
-    // Wait for reset to complete
-    int timeout = 100;
-    while ((xhci_read32(port_reg) & XHCI_PORT_PR) && --timeout > 0) {
-        mdelay(2);
+    // If port is already enabled SuperSpeed (speed >= 4, e.g. USB 3.0 SD card reader), no reset needed
+    uint8_t speed = (uint8_t)((portsc & XHCI_PORT_SPEED_MASK) >> XHCI_PORT_SPEED_SHIFT);
+    if ((portsc & XHCI_PORT_PED) && speed >= 4) {
+        return 0;
     }
 
-    // Acknowledge port reset change
+    if (speed >= 4) {
+        // SuperSpeed (USB 3.0+): Warm Port Reset (WPR, bit 31)
+        xhci_write32(port_reg, xhci_portsc_clean(portsc) | XHCI_PORT_WPR);
+
+        int timeout = 100;
+        while ((xhci_read32(port_reg) & XHCI_PORT_WPR) && --timeout > 0) {
+            mdelay(2);
+        }
+
+        portsc = xhci_read32(port_reg);
+        if (portsc & XHCI_PORT_WRC) {
+            xhci_write32(port_reg, xhci_portsc_clean(portsc) | XHCI_PORT_WRC);
+        }
+    } else {
+        // USB 2.0 / USB 1.1: Port Reset (PR, bit 4)
+        xhci_write32(port_reg, xhci_portsc_clean(portsc) | XHCI_PORT_PR);
+
+        int timeout = 100;
+        while ((xhci_read32(port_reg) & XHCI_PORT_PR) && --timeout > 0) {
+            mdelay(2);
+        }
+
+        portsc = xhci_read32(port_reg);
+        if (portsc & XHCI_PORT_PRC) {
+            xhci_write32(port_reg, xhci_portsc_clean(portsc) | XHCI_PORT_PRC);
+        }
+
+        // USB 2.0 Reset Recovery Time (TRSTRCY >= 10ms as per USB 2.0 Spec 7.1.7.5)
+        mdelay(20);
+    }
+
     portsc = xhci_read32(port_reg);
-    if (portsc & XHCI_PORT_PRC) {
-        xhci_write32(port_reg, portsc | XHCI_PORT_PRC);
-    }
-
     return (portsc & XHCI_PORT_PED) ? 0 : -2;
 }
 
@@ -378,3 +411,35 @@ int xhci_enable_slot(xhci_controller_t *ctrl, uint8_t *slot_id_out) {
     }
     return res;
 }
+
+void xhci_stop(xhci_controller_t *ctrl) {
+    if (!ctrl || !ctrl->op_regs) return;
+
+    log_info("XHCI", "Stopping xHCI controller for OS handoff...");
+
+    // 1. Disable Interrupter 0 (IMAN.IE = 0)
+    if (ctrl->rt_regs) {
+        uintptr_t intr0 = ctrl->rt_regs + 0x20;
+        xhci_write32(intr0 + XHCI_INTR_IMAN, 0);
+    }
+
+    // 2. Stop Controller (clear USBCMD.RS and USBCMD.INTE)
+    uint32_t cmd = xhci_read32(ctrl->op_regs + XHCI_OP_USBCMD);
+    cmd &= ~(XHCI_CMD_RS | XHCI_CMD_INTE);
+    xhci_write32(ctrl->op_regs + XHCI_OP_USBCMD, cmd);
+
+    // 3. Wait until controller is halted (USBSTS.HCH == 1)
+    int timeout = 100;
+    while (!(xhci_read32(ctrl->op_regs + XHCI_OP_USBSTS) & XHCI_STS_HCH) && --timeout > 0) {
+        mdelay(1);
+    }
+
+    // 4. Disable PCI Bus Master to prevent any spurious DMA into kernel memory
+    if (ctrl->pci_dev) {
+        uint16_t pci_cmd = pci_read_config16(ctrl->pci_dev->bus, ctrl->pci_dev->dev, ctrl->pci_dev->func, 0x04);
+        pci_write_config16(ctrl->pci_dev->bus, ctrl->pci_dev->dev, ctrl->pci_dev->func, 0x04, pci_cmd & ~0x06);
+    }
+
+    log_info("XHCI", "xHCI Controller successfully halted and DMA quiesced.");
+}
+

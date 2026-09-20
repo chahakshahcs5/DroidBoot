@@ -61,7 +61,13 @@ static inline void xhci_write64(uintptr_t addr, uint64_t val) {
 #define XHCI_PORT_SPEED_SHIFT   10
 #define XHCI_PORT_CSC           (1U << 17)  // Connect Status Change
 #define XHCI_PORT_PEC           (1U << 18)  // Port Enable Change
+#define XHCI_PORT_WRC           (1U << 19)  // Warm Port Reset Change
+#define XHCI_PORT_OCC           (1U << 20)  // Over-current Change
 #define XHCI_PORT_PRC           (1U << 21)  // Port Reset Change
+#define XHCI_PORT_PLC           (1U << 22)  // Port Link State Change
+#define XHCI_PORT_CEC           (1U << 23)  // Config Error Change
+#define XHCI_PORT_WPR           (1U << 31)  // Warm Port Reset (USB 3.0 only)
+#define XHCI_PORT_RW1C_MASK     (0x7FU << 17) // All RW1C change bits
 
 // Interrupter Register Offsets (relative to MMIO Base + RTSOFF + 0x20 * i)
 #define XHCI_INTR_IMAN          0x00

@@ -71,8 +71,8 @@ def main():
     print(f"[*] Launching QEMU headless verification: {' '.join(qemu_cmd)}")
     proc = subprocess.Popen(qemu_cmd, cwd=WORKSPACE_ROOT)
 
-    # Allow bootloader to execute through all stages
-    timeout_sec = 12
+    # Allow bootloader to execute through all stages (15s MTP wait + menu)
+    timeout_sec = 25
     start_time = time.time()
     success = False
     captured_log = ""

@@ -3,7 +3,7 @@
 #include "../memory/memory.h"
 #include "../../include/io.h"
 
-// 59-byte self-contained relocation trampoline for 32-bit Linux handoff
+// 60-byte self-contained relocation trampoline for 32-bit Linux handoff
 static const uint8_t trampoline_template[] = {
     0xFA,                               // cli
     0xFC,                               // cld
@@ -22,12 +22,14 @@ static const uint8_t trampoline_template[] = {
     0x8E, 0xE8,                         // mov gs, eax
     0x8E, 0xD0,                         // mov ss, eax
     0x89, 0xD6,                         // mov esi, edx       (ESI = params)
-    0x31, 0xC0,                         // xor eax, eax
-    0x31, 0xC9,                         // xor ecx, ecx
-    0x31, 0xD2,                         // xor edx, edx
-    0x31, 0xED,                         // xor ebp, ebp
-    0x31, 0xFF,                         // xor edi, edi
-    0xFF, 0xE3                          // jmp ebx            (jump to entry)
+    0x53,                               // push ebx           (push entry point)
+    0x31, 0xC0,                         // xor eax, eax       (EAX = 0)
+    0x31, 0xDB,                         // xor ebx, ebx       (EBX = 0)
+    0x31, 0xC9,                         // xor ecx, ecx       (ECX = 0)
+    0x31, 0xD2,                         // xor edx, edx       (EDX = 0)
+    0x31, 0xED,                         // xor ebp, ebp       (EBP = 0)
+    0x31, 0xFF,                         // xor edi, edi       (EDI = 0)
+    0xC3                                // ret                (jump to entry point)
 };
 
 static uint32_t kstrlen(const char *s) {
@@ -119,6 +121,22 @@ int linux_prepare_boot_params(const void *kernel_image, uint32_t kernel_size,
     out_params->hdr.type_of_loader = LINUX_BOOT_LOADER_TYPE;
     out_params->hdr.loadflags |= LINUX_LOADFLAGS_LOADED_HIGH | LINUX_LOADFLAGS_CAN_USE_HEAP;
     out_params->hdr.heap_end_ptr = 0x9000;
+
+    // Setup standard 80x25 VGA text mode screen_info (prevents early kernel console crash)
+    out_params->screen_info[0] = 0;      // orig_x = 0
+    out_params->screen_info[1] = 0;      // orig_y = 0
+    out_params->screen_info[4] = 0;      // orig_video_page = 0
+    out_params->screen_info[6] = 3;      // orig_video_mode = 3 (80x25 color text)
+    out_params->screen_info[7] = 80;     // orig_video_cols = 80
+    out_params->screen_info[14] = 25;    // orig_video_lines = 25
+    out_params->screen_info[15] = 0x22;  // orig_video_isVGA = 0x22 (VIDEO_TYPE_VGAC)
+    out_params->screen_info[16] = 16;    // orig_video_points = 16 (font 8x16)
+
+    // Fill in alt_mem_k from usable RAM
+    uint32_t mem_k = (uint32_t)(memory_get_total_usable() / 1024);
+    if (mem_k > 0) {
+        out_params->alt_mem_k = (mem_k > 0x100000) ? 0x100000 : mem_k;
+    }
 
     // Setup command line
     if (cmdline && *cmdline) {

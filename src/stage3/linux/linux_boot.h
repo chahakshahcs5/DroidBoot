@@ -102,7 +102,7 @@ typedef struct linux_boot_params {
 #define LINUX_BOOT_PARAMS_PHYS   0x00090000
 #define LINUX_CMDLINE_PHYS      0x0009A000
 #define LINUX_KERNEL_LOAD_PHYS  0x00100000
-#define LINUX_TRAMPOLINE_PHYS   0x00008000
+#define LINUX_TRAMPOLINE_PHYS   0x00006000
 
 typedef struct linux_kernel_info {
     uint32_t realmode_sectors;

@@ -120,7 +120,6 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
     } else {
         log_error("TEST", "Phase 9 Boot Params Setup FAILED!");
     }
-    disk_log_flush();
 }
 
 void c_main(boot_info_t *boot_info) {
@@ -129,7 +128,11 @@ void c_main(boot_info_t *boot_info) {
     vga_init();
     sound_boot_tone(); // PC speaker tone indicating Stage 3 is alive!
 
-    // 2. Banner
+    // 2. Initialize Persistent SD Disk Logging EARLY (before banner)
+    //    This ensures the very first printk output is captured to disk.
+    disk_log_init(boot_info);
+
+    // 3. Banner
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
     printk("\n======================================================================\n");
     printk("  ANDROID -> LINUX BOOTLOADER (LEGACY BIOS)\n");
@@ -137,7 +140,7 @@ void c_main(boot_info_t *boot_info) {
     printk("======================================================================\n\n");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-    // 3. Report Stage 1/2 Handoff Parameters
+    // 4. Report Stage 1/2 Handoff Parameters
     if (boot_info) {
         log_info("STAGE3", "Boot Drive preserved: 0x%02X (%s)",
                  boot_info->boot_drive,
@@ -146,25 +149,18 @@ void c_main(boot_info_t *boot_info) {
         log_error("STAGE3", "boot_info pointer is NULL!");
     }
 
-    // 4. Initialize Persistent SD Disk Logging
-    disk_log_init(boot_info);
-
-    // 4. Memory Management & E820 Map
+    // 5. Memory Management & E820 Map
     memory_init(boot_info);
 
-    // 5. PCI Bus Enumeration (xHCI Host Controller Discovery)
+    // 6. PCI Bus Enumeration (xHCI Host Controller Discovery)
     pci_init();
 
     pci_device_t *xhci_pci = pci_find_xhci();
     if (xhci_pci) {
-        // Flush all bootstrap and PCI detection logs to SD card while BIOS INT 13h is still operational!
-        disk_log_flush();
-        // Deactivate BIOS INT 13h disk access before xHCI controller reset
-        disk_log_disable_bios();
-
         // Phase 3: Initialize xHCI Host Controller
         log_info("STAGE3", "Initializing xHCI Host Controller hardware...");
         int xhci_status = xhci_init(xhci_pci, &xhci_ctrl);
+
         if (xhci_status == 0) {
             // Test command ring with a NO-OP command
             xhci_trb_t noop_cmd = {0};
@@ -182,65 +178,141 @@ void c_main(boot_info_t *boot_info) {
             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
             // Phase 4 & 5: Detect Connected USB Devices & Android MTP Phone
-            // Multi-pass debounce & poll loop (up to 3 seconds) for Android USB PHY negotiation
-            log_info("XHCI", "Waiting for Android phone to connect and stabilize on root hub...");
+            log_info("XHCI", "Scanning USB ports for Android phone (MTP) and boot media...");
             bool mtp_found = false;
             uint32_t probed_ports = 0;
+            uint8_t probe_fail_count[32] = {0};
+            bool phone_prompted = false;
 
-            for (int poll_iter = 0; poll_iter < 30 && !mtp_found; poll_iter++) {
-                if (poll_iter > 0) {
-                    // 100ms delay between port scans
-                    for (int d = 0; d < 100000; d++) io_wait();
-                }
+            static usb_device_t current_dev;
 
-                xhci_poll_ports(&xhci_ctrl);
+            // Pass 0: Initial full sweep across all ports to register SD Card Reader / USB Mass Storage immediately
+            xhci_poll_ports(&xhci_ctrl);
+            for (uint8_t p = 1; p <= xhci_ctrl.max_ports && p < 32; p++) {
+                uintptr_t port_reg = xhci_ctrl.op_regs + XHCI_OP_PORTS_BASE + (p - 1) * 0x10;
+                uint32_t portsc = *(volatile uint32_t *)port_reg;
+                if (!(portsc & XHCI_PORT_CCS)) continue;
 
-                for (uint8_t p = 1; p <= xhci_ctrl.max_ports; p++) {
-                    if (probed_ports & (1U << p)) continue; // Already successfully enumerated
+                k_memset(&current_dev, 0, sizeof(current_dev));
+                log_info("STAGE3", "Probing USB device on Port %u...", p);
+                int probe_res = usb_probe_port(&xhci_ctrl, p, &current_dev);
+                if (probe_res == 0) {
+                    probed_ports |= (1U << p);
+                    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                    log_info("STAGE3", "Phase 4 USB Enumeration Successfully Verified!");
+                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-                    uintptr_t port_reg = xhci_ctrl.op_regs + XHCI_OP_PORTS_BASE + (p - 1) * 0x10;
-                    uint32_t portsc = *(volatile uint32_t *)port_reg;
-
-                    if (portsc & XHCI_PORT_CCS) {
-                        usb_device_t current_dev;
-                        k_memset(&current_dev, 0, sizeof(current_dev));
-                        log_info("STAGE3", "Probing USB device on Port %u...", p);
-                        int probe_res = usb_probe_port(&xhci_ctrl, p, &current_dev);
-                        if (probe_res == 0) {
-                            probed_ports |= (1U << p);
+                    if (current_dev.has_msc) {
+                        log_info("STAGE3", "Port %u: USB Mass Storage Boot / Logging Drive registered.", p);
+                        disk_log_register_usb_msc(&current_dev);
+                    } else if (current_dev.has_mtp) {
+                        detected_usb_dev = current_dev;
+                        log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
+                        int mtp_res = mtp_init_session(&detected_usb_dev, &active_mtp_session);
+                        if (mtp_res == 0) {
+                            uint32_t storage_ids[8];
+                            uint32_t count = 0;
+                            mtp_get_storage_ids(&active_mtp_session, storage_ids, 8, &count);
                             vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-                            log_info("STAGE3", "Phase 4 USB Enumeration Successfully Verified!");
+                            log_info("STAGE3", "Phase 5 Android MTP Detection Successfully Verified!");
                             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-
-                            if (current_dev.has_mtp) {
-                                detected_usb_dev = current_dev;
-                                log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
-                                int mtp_res = mtp_init_session(&detected_usb_dev, &active_mtp_session);
-                                if (mtp_res == 0) {
-                                    uint32_t storage_ids[8];
-                                    uint32_t count = 0;
-                                    mtp_get_storage_ids(&active_mtp_session, storage_ids, 8, &count);
-
-                                    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-                                    log_info("STAGE3", "Phase 5 Android MTP Detection Successfully Verified!");
-                                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-                                    sound_phone_connected_tone(); // High chime: Phone connected!
-                                    mtp_found = true;
-                                    break;
-                                } else {
-                                    log_error("STAGE3", "Failed to initialize MTP session (code %d)", mtp_res);
-                                }
-                            } else {
-                                log_info("STAGE3", "Port %u: Attached device is not MTP (Class 0x%02X)",
-                                         p, current_dev.dev_desc.bDeviceClass);
-                            }
+                            sound_phone_connected_tone();
+                            mtp_found = true;
+                        }
+                    } else {
+                        log_info("STAGE3", "Port %u: Attached device (VID 0x%04X, PID 0x%04X) is in Charging/No-Data mode.",
+                                 p, current_dev.dev_desc.idVendor, current_dev.dev_desc.idProduct);
+                        vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+                        log_info("STAGE3", ">>> PLEASE UNLOCK PHONE AND TAP 'File Transfer / MTP' ON SCREEN! <<<");
+                        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                        if (!phone_prompted) {
+                            sound_prompt_tone();
+                            phone_prompted = true;
                         }
                     }
                 }
             }
 
+            // Poll loop: 100 iterations of 200ms delay = 20 seconds for Android MTP selection
+            for (int poll_iter = 0; poll_iter < 100 && !mtp_found; poll_iter++) {
+                if (poll_iter > 0) {
+                    for (int d = 0; d < 200000; d++) io_wait();
+                }
+
+                if (poll_iter % 25 == 0 && poll_iter > 0) {
+                    log_info("STAGE3", "Waiting for Android phone (File Transfer / MTP)... %u sec left",
+                             (100 - poll_iter) / 5);
+                }
+
+                for (uint8_t p = 1; p <= xhci_ctrl.max_ports && p < 32; p++) {
+                    uintptr_t port_reg = xhci_ctrl.op_regs + XHCI_OP_PORTS_BASE + (p - 1) * 0x10;
+                    uint32_t portsc = *(volatile uint32_t *)port_reg;
+
+                    if (!(portsc & XHCI_PORT_CCS)) {
+                        if (probed_ports & (1U << p)) {
+                            log_info("STAGE3", "Port %u: USB device disconnected.", p);
+                            probed_ports &= ~(1U << p);
+                            probe_fail_count[p] = 0;
+                        }
+                        continue;
+                    }
+
+                    if (probed_ports & (1U << p)) continue;
+
+                    if (probe_fail_count[p] >= 3) continue;
+
+                    k_memset(&current_dev, 0, sizeof(current_dev));
+                    log_info("STAGE3", "Probing USB device on Port %u...", p);
+                    int probe_res = usb_probe_port(&xhci_ctrl, p, &current_dev);
+                    if (probe_res == 0) {
+                        probed_ports |= (1U << p);
+                        probe_fail_count[p] = 0;
+                        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                        log_info("STAGE3", "Phase 4 USB Enumeration Successfully Verified!");
+                        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+                        if (current_dev.has_mtp) {
+                            detected_usb_dev = current_dev;
+                            log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
+                            int mtp_res = mtp_init_session(&detected_usb_dev, &active_mtp_session);
+                            if (mtp_res == 0) {
+                                uint32_t storage_ids[8];
+                                uint32_t count = 0;
+                                mtp_get_storage_ids(&active_mtp_session, storage_ids, 8, &count);
+
+                                vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                                log_info("STAGE3", "Phase 5 Android MTP Detection Successfully Verified!");
+                                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                                sound_phone_connected_tone();
+                                mtp_found = true;
+                                break;
+                            } else {
+                                log_error("STAGE3", "Failed to initialize MTP session (code %d)", mtp_res);
+                            }
+                        } else if (current_dev.has_msc) {
+                            log_info("STAGE3", "Port %u: USB Mass Storage / SD Card Reader active.", p);
+                            disk_log_register_usb_msc(&current_dev);
+                        } else {
+                            log_info("STAGE3", "Port %u: Attached device (VID 0x%04X, PID 0x%04X) is in Charging/No-Data mode.",
+                                     p, current_dev.dev_desc.idVendor, current_dev.dev_desc.idProduct);
+                            vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+                            log_info("STAGE3", ">>> PLEASE UNLOCK PHONE AND TAP 'File Transfer / MTP' ON SCREEN! <<<");
+                            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                            if (!phone_prompted) {
+                                sound_prompt_tone();
+                                phone_prompted = true;
+                            }
+                        }
+                    } else {
+                        probe_fail_count[p]++;
+                        log_error("STAGE3", "Probe failed on Port %u (attempt %u/3, code %d)",
+                                  p, probe_fail_count[p], probe_res);
+                    }
+                }
+            }
+
             if (!mtp_found) {
-                log_info("STAGE3", "Waiting for Android phone... (plug phone into USB with File Transfer mode)");
+                log_info("STAGE3", "No Android MTP phone detected within timeout. Proceeding to Boot Menu...");
                 sound_error_tone(); // Warning tone: No MTP phone detected
             }
         } else {
@@ -249,8 +321,6 @@ void c_main(boot_info_t *boot_info) {
         }
     } else {
         log_info("STAGE3", "No xHCI controller detected on PCI bus.");
-        disk_log_flush();
-        disk_log_disable_bios();
         sound_error_tone();
     }
 
@@ -282,39 +352,57 @@ void c_main(boot_info_t *boot_info) {
                             // Check if ISO image
                             iso_boot_files_t iso_files;
                             if (iso_find_boot_files(mtp_src, &iso_files) == 0) {
-                                log_info("BOOT", "Alpine Linux ISO detected! Streaming kernel & initramfs...");
+                                log_info("BOOT", "Alpine Linux ISO detected! Streaming kernel (%u MB) and initramfs (%u MB)...",
+                                         iso_files.kernel_size / 1024 / 1024,
+                                         iso_files.found_initrd ? (iso_files.initrd_size / 1024 / 1024) : 0);
+
                                 void *kernel_buf = (void *)0x02000000;
                                 void *initrd_buf = (void *)0x04000000;
 
                                 mtp_src->seek(mtp_src, (uint64_t)iso_files.kernel_lba * 2048);
                                 mtp_src->read(mtp_src, kernel_buf, iso_files.kernel_size);
+                                log_info("BOOT", "Kernel streamed into RAM at 0x%08X (%u bytes).",
+                                         (uint32_t)kernel_buf, iso_files.kernel_size);
 
                                 if (iso_files.found_initrd) {
                                     mtp_src->seek(mtp_src, (uint64_t)iso_files.initrd_lba * 2048);
                                     mtp_src->read(mtp_src, initrd_buf, iso_files.initrd_size);
+                                    log_info("BOOT", "Initramfs streamed into RAM at 0x%08X (%u bytes).",
+                                             (uint32_t)initrd_buf, iso_files.initrd_size);
                                 }
 
                                 linux_kernel_info_t kinfo;
                                 if (linux_check_kernel_image(kernel_buf, iso_files.kernel_size, &kinfo) == 0) {
-                                    static linux_boot_params_t alpine_params;
-                                    const char *alpine_cmdline = "modules=loop,squashfs,sd-mod,usb-storage console=tty0 console=ttyS0,115200 quiet";
+                                    linux_boot_params_t *alpine_params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
+                                    const char *alpine_cmdline = "modules=loop,squashfs,sd-mod,usb-storage console=tty0 earlyprintk=vga loglevel=7";
                                     linux_prepare_boot_params(kernel_buf, iso_files.kernel_size,
                                                               iso_files.found_initrd ? initrd_buf : NULL,
                                                               iso_files.found_initrd ? iso_files.initrd_size : 0,
-                                                              alpine_cmdline, boot_info, &alpine_params);
+                                                              alpine_cmdline, boot_info, alpine_params);
 
                                     vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
                                     log_info("BOOT", "==========================================================");
                                     log_info("BOOT", "  HANDING OFF TO ALPINE LINUX KERNEL ENTRY (0x00100000)   ");
                                     log_info("BOOT", "==========================================================");
                                     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-                                    disk_log_flush();
+
+                                    // 1. Quiesce xHCI host controller & disable DMA to prevent memory corruption
+                                    xhci_stop(&xhci_ctrl);
+
+                                    // 2. Silence PC speaker
+                                    sound_silence();
+
+                                    // 3. Final persistent log flush with audio feedback before handoff
+                                    log_info("LOG", "Final pre-handoff flush: %u flushes, %u errors, %u bytes logged",
+                                             disk_log_get_flush_count(), disk_log_get_error_count(), disk_log_get_length());
+                                    disk_log_flush_with_feedback();
+
                                     sound_kernel_jump_tone(); // Fanfare: Booting into Linux kernel!
 
                                     linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
                                                     LINUX_KERNEL_LOAD_PHYS,
                                                     kinfo.protected_mode_size,
-                                                    (uint32_t)&alpine_params,
+                                                    LINUX_BOOT_PARAMS_PHYS,
                                                     kinfo.code32_start);
                                 }
                             } else {
@@ -325,15 +413,23 @@ void c_main(boot_info_t *boot_info) {
 
                                 linux_kernel_info_t kinfo;
                                 if (linux_check_kernel_image(kernel_buf, (uint32_t)fsize, &kinfo) == 0) {
-                                    static linux_boot_params_t raw_params;
-                                    const char *cmdline = "console=tty0 console=ttyS0,115200 root=/dev/ram0 rw quiet";
+                                    linux_boot_params_t *raw_params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
+                                    const char *cmdline = "console=tty0 earlyprintk=vga loglevel=7 root=/dev/ram0 rw";
                                     linux_prepare_boot_params(kernel_buf, (uint32_t)fsize,
                                                               NULL, 0,
-                                                              cmdline, boot_info, &raw_params);
+                                                              cmdline, boot_info, raw_params);
+
+                                    xhci_stop(&xhci_ctrl);
+                                    sound_silence();
+
+                                    log_info("LOG", "Final pre-handoff flush: %u flushes, %u errors, %u bytes logged",
+                                             disk_log_get_flush_count(), disk_log_get_error_count(), disk_log_get_length());
+                                    disk_log_flush_with_feedback();
+
                                     linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
                                                     LINUX_KERNEL_LOAD_PHYS,
                                                     kinfo.protected_mode_size,
-                                                    (uint32_t)&raw_params,
+                                                    LINUX_BOOT_PARAMS_PHYS,
                                                     kinfo.code32_start);
                                 }
                             }
@@ -365,7 +461,10 @@ void c_main(boot_info_t *boot_info) {
             break;
     }
 
-    disk_log_flush();
+    // Boot-end summary: log flush statistics for diagnostics
+    log_info("LOG", "Boot session complete: %u flushes, %u errors, %u bytes logged",
+             disk_log_get_flush_count(), disk_log_get_error_count(), disk_log_get_length());
+    disk_log_flush_with_feedback();
 
     // Main execution loop / halt
     while (1) {
