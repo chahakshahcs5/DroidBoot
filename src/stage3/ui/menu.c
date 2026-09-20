@@ -15,11 +15,11 @@ static int poll_input_char(void) {
     // 2. Poll PS/2 Keyboard Controller (Status Port 0x64 bit 0 = Output Buffer Full)
     if (inb(0x64) & 0x01) {
         uint8_t sc = inb(0x60);
-        // Translate Scancode Set 1
-        if (sc == 0x02) return '1';
-        if (sc == 0x03) return '2';
-        if (sc == 0x04) return '3';
-        if (sc == 0x05) return '4';
+        // Translate Scancode Set 1: top row numbers or numeric keypad
+        if (sc == 0x02 || sc == 0x4F) return '1';
+        if (sc == 0x03 || sc == 0x50) return '2';
+        if (sc == 0x04 || sc == 0x51) return '3';
+        if (sc == 0x05 || sc == 0x4B) return '4';
         if (sc == 0x1C) return '\n';
         if (sc == 0x39) return ' ';
     }
@@ -87,48 +87,43 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 }
 
-boot_choice_t menu_wait_selection(uint32_t timeout_seconds, bool has_mtp, bool has_msc) {
-    printk("[MENU] Select option [1-4] or wait %u sec for auto-selection...\n", timeout_seconds);
+boot_choice_t menu_wait_selection(bool has_mtp, bool has_msc) {
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    printk("\n[MENU] Select option [1-4]: ");
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-    for (int sec = (int)timeout_seconds; sec > 0; sec--) {
-        printk("[MENU] Auto-booting in %d second(s)... (press 1-4)\r", sec);
-
-        // Approximate 1 second delay loop with active polling
-        for (int i = 0; i < 1000; i++) {
-            int ch = poll_input_char();
-            if (ch == '1') {
-                if (has_msc) {
-                    printk("\n[MENU] User selected [1]: Boot from USB Block Storage (Direct)\n");
-                    return BOOT_CHOICE_USB_MSC;
-                } else {
-                    printk("\n[MENU] User selected [1]: Boot from Android Phone (MTP In-RAM)\n");
-                    return BOOT_CHOICE_ANDROID_MTP;
-                }
-            }
-            if (ch == '2') {
-                printk("\n[MENU] User selected [2]: Boot Linux from SD Card (FAT32)\n");
-                return BOOT_CHOICE_SD_FAT;
-            }
-            if (ch == '3') {
-                printk("\n[MENU] User selected [3]: Hardware Diagnostics\n");
-                return BOOT_CHOICE_DIAGNOSTICS;
-            }
-            if (ch == '4') {
-                printk("\n[MENU] User selected [4]: Linux Boot Protocol Simulation\n");
-                return BOOT_CHOICE_TEST_PROTOCOL;
-            }
-
-            // Small delay (~1 ms)
-            for (int w = 0; w < 1000; w++) {
-                io_wait();
+    while (1) {
+        int ch = poll_input_char();
+        if (ch == '1') {
+            if (has_msc) {
+                printk("1\n[MENU] User selected [1]: Boot from USB Block Storage (Direct)\n");
+                return BOOT_CHOICE_USB_MSC;
+            } else if (has_mtp) {
+                printk("1\n[MENU] User selected [1]: Boot from Android Phone (MTP In-RAM)\n");
+                return BOOT_CHOICE_ANDROID_MTP;
+            } else {
+                printk("1\n[MENU] User selected [1]: Boot from Android Phone (MTP)\n");
+                return BOOT_CHOICE_ANDROID_MTP;
             }
         }
-    }
+        if (ch == '2') {
+            printk("2\n[MENU] User selected [2]: Boot Linux from SD Card (FAT32)\n");
+            return BOOT_CHOICE_SD_FAT;
+        }
+        if (ch == '3') {
+            printk("3\n[MENU] User selected [3]: Hardware Diagnostics\n");
+            return BOOT_CHOICE_DIAGNOSTICS;
+        }
+        if (ch == '4') {
+            printk("4\n[MENU] User selected [4]: Linux Boot Protocol Simulation\n");
+            return BOOT_CHOICE_TEST_PROTOCOL;
+        }
 
-    printk("\n[MENU] Countdown expired! Proceeding with auto-selection...\n");
-    if (has_msc) return BOOT_CHOICE_USB_MSC;
-    if (has_mtp) return BOOT_CHOICE_ANDROID_MTP;
-    return BOOT_CHOICE_TEST_PROTOCOL;
+        // Small delay (~1 ms) to not burn 100% CPU
+        for (int w = 0; w < 1000; w++) {
+            io_wait();
+        }
+    }
 }
 
 void menu_show_diagnostics(boot_info_t *boot_info, xhci_controller_t *xhci,

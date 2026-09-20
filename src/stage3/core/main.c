@@ -621,10 +621,8 @@ void c_main(boot_info_t *boot_info) {
     // Phase 10: Display Interactive Boot Menu
     menu_render(boot_info, &xhci_ctrl, &detected_usb_dev, &active_mtp_session);
 
-    // Wait for user selection or auto-selection timeout (1 second if device active, 2 seconds otherwise)
-    bool has_active_dev = active_mtp_session.session_active || msc_found;
-    boot_choice_t choice = menu_wait_selection(has_active_dev ? 1 : 2,
-                                               active_mtp_session.session_active,
+    // Wait for explicit user selection (no auto-boot countdown)
+    boot_choice_t choice = menu_wait_selection(active_mtp_session.session_active,
                                                msc_found);
 
     switch (choice) {
