@@ -186,22 +186,22 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
     }
 
     // Determine kernel command line:
-    char cmdline[256];
+    char cmdline[512];
     if (iso_files.is_casper) {
         if (prof && prof->is_clean_session) {
             snprintf(cmdline, sizeof(cmdline),
-                     "boot=casper console=tty0 quiet splash");
+                     "boot=casper console=tty0 console=ttyS0,115200");
         } else {
             snprintf(cmdline, sizeof(cmdline),
-                     "boot=casper persistent persistent-path=/BootManager/persistence/ console=tty0 quiet splash");
+                     "boot=casper persistent persistent-path=/BootManager/persistence/ console=tty0 console=ttyS0,115200");
         }
     } else {
         if (prof && prof->is_clean_session) {
             snprintf(cmdline, sizeof(cmdline),
-                     "modules=loop,squashfs,sd-mod,usb-storage console=tty0");
+                     "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 modules=loop,squashfs,sd-mod,usb-storage");
         } else {
             snprintf(cmdline, sizeof(cmdline),
-                     "modules=loop,squashfs,sd-mod,usb-storage console=tty0 apkovl=sda1:");
+                     "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 modules=loop,squashfs,sd-mod,usb-storage apkovl=sda1:");
         }
     }
 
@@ -278,34 +278,25 @@ static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_fil
     // Install mBFT table at 0x000E0000 for Alpine memdiskfind
     linux_setup_mbft(LINUX_RAM_ISO_PHYS, total_iso_bytes);
 
-    char alpine_cmdline[256];
+    char alpine_cmdline[512];
     if (prof && prof->is_clean_session) {
         snprintf(alpine_cmdline, sizeof(alpine_cmdline),
-                 "modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes console=tty0 loglevel=7",
+                 "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes loglevel=7",
                  LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
     } else {
         snprintf(alpine_cmdline, sizeof(alpine_cmdline),
-                 "modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes console=tty0 loglevel=7 apkovl=sda1:",
+                 "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes loglevel=7 apkovl=sda1:",
                  LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
     }
 
-    // Switch to VBE Linear Framebuffer mode
-    vbe_mode_info_t vbe_mode = {0};
-    uint16_t vbe_mode_num = 0;
-    int vbe_ok = vbe_setup_linear_framebuffer(&vbe_mode, &vbe_mode_num);
-    if (vbe_ok == 0) {
-        log_info("BOOT", "VBE Linear Framebuffer active: Mode 0x%04X (%ux%ux%u)",
-                 vbe_mode_num, vbe_mode.x_res, vbe_mode.y_res, vbe_mode.bits_per_pixel);
-    } else {
-        log_info("BOOT", "VBE unavailable; falling back to VGA text mode.");
-    }
-
+    // Standard 80x25 VGA text mode for maximum compatibility with Alpine Linux & Linux distributions
+    // (Preserves text display and avoids black screen from unsupported 24-bit VBE modes)
     linux_boot_params_t *alpine_params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
     linux_prepare_boot_params(kernel_buf, iso_files->kernel_size,
                               iso_files->found_initrd ? initrd_buf : NULL,
                               iso_files->found_initrd ? iso_files->initrd_size : 0,
                               alpine_cmdline, boot_info,
-                              (vbe_ok == 0) ? &vbe_mode : NULL,
+                              NULL, // Standard 80x25 VGA text mode
                               LINUX_RAM_ISO_PHYS, total_iso_bytes,
                               alpine_params);
 
