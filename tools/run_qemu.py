@@ -151,10 +151,26 @@ def main():
                         help="Run without graphical display window")
     parser.add_argument("--profile", choices=["work", "personal", "clean", ""], default="",
                         help="Target persistence profile to select at runtime (e.g. 'work', 'personal', 'clean')")
-    parser.add_argument("--usb-host", default="",
-                        help="Pass-through real physical USB phone (VID:PID, e.g. 2717:ff40)")
+    parser.add_argument("--clean", action="store_true",
+                        help="Wipe build artifacts and regenerate a clean, pristine boot.img before launching")
 
     args = parser.parse_args()
+
+    if args.clean:
+        print("[*] Cleaning build directory and resetting boot image...")
+        for fname in ["serial.log", "serial_persist.log", "ubuntu_boot.log", "screen.ppm", "screen.png"]:
+            fpath = os.path.join(BUILD_DIR, fname)
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
+        if os.path.exists(BOOT_IMG):
+            try:
+                os.remove(BOOT_IMG)
+            except OSError:
+                pass
+        print("[+] Removed stale logs and boot image. Fresh image will be generated now.")
 
     # Determine default ISO based on mode
     iso_path = args.iso

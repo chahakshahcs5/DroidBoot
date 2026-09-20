@@ -161,13 +161,13 @@ def test_multiprofile_persistence(port=4445):
         if not state.get("sent_os") and "[MENU] Select option" in current_log:
             print("[*] Main boot menu detected! Selecting OS [1] (Ubuntu)...")
             time.sleep(0.1)
-            conn.sendall(b"1")
+            conn.sendall(b"1\n")
             state["sent_os"] = True
 
         if not state.get("sent_prof") and "[PROFILE] Select persistence profile" in current_log:
             print("[*] Persistence Profile Sub-Menu detected! Selecting [3] (Clean Disposable Session)...")
             time.sleep(0.1)
-            conn.sendall(b"3")
+            conn.sendall(b"3\n")
             state["sent_prof"] = True
 
         if "HANDING OFF EXECUTION TO LINUX" in current_log:
@@ -216,19 +216,19 @@ def test_custom_capacity_selection(port=4446):
         if not state.get("sent_os") and "[MENU] Select option" in current_log:
             print("[*] Main boot menu detected! Selecting OS [1] (Ubuntu)...")
             time.sleep(0.1)
-            conn.sendall(b"1")
+            conn.sendall(b"1\n")
             state["sent_os"] = True
 
         if not state.get("sent_create") and "[PROFILE] Select persistence profile" in current_log:
             print("[*] Profile sub-menu detected! Selecting [4] (Create New Custom Profile)...")
             time.sleep(0.1)
-            conn.sendall(b"4")
+            conn.sendall(b"4\n")
             state["sent_create"] = True
 
         if not state.get("sent_size") and "[SIZE] Select persistence capacity" in current_log:
             print("[*] Capacity Size Selector detected! Selecting [3] (8 GB Developer)...")
             time.sleep(0.1)
-            conn.sendall(b"3")
+            conn.sendall(b"3\n")
             state["sent_size"] = True
 
         if "HANDING OFF EXECUTION TO LINUX" in current_log:
@@ -277,13 +277,13 @@ def test_in_ram_iso_boot(port=4447):
         if not state.get("sent_os") and "[MENU] Select option" in current_log:
             print("[*] Main boot menu detected! Selecting OS [1] (Alpine Linux Standard)...")
             time.sleep(0.1)
-            conn.sendall(b"1")
+            conn.sendall(b"1\n")
             state["sent_os"] = True
 
         if not state.get("sent_prof") and "[PROFILE] Select persistence profile" in current_log:
             print("[*] Profile sub-menu detected! Selecting [1] (Saved Profile)...")
             time.sleep(0.1)
-            conn.sendall(b"1")
+            conn.sendall(b"1\n")
             state["sent_prof"] = True
 
         if "HANDING OFF TO IN-RAM LINUX WITH SD PERSISTENCE" in current_log:

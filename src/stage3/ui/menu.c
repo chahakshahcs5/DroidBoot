@@ -15,6 +15,9 @@ static int poll_input_char(void) {
     // 2. Poll PS/2 Keyboard Controller (Status Port 0x64 bit 0 = Output Buffer Full)
     if (inb(0x64) & 0x01) {
         uint8_t sc = inb(0x60);
+        // Ignore break codes (key release has bit 7 set)
+        if (sc & 0x80) return -1;
+
         // Translate Scancode Set 1: top row numbers or numeric keypad
         if (sc == 0x02 || sc == 0x4F) return '1';
         if (sc == 0x03 || sc == 0x50) return '2';
@@ -24,13 +27,59 @@ static int poll_input_char(void) {
         if (sc == 0x07 || sc == 0x4D) return '6';
         if (sc == 0x08 || sc == 0x47) return '7';
         if (sc == 0x09 || sc == 0x48) return '8';
+        if (sc == 0x0A || sc == 0x49) return '9';
+        if (sc == 0x0B || sc == 0x52) return '0';
+        if (sc == 0x0E) return 0x08; // Backspace
         if (sc == 0x20) return 'd'; // 'D'
         if (sc == 0x14) return 't'; // 'T'
-        if (sc == 0x1C) return '\n';
+        if (sc == 0x1C) return '\n'; // Enter
         if (sc == 0x39) return ' ';
     }
 
     return -1;
+}
+
+static int menu_read_line(char *buf, uint32_t max_len) {
+    uint32_t pos = 0;
+    buf[0] = '\0';
+
+    while (1) {
+        int ch = poll_input_char();
+        if (ch == -1) {
+            for (int w = 0; w < 1000; w++) io_wait();
+            continue;
+        }
+
+        // Enter key: carriage return (\r) or line feed (\n)
+        if (ch == '\r' || ch == '\n') {
+            if (pos == 0) {
+                // Ignore leading newlines (e.g. from previous \r\n)
+                continue;
+            }
+            printk("\n");
+            buf[pos] = '\0';
+            return (int)pos;
+        }
+
+        // Backspace: 0x08 (BS) or 0x7F (DEL) or '\b'
+        if (ch == 0x08 || ch == 0x7F || ch == '\b') {
+            if (pos > 0) {
+                pos--;
+                buf[pos] = '\0';
+                printk("\b \b");
+            }
+            continue;
+        }
+
+        // Printable characters
+        if (ch >= 32 && ch <= 126) {
+            if (pos + 1 < max_len) {
+                buf[pos++] = (char)ch;
+                buf[pos] = '\0';
+                printk("%c", ch);
+            }
+        }
+    }
 }
 
 void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
@@ -120,39 +169,52 @@ menu_selection_t menu_wait_selection(const os_registry_t *registry) {
     uint32_t diag_num = os_count > 0 ? os_count + 1 : 1;
     uint32_t test_num = os_count > 0 ? os_count + 2 : 2;
 
-    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-    printk("\n[MENU] Select option [1-%u]: ", test_num);
-    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-
     while (1) {
-        int ch = poll_input_char();
-        if (ch >= '1' && ch <= '8') {
-            uint32_t val = (uint32_t)(ch - '0');
-            if (val <= os_count) {
-                uint32_t idx = val - 1;
-                printk("%c\n[MENU] User selected [%u]: Boot %s\n", ch, val, registry->entries[idx].title);
-                return (menu_selection_t){ .type = MENU_ACTION_BOOT_OS, .os_index = idx };
-            } else if (val == diag_num) {
-                printk("%c\n[MENU] User selected [%u]: Hardware Diagnostics\n", ch, val);
-                return (menu_selection_t){ .type = MENU_ACTION_DIAGNOSTICS, .os_index = 0 };
-            } else if (val == test_num || (os_count == 0 && val == 4)) {
-                printk("%c\n[MENU] User selected [%u]: Linux Boot Protocol Simulation\n", ch, val);
-                return (menu_selection_t){ .type = MENU_ACTION_SELF_TEST, .os_index = 0 };
-            }
-        }
-        if (ch == 'd' || ch == 'D') {
-            printk("D\n[MENU] User selected: Hardware Diagnostics\n");
+        vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+        printk("\n[MENU] Select option [1-%u]: ", test_num);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+        char line[16];
+        menu_read_line(line, sizeof(line));
+
+        // Direct letter shortcuts (case-insensitive)
+        if ((line[0] == 'd' || line[0] == 'D') && line[1] == '\0') {
+            printk("[MENU] User selected: Hardware Diagnostics\n");
             return (menu_selection_t){ .type = MENU_ACTION_DIAGNOSTICS, .os_index = 0 };
         }
-        if (ch == 't' || ch == 'T') {
-            printk("T\n[MENU] User selected: Linux Boot Protocol Simulation\n");
+        if ((line[0] == 't' || line[0] == 'T') && line[1] == '\0') {
+            printk("[MENU] User selected: Linux Boot Protocol Simulation\n");
             return (menu_selection_t){ .type = MENU_ACTION_SELF_TEST, .os_index = 0 };
         }
 
-        // Small delay (~1 ms) to not burn 100% CPU
-        for (int w = 0; w < 1000; w++) {
-            io_wait();
+        // Numeric parsing
+        bool is_num = true;
+        uint32_t val = 0;
+        for (int i = 0; line[i]; i++) {
+            if (line[i] < '0' || line[i] > '9') {
+                is_num = false;
+                break;
+            }
+            val = val * 10 + (uint32_t)(line[i] - '0');
         }
+
+        if (is_num && val > 0) {
+            if (val <= os_count) {
+                uint32_t idx = val - 1;
+                printk("[MENU] User selected [%u]: Boot %s\n", val, registry->entries[idx].title);
+                return (menu_selection_t){ .type = MENU_ACTION_BOOT_OS, .os_index = idx };
+            } else if (val == diag_num) {
+                printk("[MENU] User selected [%u]: Hardware Diagnostics\n", val);
+                return (menu_selection_t){ .type = MENU_ACTION_DIAGNOSTICS, .os_index = 0 };
+            } else if (val == test_num || (os_count == 0 && val == 4)) {
+                printk("[MENU] User selected [%u]: Linux Boot Protocol Simulation\n", val);
+                return (menu_selection_t){ .type = MENU_ACTION_SELF_TEST, .os_index = 0 };
+            }
+        }
+
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        printk("[MENU] Invalid choice '%s'. Please enter a valid number or option.\n", line);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     }
 }
 
@@ -225,26 +287,32 @@ uint64_t menu_prompt_profile_size(void) {
     printk("  [4] 16 GB (Heavy Workstation - Full Linux software space)\n");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     printk("  * Sparse allocation: Initially consumes only ~35 MB on phone!\n");
-    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-    printk("\n[SIZE] Select persistence capacity [1-4]: ");
-    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
     while (1) {
-        int ch = poll_input_char();
-        if (ch == '1') {
-            printk("1 (2 GB)\n[SIZE] Allocated 2 GB sparse overlay capacity.\n\n");
+        vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+        printk("\n[SIZE] Select persistence capacity [1-4]: ");
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+        char line[16];
+        menu_read_line(line, sizeof(line));
+
+        if (line[0] == '1' && line[1] == '\0') {
+            printk("[SIZE] Allocated 2 GB sparse overlay capacity.\n\n");
             return (uint64_t)2 * 1024 * 1024 * 1024;
-        } else if (ch == '2') {
-            printk("2 (4 GB)\n[SIZE] Allocated 4 GB standard overlay capacity.\n\n");
+        } else if (line[0] == '2' && line[1] == '\0') {
+            printk("[SIZE] Allocated 4 GB standard overlay capacity.\n\n");
             return (uint64_t)4 * 1024 * 1024 * 1024;
-        } else if (ch == '3') {
-            printk("3 (8 GB)\n[SIZE] Allocated 8 GB developer overlay capacity.\n\n");
+        } else if (line[0] == '3' && line[1] == '\0') {
+            printk("[SIZE] Allocated 8 GB developer overlay capacity.\n\n");
             return (uint64_t)8 * 1024 * 1024 * 1024;
-        } else if (ch == '4') {
-            printk("4 (16 GB)\n[SIZE] Allocated 16 GB workstation overlay capacity.\n\n");
+        } else if (line[0] == '4' && line[1] == '\0') {
+            printk("[SIZE] Allocated 16 GB workstation overlay capacity.\n\n");
             return (uint64_t)16 * 1024 * 1024 * 1024;
         }
-        for (int w = 0; w < 1000; w++) io_wait();
+
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        printk("[SIZE] Invalid choice '%s'. Please select [1-4].\n", line);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     }
 }
 
@@ -283,22 +351,32 @@ int menu_select_persistence_profile(os_entry_t *entry) {
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     printk("      * Choose custom virtual capacity (2GB, 4GB, 8GB, 16GB)\n");
 
-    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-    printk("\n[PROFILE] Select persistence profile [1-%u]: ", create_opt);
-    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-
-    // Wait indefinitely for explicit user selection (zero auto-selection)
     while (1) {
-        int ch = poll_input_char();
-        if (ch >= '1' && ch <= '0' + (int)entry->profile_count) {
-            int selected = ch - '1';
-            printk("%c\n[PROFILE] User selected [%d]: %s\n\n",
-                   ch, selected + 1, entry->profiles[selected].profile_name);
+        vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+        printk("\n[PROFILE] Select persistence profile [1-%u]: ", create_opt);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+        char line[16];
+        menu_read_line(line, sizeof(line));
+
+        bool is_num = true;
+        uint32_t val = 0;
+        for (int i = 0; line[i]; i++) {
+            if (line[i] < '0' || line[i] > '9') {
+                is_num = false;
+                break;
+            }
+            val = val * 10 + (uint32_t)(line[i] - '0');
+        }
+
+        if (is_num && val >= 1 && val <= entry->profile_count) {
+            int selected = (int)val - 1;
+            printk("[PROFILE] User selected [%d]: %s\n\n",
+                   val, entry->profiles[selected].profile_name);
             return selected;
         }
-        if (ch == '0' + (int)create_opt) {
-            printk("%c\n[PROFILE] User selected [%d]: Create New Custom Profile\n",
-                   ch, create_opt);
+        if (is_num && val == create_opt) {
+            printk("[PROFILE] User selected [%u]: Create New Custom Profile\n", create_opt);
             uint64_t chosen_size = menu_prompt_profile_size();
             uint32_t mb = (uint32_t)(chosen_size / 1024 / 1024);
             char prof_name[32];
@@ -311,7 +389,10 @@ int menu_select_persistence_profile(os_entry_t *entry) {
             }
             return 0;
         }
-        for (int w = 0; w < 1000; w++) io_wait();
+
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        printk("[PROFILE] Invalid choice '%s'. Please select [1-%u].\n", line, create_opt);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     }
 }
 
