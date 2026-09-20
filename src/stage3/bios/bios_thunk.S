@@ -116,7 +116,9 @@ thunk_rm_entry:
     movb $0x00, %al         # verify = 0
 
     clc
+    sti                     # Enable interrupts for BIOS disk controller handlers & timer ticks
     int $0x13
+    cli                     # Disable interrupts before returning to 32-bit PM
     jc .disk_fail
 
     # Success: store 0
