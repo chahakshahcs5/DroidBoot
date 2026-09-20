@@ -16,6 +16,7 @@
 #include "../filesystem/iso_reader.h"
 #include "../debug/disk_log.h"
 #include "../debug/sound.h"
+#include "../bios/vbe.h"
 
 static xhci_controller_t xhci_ctrl;
 static usb_device_t      detected_usb_dev;
@@ -48,7 +49,9 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
             const char *alpine_cmdline = "earlyprintk=serial,0x3f8,115200 console=ttyS0,115200 console=tty0 noapic debug";
             linux_prepare_boot_params(kernel_buf, kernel_size,
                                       initrd_buf, initrd_size,
-                                      alpine_cmdline, boot_info, params_at_low_mem);
+                                      alpine_cmdline, boot_info,
+                                      NULL, 0, 0,
+                                      params_at_low_mem);
 
             vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
             log_info("STAGE3", "Phase 8 Image Detection Successfully Verified!");
@@ -108,7 +111,9 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
     const char *cmdline = "console=ttyS0,115200 root=/dev/ram0 rw quiet";
     int prep = linux_prepare_boot_params(test_kernel_image, sizeof(test_kernel_image),
                                          (void *)0x04000000, 1048576,
-                                         cmdline, boot_info, &test_params);
+                                         cmdline, boot_info,
+                                         NULL, 0, 0,
+                                         &test_params);
     if (prep == 0 && test_params.hdr.header == LINUX_HDRS_MAGIC && test_params.e820_entries > 0) {
         log_info("TEST", "Phase 9 Boot Params Setup: SUCCESS (%u E820 entries attached)",
                  test_params.e820_entries);
@@ -352,33 +357,99 @@ void c_main(boot_info_t *boot_info) {
                             // Check if ISO image
                             iso_boot_files_t iso_files;
                             if (iso_find_boot_files(mtp_src, &iso_files) == 0) {
-                                log_info("BOOT", "Alpine Linux ISO detected! Streaming kernel (%u MB) and initramfs (%u MB)...",
-                                         iso_files.kernel_size / 1024 / 1024,
-                                         iso_files.found_initrd ? (iso_files.initrd_size / 1024 / 1024) : 0);
+                                uint32_t total_iso_bytes = (uint32_t)fsize;
+                                uint8_t *ram_iso = (uint8_t *)LINUX_RAM_ISO_PHYS;
+
+                                vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+                                log_info("BOOT", "Alpine Linux ISO detected (%u MB)!", total_iso_bytes / 1024 / 1024);
+                                log_info("BOOT", "Streaming full ISO from Android phone to RAM at 0x%08X...", LINUX_RAM_ISO_PHYS);
+                                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+                                uint32_t streamed = 0;
+                                uint32_t block_size = 1048576; // 1 MB per MTP GetPartialObject request
+                                uint32_t last_pct = 0;
+
+                                while (streamed < total_iso_bytes) {
+                                    uint32_t chunk = total_iso_bytes - streamed;
+                                    if (chunk > block_size) chunk = block_size;
+
+                                    mtp_src->seek(mtp_src, streamed);
+                                    int r = mtp_src->read(mtp_src, ram_iso + streamed, chunk);
+                                    if (r <= 0) {
+                                        log_error("BOOT", "Failed to stream ISO at offset %u (chunk %u)", streamed, chunk);
+                                        break;
+                                    }
+                                    streamed += r;
+
+                                    uint32_t mb_streamed = streamed >> 20;
+                                    uint32_t mb_total = total_iso_bytes >> 20;
+                                    uint32_t pct = mb_total ? ((mb_streamed * 100) / mb_total) : 0;
+                                    if (pct >= last_pct + 10 || streamed == total_iso_bytes) {
+                                        log_info("BOOT", "  Streaming ISO: %u%% (%u MB / %u MB)...",
+                                                 pct, mb_streamed, mb_total);
+                                        last_pct = pct;
+                                        disk_log_flush();
+                                    }
+                                }
+
+                                if (streamed < total_iso_bytes) {
+                                    log_error("BOOT", "ISO transfer incomplete: %u / %u bytes", streamed, total_iso_bytes);
+                                    sound_error_tone();
+                                    break;
+                                }
+
+                                vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                                log_info("BOOT", "Full ISO successfully cached in RAM (%u MB)!", total_iso_bytes / 1024 / 1024);
+                                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
                                 void *kernel_buf = (void *)0x02000000;
                                 void *initrd_buf = (void *)0x04000000;
 
-                                mtp_src->seek(mtp_src, (uint64_t)iso_files.kernel_lba * 2048);
-                                mtp_src->read(mtp_src, kernel_buf, iso_files.kernel_size);
-                                log_info("BOOT", "Kernel streamed into RAM at 0x%08X (%u bytes).",
+                                // Fast extraction from in-RAM ISO buffer
+                                for (uint32_t b = 0; b < iso_files.kernel_size; b++) {
+                                    ((uint8_t *)kernel_buf)[b] = ram_iso[(iso_files.kernel_lba * 2048) + b];
+                                }
+                                log_info("BOOT", "Kernel extracted into RAM at 0x%08X (%u bytes).",
                                          (uint32_t)kernel_buf, iso_files.kernel_size);
 
                                 if (iso_files.found_initrd) {
-                                    mtp_src->seek(mtp_src, (uint64_t)iso_files.initrd_lba * 2048);
-                                    mtp_src->read(mtp_src, initrd_buf, iso_files.initrd_size);
-                                    log_info("BOOT", "Initramfs streamed into RAM at 0x%08X (%u bytes).",
+                                    for (uint32_t b = 0; b < iso_files.initrd_size; b++) {
+                                        ((uint8_t *)initrd_buf)[b] = ram_iso[(iso_files.initrd_lba * 2048) + b];
+                                    }
+                                    log_info("BOOT", "Initramfs extracted into RAM at 0x%08X (%u bytes).",
                                              (uint32_t)initrd_buf, iso_files.initrd_size);
                                 }
 
                                 linux_kernel_info_t kinfo;
                                 if (linux_check_kernel_image(kernel_buf, iso_files.kernel_size, &kinfo) == 0) {
+                                    // Install mBFT table at 0x000E0000 for memdiskfind
+                                    linux_setup_mbft(LINUX_RAM_ISO_PHYS, total_iso_bytes);
+
+                                    // Kernel command line: phram + memmap + memdisk + console=tty0
+                                    char alpine_cmdline[256];
+                                    snprintf(alpine_cmdline, sizeof(alpine_cmdline),
+                                             "modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes console=tty0 loglevel=7",
+                                             LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
+
+                                    // Switch to VBE Linear Framebuffer mode (activates HDMI external display & ANSI colors & scrollback)
+                                    vbe_mode_info_t vbe_mode = {0};
+                                    uint16_t vbe_mode_num = 0;
+                                    int vbe_ok = vbe_setup_linear_framebuffer(&vbe_mode, &vbe_mode_num);
+                                    if (vbe_ok == 0) {
+                                        log_info("BOOT", "VBE Linear Framebuffer active: Mode 0x%04X (%ux%ux%u)",
+                                                 vbe_mode_num, vbe_mode.x_res, vbe_mode.y_res, vbe_mode.bits_per_pixel);
+                                    } else {
+                                        log_info("BOOT", "VBE unavailable; falling back to VGA text mode.");
+                                    }
+
                                     linux_boot_params_t *alpine_params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
-                                    const char *alpine_cmdline = "modules=loop,squashfs,sd-mod,usb-storage console=tty0 earlyprintk=vga loglevel=7";
                                     linux_prepare_boot_params(kernel_buf, iso_files.kernel_size,
                                                               iso_files.found_initrd ? initrd_buf : NULL,
                                                               iso_files.found_initrd ? iso_files.initrd_size : 0,
-                                                              alpine_cmdline, boot_info, alpine_params);
+                                                              alpine_cmdline, boot_info,
+                                                              (vbe_ok == 0) ? &vbe_mode : NULL,
+                                                              LINUX_RAM_ISO_PHYS, total_iso_bytes,
+                                                              alpine_params);
 
                                     vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
                                     log_info("BOOT", "==========================================================");
@@ -417,7 +488,9 @@ void c_main(boot_info_t *boot_info) {
                                     const char *cmdline = "console=tty0 earlyprintk=vga loglevel=7 root=/dev/ram0 rw";
                                     linux_prepare_boot_params(kernel_buf, (uint32_t)fsize,
                                                               NULL, 0,
-                                                              cmdline, boot_info, raw_params);
+                                                              cmdline, boot_info,
+                                                              NULL, 0, 0,
+                                                              raw_params);
 
                                     xhci_stop(&xhci_ctrl);
                                     sound_silence();

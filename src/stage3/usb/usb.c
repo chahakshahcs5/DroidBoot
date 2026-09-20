@@ -528,7 +528,7 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
     xhci_write32(db_reg, doorbell_target);
 
     // Poll Event Ring for Transfer Event
-    int timeout = 20000;
+    int timeout = 100000;
     while (--timeout > 0) {
         xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
         uint32_t cycle = evt->control & 1U;
