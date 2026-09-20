@@ -225,13 +225,17 @@ static uint32_t msc_src_read(boot_source_t *src, void *buf, uint32_t size) {
         if (sec_offset == 0 && (size - bytes_read) >= 512) {
             uint32_t sectors_to_read = (size - bytes_read) >> 9;
             if (sectors_to_read > 64) sectors_to_read = 64; // Max 32KB per bulk transfer
-            if (usb_msc_read_sectors(priv->dev, lba, (uint16_t)sectors_to_read, dst + bytes_read) != 0) {
+            int res = usb_msc_read_sectors(priv->dev, lba, (uint16_t)sectors_to_read, dst + bytes_read);
+            if (res != 0) {
+                log_error("MSC", "Read failed at LBA %u (error %d, read %u / %u bytes)", lba, res, bytes_read, size);
                 break;
             }
             bytes_read += sectors_to_read * 512;
         } else {
             static uint8_t bounce[512];
-            if (usb_msc_read_sectors(priv->dev, lba, 1, bounce) != 0) {
+            int res = usb_msc_read_sectors(priv->dev, lba, 1, bounce);
+            if (res != 0) {
+                log_error("MSC", "Read bounce failed at LBA %u (error %d, read %u / %u bytes)", lba, res, bytes_read, size);
                 break;
             }
             uint32_t chunk = 512 - sec_offset;

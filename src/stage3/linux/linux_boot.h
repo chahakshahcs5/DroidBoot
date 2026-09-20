@@ -175,6 +175,7 @@ typedef struct linux_mbft {
 #define LINUX_KERNEL_LOAD_PHYS  0x00100000
 #define LINUX_TRAMPOLINE_PHYS   0x00006000
 #define LINUX_RAM_ISO_PHYS      0x10000000  // 256 MiB physical address for in-RAM ISO
+#define LINUX_INITRD_LOAD_PHYS  0x06000000  // 96 MiB physical address for initrd (above kernel init_size 85MB)
 
 #define VIDEO_TYPE_VGAC         0x22
 #define VIDEO_TYPE_VLFB         0x23

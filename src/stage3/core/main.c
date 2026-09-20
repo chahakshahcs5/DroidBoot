@@ -42,7 +42,7 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
         log_info("BOOT", "==========================================================");
 
         void *kernel_buf = (void *)0x02000000;
-        void *initrd_buf = (void *)0x04000000;
+        void *initrd_buf = (void *)LINUX_INITRD_LOAD_PHYS;
         uint32_t kernel_size = 14513152;
         uint32_t initrd_size = 22504936;
 
@@ -116,7 +116,7 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
     static linux_boot_params_t test_params;
     const char *cmdline = "console=ttyS0,115200 root=/dev/ram0 rw quiet";
     int prep = linux_prepare_boot_params(test_kernel_image, sizeof(test_kernel_image),
-                                         (void *)0x04000000, 1048576,
+                                         (void *)LINUX_INITRD_LOAD_PHYS, 1048576,
                                          cmdline, boot_info,
                                          NULL, 0, 0,
                                          &test_params);
@@ -164,16 +164,30 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
 
     // Read ONLY kernel (16MB) and initrd (91MB) into RAM
     void *kernel_buf = (void *)0x02000000;
-    void *initrd_buf = (void *)0x04000000;
 
     log_info("BOOT", "Streaming tiny kernel (%u MB) from block device into RAM...", iso_files.kernel_size / 1024 / 1024);
     msc_src->seek(msc_src, (uint64_t)iso_files.kernel_lba * 2048);
-    msc_src->read(msc_src, kernel_buf, iso_files.kernel_size);
+    uint32_t k_read = msc_src->read(msc_src, kernel_buf, iso_files.kernel_size);
+    log_info("BOOT", "Kernel read: %u / %u bytes", k_read, iso_files.kernel_size);
+
+    // Compute safe physical address for initramfs safely above kernel decompression footprint
+    uint32_t initrd_phys = LINUX_INITRD_LOAD_PHYS;
+    const linux_setup_header_t *setup_hdr = (const linux_setup_header_t *)((const uint8_t *)kernel_buf + 0x1F1);
+    if (setup_hdr->header == LINUX_HDRS_MAGIC && setup_hdr->version >= 0x020A && setup_hdr->init_size > 0) {
+        uint32_t kernel_decomp_end = (uint32_t)setup_hdr->pref_address + setup_hdr->init_size;
+        uint32_t safe_boundary = (kernel_decomp_end + 0x001FFFFF) & ~0x001FFFFF;
+        if (safe_boundary > initrd_phys) {
+            initrd_phys = safe_boundary;
+        }
+    }
+    void *initrd_buf = (void *)initrd_phys;
 
     if (iso_files.found_initrd) {
-        log_info("BOOT", "Streaming initramfs (%u MB) from block device into RAM...", iso_files.initrd_size / 1024 / 1024);
+        log_info("BOOT", "Streaming initramfs (%u MB) to 0x%08X (safe from kernel decompressor)...",
+                 iso_files.initrd_size / 1024 / 1024, initrd_phys);
         msc_src->seek(msc_src, (uint64_t)iso_files.initrd_lba * 2048);
-        msc_src->read(msc_src, initrd_buf, iso_files.initrd_size);
+        uint32_t i_read = msc_src->read(msc_src, initrd_buf, iso_files.initrd_size);
+        log_info("BOOT", "Initramfs read: %u / %u bytes", i_read, iso_files.initrd_size);
     }
 
     msc_src->close(msc_src);
@@ -190,10 +204,10 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
     if (iso_files.is_casper) {
         if (prof && prof->is_clean_session) {
             snprintf(cmdline, sizeof(cmdline),
-                     "boot=casper console=tty0 console=ttyS0,115200");
+                     "boot=casper nosplash console=tty0 console=ttyS0,115200");
         } else {
             snprintf(cmdline, sizeof(cmdline),
-                     "boot=casper persistent persistent-path=/BootManager/persistence/ console=tty0 console=ttyS0,115200");
+                     "boot=casper persistent persistent-path=/BootManager/persistence/ nosplash console=tty0 console=ttyS0,115200");
         }
     } else {
         if (prof && prof->is_clean_session) {
@@ -205,23 +219,13 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
         }
     }
 
-    // Switch to VBE Linear Framebuffer mode (activates HDMI external display & ANSI colors & scrollback)
-    vbe_mode_info_t vbe_mode = {0};
-    uint16_t vbe_mode_num = 0;
-    int vbe_ok = vbe_setup_linear_framebuffer(&vbe_mode, &vbe_mode_num);
-    if (vbe_ok == 0) {
-        log_info("BOOT", "VBE Linear Framebuffer active: Mode 0x%04X (%ux%ux%u)",
-                 vbe_mode_num, vbe_mode.x_res, vbe_mode.y_res, vbe_mode.bits_per_pixel);
-    } else {
-        log_info("BOOT", "VBE unavailable; falling back to VGA text mode.");
-    }
-
+    // Keep standard 80x25 VGA text mode for maximum compatibility across distributions
     linux_boot_params_t *params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
     linux_prepare_boot_params(kernel_buf, iso_files.kernel_size,
                               iso_files.found_initrd ? initrd_buf : NULL,
                               iso_files.found_initrd ? iso_files.initrd_size : 0,
                               cmdline, boot_info,
-                              (vbe_ok == 0) ? &vbe_mode : NULL,
+                              NULL, // Standard 80x25 VGA text mode
                               0, 0, // 0 MB of 6GB in RAM, no E820 reservation needed!
                               params);
 
@@ -252,7 +256,6 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
 static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_files_t *iso_files, boot_info_t *boot_info, const persistence_profile_t *prof) {
     uint8_t *ram_iso = (uint8_t *)LINUX_RAM_ISO_PHYS;
     void *kernel_buf = (void *)0x02000000;
-    void *initrd_buf = (void *)0x04000000;
 
     for (uint32_t b = 0; b < iso_files->kernel_size; b++) {
         ((uint8_t *)kernel_buf)[b] = ram_iso[(iso_files->kernel_lba * 2048) + b];
@@ -260,11 +263,23 @@ static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_fil
     log_info("BOOT", "Kernel extracted into RAM at 0x%08X (%u bytes).",
              (uint32_t)kernel_buf, iso_files->kernel_size);
 
+    // Compute safe physical address for initramfs safely above kernel decompression footprint
+    uint32_t initrd_phys = LINUX_INITRD_LOAD_PHYS;
+    const linux_setup_header_t *setup_hdr = (const linux_setup_header_t *)((const uint8_t *)kernel_buf + 0x1F1);
+    if (setup_hdr->header == LINUX_HDRS_MAGIC && setup_hdr->version >= 0x020A && setup_hdr->init_size > 0) {
+        uint32_t kernel_decomp_end = (uint32_t)setup_hdr->pref_address + setup_hdr->init_size;
+        uint32_t safe_boundary = (kernel_decomp_end + 0x001FFFFF) & ~0x001FFFFF;
+        if (safe_boundary > initrd_phys) {
+            initrd_phys = safe_boundary;
+        }
+    }
+    void *initrd_buf = (void *)initrd_phys;
+
     if (iso_files->found_initrd) {
         for (uint32_t b = 0; b < iso_files->initrd_size; b++) {
             ((uint8_t *)initrd_buf)[b] = ram_iso[(iso_files->initrd_lba * 2048) + b];
         }
-        log_info("BOOT", "Initramfs extracted into RAM at 0x%08X (%u bytes).",
+        log_info("BOOT", "Initramfs extracted into RAM at 0x%08X (%u bytes, safe from decompressor).",
                  (uint32_t)initrd_buf, iso_files->initrd_size);
     }
 
