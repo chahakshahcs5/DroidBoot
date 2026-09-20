@@ -293,3 +293,49 @@ int mtp_get_object(mtp_session_t *session, uint32_t handle, void *out_buf, uint3
     ptp_container_t resp;
     return mtp_recv_resp(session, &resp);
 }
+
+int mtp_get_partial_object(mtp_session_t *session, uint32_t handle, uint32_t offset, uint32_t max_bytes, void *out_buf, uint32_t *actual_len) {
+    if (!session || handle == 0 || !out_buf || max_bytes == 0) return -1;
+
+    // Operation 0x101B (GetPartialObject): Param1=Handle, Param2=Offset, Param3=MaxBytes
+    int res = mtp_send_cmd(session, PTP_OC_GetPartialObject, 3, handle, offset, max_bytes);
+    if (res != 0) return res;
+
+    static uint8_t first_chunk[1024];
+    uint32_t received = 0;
+    res = usb_bulk_transfer(session->usb_dev, session->usb_dev->mtp_bulk_in_ep, first_chunk, sizeof(first_chunk), &received);
+    if (res != 0) return res;
+
+    ptp_container_t *cont = (ptp_container_t *)first_chunk;
+    if (cont->type != PTP_CONTAINER_TYPE_DATA) {
+        log_error("MTP", "Expected Data container for GetPartialObject!");
+        return -2;
+    }
+
+    uint32_t total_payload = cont->length - 12;
+    uint32_t copy_first = received > 12 ? (received - 12) : 0;
+    if (copy_first > max_bytes) copy_first = max_bytes;
+
+    uint8_t *dst = (uint8_t *)out_buf;
+    for (uint32_t i = 0; i < copy_first; i++) {
+        dst[i] = first_chunk[12 + i];
+    }
+
+    uint32_t total_read = copy_first;
+    while (total_read < total_payload && total_read < max_bytes) {
+        uint32_t to_read = total_payload - total_read;
+        if (to_read > 4096) to_read = 4096;
+        if (total_read + to_read > max_bytes) to_read = max_bytes - total_read;
+
+        uint32_t chunk_received = 0;
+        res = usb_bulk_transfer(session->usb_dev, session->usb_dev->mtp_bulk_in_ep, dst + total_read, to_read, &chunk_received);
+        if (res != 0) break;
+        total_read += chunk_received;
+        if (chunk_received == 0) break;
+    }
+
+    if (actual_len) *actual_len = total_read;
+
+    ptp_container_t resp;
+    return mtp_recv_resp(session, &resp);
+}

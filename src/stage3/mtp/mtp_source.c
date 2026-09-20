@@ -90,6 +90,58 @@ static int mtp_source_open(boot_source_t *src, const char *path) {
     return -5;
 }
 
+int mtp_find_boot_file(boot_source_t *src, char *out_name, uint32_t max_len) {
+    mtp_fs_t *fs = (mtp_fs_t *)src->priv;
+    if (!fs || !fs->session || !out_name || max_len == 0) return -1;
+
+    uint32_t handles[256];
+    uint32_t hcount = 0;
+    int res = mtp_get_object_handles(fs->session, fs->session->active_storage_id, 0x00000000, handles, 256, &hcount);
+    if (res != 0) return res;
+
+    // First search for .iso files
+    for (uint32_t i = 0; i < hcount; i++) {
+        char name[64];
+        uint64_t size = 0;
+        if (mtp_get_object_info(fs->session, handles[i], name, sizeof(name), &size) == 0) {
+            int len = 0;
+            while (name[len]) len++;
+            if (len >= 4) {
+                const char *ext = name + len - 4;
+                if (str_eq_nocase(ext, ".iso")) {
+                    for (int c = 0; c < len && c < (int)max_len - 1; c++) {
+                        out_name[c] = name[c];
+                    }
+                    uint32_t final_idx = (uint32_t)len < (max_len - 1) ? (uint32_t)len : (max_len - 1);
+                    out_name[final_idx] = '\0';
+                    return 0;
+                }
+            }
+        }
+    }
+
+    // Then search for bzImage, vmlinuz*, or .img files
+    for (uint32_t i = 0; i < hcount; i++) {
+        char name[64];
+        uint64_t size = 0;
+        if (mtp_get_object_info(fs->session, handles[i], name, sizeof(name), &size) == 0) {
+            int len = 0;
+            while (name[len]) len++;
+            if (str_eq_nocase(name, "bzImage") || str_eq_nocase(name, "vmlinuz") ||
+                (len >= 4 && str_eq_nocase(name + len - 4, ".img"))) {
+                for (int c = 0; c < len && c < (int)max_len - 1; c++) {
+                    out_name[c] = name[c];
+                }
+                uint32_t final_idx = (uint32_t)len < (max_len - 1) ? (uint32_t)len : (max_len - 1);
+                out_name[final_idx] = '\0';
+                return 0;
+            }
+        }
+    }
+
+    return -2;
+}
+
 static uint32_t mtp_source_read(boot_source_t *src, void *buf, uint32_t size) {
     mtp_fs_t *fs = (mtp_fs_t *)src->priv;
     if (!fs || !fs->file_open || !buf) return 0;
@@ -99,7 +151,19 @@ static uint32_t mtp_source_read(boot_source_t *src, void *buf, uint32_t size) {
     }
     if (size == 0) return 0;
 
-    // If cached data not loaded, load full object into heap/streaming buffer
+    // For large files (> 8 MB, e.g. 353 MB Alpine ISO), stream on demand via GetPartialObject!
+    if (fs->file_size > (8 * 1024 * 1024)) {
+        uint32_t actual = 0;
+        int res = mtp_get_partial_object(fs->session, fs->handle, (uint32_t)fs->file_pos, size, buf, &actual);
+        if (res == 0) {
+            fs->file_pos += actual;
+            return actual;
+        }
+        log_error("MTP", "GetPartialObject failed at offset %u (error %d)", (uint32_t)fs->file_pos, res);
+        return 0;
+    }
+
+    // For smaller files (<= 8 MB), cache on first read
     if (!fs->cached_data) {
         fs->cached_data = (uint8_t *)kmalloc((uint32_t)fs->file_size);
         if (!fs->cached_data) {

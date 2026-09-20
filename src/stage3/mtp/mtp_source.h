@@ -7,5 +7,6 @@
 #include "../../include/boot_source.h"
 
 boot_source_t *boot_source_mtp_create(mtp_session_t *session);
+int            mtp_find_boot_file(boot_source_t *src, char *out_name, uint32_t max_len);
 
 #endif // MTP_SOURCE_H

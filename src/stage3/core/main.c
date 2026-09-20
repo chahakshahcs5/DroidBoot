@@ -13,6 +13,7 @@
 #include "../image/image_detect.h"
 #include "../linux/linux_boot.h"
 #include "../ui/menu.h"
+#include "../filesystem/iso_reader.h"
 
 static xhci_controller_t xhci_ctrl;
 static usb_device_t      detected_usb_dev;
@@ -191,8 +192,73 @@ void c_main(boot_info_t *boot_info) {
             if (active_mtp_session.session_active) {
                 boot_source_t *mtp_src = boot_source_mtp_create(&active_mtp_session);
                 if (mtp_src) {
-                    if (mtp_src->open(mtp_src, "bzImage") == 0) {
-                        log_info("BOOT", "Kernel image located on phone! Loading into RAM...");
+                    char target_file[64] = {0};
+                    if (mtp_find_boot_file(mtp_src, target_file, sizeof(target_file)) == 0) {
+                        log_info("BOOT", "Boot image found on Android phone: '%s'", target_file);
+                        if (mtp_src->open(mtp_src, target_file) == 0) {
+                            uint64_t fsize = mtp_src->size(mtp_src);
+                            log_info("BOOT", "Opened '%s' (%u MB). Inspecting...",
+                                     target_file, (uint32_t)(fsize / 1024 / 1024));
+
+                            // Check if ISO image
+                            iso_boot_files_t iso_files;
+                            if (iso_find_boot_files(mtp_src, &iso_files) == 0) {
+                                log_info("BOOT", "Alpine Linux ISO detected! Streaming kernel & initramfs...");
+                                void *kernel_buf = (void *)0x02000000;
+                                void *initrd_buf = (void *)0x04000000;
+
+                                mtp_src->seek(mtp_src, (uint64_t)iso_files.kernel_lba * 2048);
+                                mtp_src->read(mtp_src, kernel_buf, iso_files.kernel_size);
+
+                                if (iso_files.found_initrd) {
+                                    mtp_src->seek(mtp_src, (uint64_t)iso_files.initrd_lba * 2048);
+                                    mtp_src->read(mtp_src, initrd_buf, iso_files.initrd_size);
+                                }
+
+                                linux_kernel_info_t kinfo;
+                                if (linux_check_kernel_image(kernel_buf, iso_files.kernel_size, &kinfo) == 0) {
+                                    static linux_boot_params_t alpine_params;
+                                    const char *alpine_cmdline = "modules=loop,squashfs,sd-mod,usb-storage console=tty0 console=ttyS0,115200 quiet";
+                                    linux_prepare_boot_params(kernel_buf, iso_files.kernel_size,
+                                                              iso_files.found_initrd ? initrd_buf : NULL,
+                                                              iso_files.found_initrd ? iso_files.initrd_size : 0,
+                                                              alpine_cmdline, boot_info, &alpine_params);
+
+                                    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                                    log_info("BOOT", "==========================================================");
+                                    log_info("BOOT", "  HANDING OFF TO ALPINE LINUX KERNEL ENTRY (0x00100000)   ");
+                                    log_info("BOOT", "==========================================================");
+                                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+                                    linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
+                                                    LINUX_KERNEL_LOAD_PHYS,
+                                                    kinfo.protected_mode_size,
+                                                    (uint32_t)&alpine_params,
+                                                    kinfo.code32_start);
+                                }
+                            } else {
+                                // Raw kernel image
+                                void *kernel_buf = (void *)0x02000000;
+                                mtp_src->seek(mtp_src, 0);
+                                mtp_src->read(mtp_src, kernel_buf, (uint32_t)fsize);
+
+                                linux_kernel_info_t kinfo;
+                                if (linux_check_kernel_image(kernel_buf, (uint32_t)fsize, &kinfo) == 0) {
+                                    static linux_boot_params_t raw_params;
+                                    const char *cmdline = "console=tty0 console=ttyS0,115200 root=/dev/ram0 rw quiet";
+                                    linux_prepare_boot_params(kernel_buf, (uint32_t)fsize,
+                                                              NULL, 0,
+                                                              cmdline, boot_info, &raw_params);
+                                    linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
+                                                    LINUX_KERNEL_LOAD_PHYS,
+                                                    kinfo.protected_mode_size,
+                                                    (uint32_t)&raw_params,
+                                                    kinfo.code32_start);
+                                }
+                            }
+                        }
+                    } else {
+                        log_error("BOOT", "No bootable kernel or ISO found in Android /Download/!");
                     }
                 }
             } else {
