@@ -7,6 +7,7 @@
 #include "../pci/pci.h"
 #include "../xhci/xhci.h"
 #include "../usb/usb.h"
+#include "../usb/usb_msc.h"
 #include "../mtp/mtp.h"
 #include "../mtp/mtp_source.h"
 #include "../filesystem/fat_source.h"
@@ -16,9 +17,12 @@
 #include "../filesystem/iso_reader.h"
 #include "../debug/disk_log.h"
 #include "../debug/sound.h"
+#include "../bios/vbe.h"
 
 static xhci_controller_t xhci_ctrl;
 static usb_device_t      detected_usb_dev;
+static usb_device_t      detected_msc_dev;
+static bool              msc_found = false;
 static mtp_session_t     active_mtp_session;
 
 static void k_memset(void *dst, uint8_t val, size_t n) {
@@ -48,7 +52,9 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
             const char *alpine_cmdline = "earlyprintk=serial,0x3f8,115200 console=ttyS0,115200 console=tty0 noapic debug";
             linux_prepare_boot_params(kernel_buf, kernel_size,
                                       initrd_buf, initrd_size,
-                                      alpine_cmdline, boot_info, params_at_low_mem);
+                                      alpine_cmdline, boot_info,
+                                      NULL, 0, 0,
+                                      params_at_low_mem);
 
             vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
             log_info("STAGE3", "Phase 8 Image Detection Successfully Verified!");
@@ -108,7 +114,9 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
     const char *cmdline = "console=ttyS0,115200 root=/dev/ram0 rw quiet";
     int prep = linux_prepare_boot_params(test_kernel_image, sizeof(test_kernel_image),
                                          (void *)0x04000000, 1048576,
-                                         cmdline, boot_info, &test_params);
+                                         cmdline, boot_info,
+                                         NULL, 0, 0,
+                                         &test_params);
     if (prep == 0 && test_params.hdr.header == LINUX_HDRS_MAGIC && test_params.e820_entries > 0) {
         log_info("TEST", "Phase 9 Boot Params Setup: SUCCESS (%u E820 entries attached)",
                  test_params.e820_entries);
@@ -122,14 +130,315 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
     }
 }
 
+static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info) {
+    log_info("BOOT", "Attempting boot from USB Block Storage on Port %u...", dev->port_num);
+    boot_source_t *msc_src = boot_source_msc_create(dev);
+    if (!msc_src) {
+        log_error("BOOT", "Failed to create boot source for USB block device.");
+        sound_error_tone();
+        return;
+    }
+
+    iso_boot_files_t iso_files;
+    int r = iso_find_boot_files(msc_src, &iso_files);
+    if (r != 0 || !iso_files.found_kernel) {
+        log_error("BOOT", "No bootable Linux kernel or ISO9660 image found on USB block storage!");
+        sound_error_tone();
+        return;
+    }
+
+    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    log_info("BOOT", "==========================================================");
+    log_info("BOOT", "  BOOTABLE OS DETECTED ON USB BLOCK DEVICE!               ");
+    log_info("BOOT", "  * Distro Type    : %s", iso_files.is_casper ? "Ubuntu / Casper Live (6GB)" : "Alpine / Standard Linux");
+    log_info("BOOT", "  * Kernel LBA     : %u (Size: %u MB)", iso_files.kernel_lba, iso_files.kernel_size / 1024 / 1024);
+    log_info("BOOT", "  * Initramfs LBA  : %u (Size: %u MB)", iso_files.initrd_lba, iso_files.initrd_size / 1024 / 1024);
+    log_info("BOOT", "  * Mode           : Direct Block Access (0 MB OS in RAM!) ");
+    log_info("BOOT", "==========================================================");
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+    void *kernel_buf = (void *)0x02000000;
+    void *initrd_buf = (void *)0x04000000;
+
+    log_info("BOOT", "Streaming tiny kernel (%u MB) from block device into RAM...", iso_files.kernel_size / 1024 / 1024);
+    msc_src->seek(msc_src, (uint64_t)iso_files.kernel_lba * 2048);
+    uint32_t k_read = msc_src->read(msc_src, kernel_buf, iso_files.kernel_size);
+    if (k_read != iso_files.kernel_size) {
+        log_error("BOOT", "Kernel read incomplete: %u / %u bytes", k_read, iso_files.kernel_size);
+        sound_error_tone();
+        return;
+    }
+
+    if (iso_files.found_initrd) {
+        log_info("BOOT", "Streaming initramfs (%u MB) from block device into RAM...", iso_files.initrd_size / 1024 / 1024);
+        msc_src->seek(msc_src, (uint64_t)iso_files.initrd_lba * 2048);
+        uint32_t i_read = msc_src->read(msc_src, initrd_buf, iso_files.initrd_size);
+        if (i_read != iso_files.initrd_size) {
+            log_error("BOOT", "Initramfs read incomplete: %u / %u bytes", i_read, iso_files.initrd_size);
+            sound_error_tone();
+            return;
+        }
+    }
+
+    linux_kernel_info_t kinfo;
+    if (linux_check_kernel_image(kernel_buf, iso_files.kernel_size, &kinfo) != 0) {
+        log_error("BOOT", "Kernel image validation failed!");
+        sound_error_tone();
+        return;
+    }
+
+    // Determine kernel command line:
+    // For Ubuntu / Casper live: boot directly from phone block storage on-demand with persistence
+    // For Alpine on block device: boot with sd-mod, usb-storage and apkovl persistence
+    char cmdline[256];
+    if (iso_files.is_casper) {
+        snprintf(cmdline, sizeof(cmdline),
+                 "boot=casper persistent console=tty0 quiet splash");
+    } else {
+        snprintf(cmdline, sizeof(cmdline),
+                 "modules=loop,squashfs,sd-mod,usb-storage console=tty0 apkovl=sda1:");
+    }
+
+    // Switch to VBE Linear Framebuffer mode (activates HDMI external display & ANSI colors & scrollback)
+    vbe_mode_info_t vbe_mode = {0};
+    uint16_t vbe_mode_num = 0;
+    int vbe_ok = vbe_setup_linear_framebuffer(&vbe_mode, &vbe_mode_num);
+    if (vbe_ok == 0) {
+        log_info("BOOT", "VBE Linear Framebuffer active: Mode 0x%04X (%ux%ux%u)",
+                 vbe_mode_num, vbe_mode.x_res, vbe_mode.y_res, vbe_mode.bits_per_pixel);
+    } else {
+        log_info("BOOT", "VBE unavailable; falling back to VGA text mode.");
+    }
+
+    linux_boot_params_t *params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
+    linux_prepare_boot_params(kernel_buf, iso_files.kernel_size,
+                              iso_files.found_initrd ? initrd_buf : NULL,
+                              iso_files.found_initrd ? iso_files.initrd_size : 0,
+                              cmdline, boot_info,
+                              (vbe_ok == 0) ? &vbe_mode : NULL,
+                              0, 0, // 0 MB of 6GB in RAM, no E820 reservation needed!
+                              params);
+
+    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    log_info("BOOT", "==========================================================");
+    log_info("BOOT", "  HANDING OFF EXECUTION TO LINUX (ON-DEMAND BLOCK STORAGE)");
+    log_info("BOOT", "  * OS Filesystem streamed on-demand directly from phone! ");
+    log_info("BOOT", "  * RAM consumed by OS image: 0 MB!                       ");
+    log_info("BOOT", "==========================================================");
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+    xhci_stop(&xhci_ctrl);
+    sound_silence();
+
+    log_info("LOG", "Final pre-handoff flush: %u flushes, %u errors, %u bytes logged",
+             disk_log_get_flush_count(), disk_log_get_error_count(), disk_log_get_length());
+    disk_log_flush_with_feedback();
+
+    sound_kernel_jump_tone();
+
+    linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
+                    LINUX_KERNEL_LOAD_PHYS,
+                    kinfo.protected_mode_size,
+                    LINUX_BOOT_PARAMS_PHYS,
+                    kinfo.code32_start);
+}
+
+static void boot_from_android_mtp(mtp_session_t *session, boot_info_t *boot_info) {
+    log_info("BOOT", "Attempting boot from Android Phone (MTP)...");
+    if (!session || !session->session_active) {
+        log_error("BOOT", "Android MTP session not active!");
+        sound_error_tone();
+        return;
+    }
+
+    boot_source_t *mtp_src = boot_source_mtp_create(session);
+    if (!mtp_src) {
+        log_error("BOOT", "Failed to create MTP boot source.");
+        sound_error_tone();
+        return;
+    }
+
+    char target_file[64] = {0};
+    if (mtp_find_boot_file(mtp_src, target_file, sizeof(target_file)) != 0) {
+        log_error("BOOT", "No bootable kernel or ISO found in Android /Download/!");
+        sound_error_tone();
+        return;
+    }
+
+    log_info("BOOT", "Boot image found on Android phone: '%s'", target_file);
+    if (mtp_src->open(mtp_src, target_file) != 0) {
+        log_error("BOOT", "Failed to open '%s' on Android phone!", target_file);
+        sound_error_tone();
+        return;
+    }
+
+    uint64_t fsize = mtp_src->size(mtp_src);
+    log_info("BOOT", "Opened '%s' (%u MB). Inspecting...",
+             target_file, (uint32_t)(fsize / 1024 / 1024));
+
+    iso_boot_files_t iso_files;
+    if (iso_find_boot_files(mtp_src, &iso_files) == 0 && iso_files.found_kernel) {
+        log_info("BOOT", "Bootable ISO detected! (%s)",
+                 iso_files.is_casper ? "Ubuntu / Casper Live" : "Alpine Linux");
+
+        uint32_t total_iso_bytes = (uint32_t)fsize;
+        uint8_t *ram_iso = (uint8_t *)LINUX_RAM_ISO_PHYS;
+
+        vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+        log_info("BOOT", "Streaming full ISO from Android phone to RAM at 0x%08X...", LINUX_RAM_ISO_PHYS);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+        uint32_t streamed = 0;
+        uint32_t block_size = 1048576; // 1 MB per request
+        uint32_t last_pct = 0;
+
+        while (streamed < total_iso_bytes) {
+            uint32_t chunk = total_iso_bytes - streamed;
+            if (chunk > block_size) chunk = block_size;
+
+            mtp_src->seek(mtp_src, streamed);
+            int r = mtp_src->read(mtp_src, ram_iso + streamed, chunk);
+            if (r <= 0) {
+                log_error("BOOT", "Failed to stream ISO at offset %u (chunk %u)", streamed, chunk);
+                break;
+            }
+            streamed += r;
+
+            uint32_t mb_streamed = streamed >> 20;
+            uint32_t mb_total = total_iso_bytes >> 20;
+            uint32_t pct = mb_total ? ((mb_streamed * 100) / mb_total) : 0;
+            if (pct >= last_pct + 10 || streamed == total_iso_bytes) {
+                log_info("BOOT", "  Streaming ISO: %u%% (%u MB / %u MB)...",
+                         pct, mb_streamed, mb_total);
+                last_pct = pct;
+                disk_log_flush();
+            }
+        }
+
+        if (streamed < total_iso_bytes) {
+            log_error("BOOT", "ISO transfer incomplete: %u / %u bytes", streamed, total_iso_bytes);
+            sound_error_tone();
+            return;
+        }
+
+        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        log_info("BOOT", "Full ISO successfully cached in RAM (%u MB)!", total_iso_bytes / 1024 / 1024);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+        void *kernel_buf = (void *)0x02000000;
+        void *initrd_buf = (void *)0x04000000;
+
+        // Fast extraction from in-RAM ISO buffer
+        for (uint32_t b = 0; b < iso_files.kernel_size; b++) {
+            ((uint8_t *)kernel_buf)[b] = ram_iso[(iso_files.kernel_lba * 2048) + b];
+        }
+        log_info("BOOT", "Kernel extracted into RAM at 0x%08X (%u bytes).",
+                 (uint32_t)kernel_buf, iso_files.kernel_size);
+
+        if (iso_files.found_initrd) {
+            for (uint32_t b = 0; b < iso_files.initrd_size; b++) {
+                ((uint8_t *)initrd_buf)[b] = ram_iso[(iso_files.initrd_lba * 2048) + b];
+            }
+            log_info("BOOT", "Initramfs extracted into RAM at 0x%08X (%u bytes).",
+                     (uint32_t)initrd_buf, iso_files.initrd_size);
+        }
+
+        linux_kernel_info_t kinfo;
+        if (linux_check_kernel_image(kernel_buf, iso_files.kernel_size, &kinfo) == 0) {
+            // Install mBFT table at 0x000E0000 for Alpine memdiskfind
+            linux_setup_mbft(LINUX_RAM_ISO_PHYS, total_iso_bytes);
+
+            // Kernel command line: phram + memmap + memdisk + apkovl=sda1: (SD card persistence!)
+            char alpine_cmdline[256];
+            snprintf(alpine_cmdline, sizeof(alpine_cmdline),
+                     "modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes console=tty0 loglevel=7 apkovl=sda1:",
+                     LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
+
+            // Switch to VBE Linear Framebuffer mode
+            vbe_mode_info_t vbe_mode = {0};
+            uint16_t vbe_mode_num = 0;
+            int vbe_ok = vbe_setup_linear_framebuffer(&vbe_mode, &vbe_mode_num);
+            if (vbe_ok == 0) {
+                log_info("BOOT", "VBE Linear Framebuffer active: Mode 0x%04X (%ux%ux%u)",
+                         vbe_mode_num, vbe_mode.x_res, vbe_mode.y_res, vbe_mode.bits_per_pixel);
+            } else {
+                log_info("BOOT", "VBE unavailable; falling back to VGA text mode.");
+            }
+
+            linux_boot_params_t *alpine_params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
+            linux_prepare_boot_params(kernel_buf, iso_files.kernel_size,
+                                      iso_files.found_initrd ? initrd_buf : NULL,
+                                      iso_files.found_initrd ? iso_files.initrd_size : 0,
+                                      alpine_cmdline, boot_info,
+                                      (vbe_ok == 0) ? &vbe_mode : NULL,
+                                      LINUX_RAM_ISO_PHYS, total_iso_bytes,
+                                      alpine_params);
+
+            vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+            log_info("BOOT", "==========================================================");
+            log_info("BOOT", "  HANDING OFF TO IN-RAM LINUX WITH SD PERSISTENCE         ");
+            log_info("BOOT", "  * In-RAM ISO     : 0x%08X (%u MB, Type 2 RESERVED)     ",
+                     LINUX_RAM_ISO_PHYS, total_iso_bytes / 1024 / 1024);
+            log_info("BOOT", "  * Persistence    : apkovl=sda1: (SD card FAT32 overlay) ");
+            log_info("BOOT", "==========================================================");
+            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+            xhci_stop(&xhci_ctrl);
+            sound_silence();
+
+            log_info("LOG", "Final pre-handoff flush: %u flushes, %u errors, %u bytes logged",
+                     disk_log_get_flush_count(), disk_log_get_error_count(), disk_log_get_length());
+            disk_log_flush_with_feedback();
+
+            sound_kernel_jump_tone();
+
+            linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
+                            LINUX_KERNEL_LOAD_PHYS,
+                            kinfo.protected_mode_size,
+                            LINUX_BOOT_PARAMS_PHYS,
+                            kinfo.code32_start);
+        }
+    } else {
+        // Raw kernel image fallback
+        void *kernel_buf = (void *)0x02000000;
+        mtp_src->seek(mtp_src, 0);
+        mtp_src->read(mtp_src, kernel_buf, (uint32_t)fsize);
+
+        linux_kernel_info_t kinfo;
+        if (linux_check_kernel_image(kernel_buf, (uint32_t)fsize, &kinfo) == 0) {
+            linux_boot_params_t *raw_params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
+            const char *cmdline = "console=tty0 earlyprintk=vga loglevel=7 root=/dev/ram0 rw";
+            linux_prepare_boot_params(kernel_buf, (uint32_t)fsize,
+                                      NULL, 0,
+                                      cmdline, boot_info,
+                                      NULL, 0, 0,
+                                      raw_params);
+
+            xhci_stop(&xhci_ctrl);
+            sound_silence();
+
+            log_info("LOG", "Final pre-handoff flush: %u flushes, %u errors, %u bytes logged",
+                     disk_log_get_flush_count(), disk_log_get_error_count(), disk_log_get_length());
+            disk_log_flush_with_feedback();
+
+            sound_kernel_jump_tone();
+
+            linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
+                            LINUX_KERNEL_LOAD_PHYS,
+                            kinfo.protected_mode_size,
+                            LINUX_BOOT_PARAMS_PHYS,
+                            kinfo.code32_start);
+        }
+    }
+}
+
 void c_main(boot_info_t *boot_info) {
     // 1. Initialize Serial Port & VGA Console
     serial_init();
     vga_init();
-    sound_boot_tone(); // PC speaker tone indicating Stage 3 is alive!
+    sound_boot_tone();
 
-    // 2. Initialize Persistent SD Disk Logging EARLY (before banner)
-    //    This ensures the very first printk output is captured to disk.
+    // 2. Initialize Persistent SD Disk Logging EARLY
     disk_log_init(boot_info);
 
     // 3. Banner
@@ -140,29 +449,24 @@ void c_main(boot_info_t *boot_info) {
     printk("======================================================================\n\n");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-    // 4. Report Stage 1/2 Handoff Parameters
-    if (boot_info) {
-        log_info("STAGE3", "Boot Drive preserved: 0x%02X (%s)",
-                 boot_info->boot_drive,
-                 (boot_info->boot_drive >= 0x80) ? "Hard Disk / SD" : "Floppy");
-    } else {
-        log_error("STAGE3", "boot_info pointer is NULL!");
-    }
+    log_info("STAGE3", "Boot Drive preserved: 0x%02X (%s)",
+             boot_info->boot_drive,
+             (boot_info->boot_drive >= 0x80) ? "Hard Disk / SD" : "Floppy");
 
-    // 5. Memory Management & E820 Map
+    // Phase 2: Memory Management Initialization
     memory_init(boot_info);
+    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    log_info("STAGE3", "Phase 2 Memory Management Successfully Verified!");
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
     // 6. PCI Bus Enumeration (xHCI Host Controller Discovery)
     pci_init();
 
     pci_device_t *xhci_pci = pci_find_xhci();
     if (xhci_pci) {
-        // Phase 3: Initialize xHCI Host Controller
         log_info("STAGE3", "Initializing xHCI Host Controller hardware...");
         int xhci_status = xhci_init(xhci_pci, &xhci_ctrl);
-
         if (xhci_status == 0) {
-            // Test command ring with a NO-OP command
             xhci_trb_t noop_cmd = {0};
             noop_cmd.control = TRB_TYPE(TRB_NOOP_CMD);
             xhci_trb_t noop_evt = {0};
@@ -177,20 +481,17 @@ void c_main(boot_info_t *boot_info) {
             log_info("STAGE3", "Phase 3 xHCI Controller Initialization Successfully Verified!");
             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-            // Phase 4 & 5: Detect Connected USB Devices & Android MTP Phone
-            log_info("XHCI", "Scanning USB ports for Android phone (MTP) and boot media...");
+            bool phone_prompted = false;
             bool mtp_found = false;
             uint32_t probed_ports = 0;
             uint8_t probe_fail_count[32] = {0};
-            bool phone_prompted = false;
 
-            static usb_device_t current_dev;
-
-            // Pass 0: Initial full sweep across all ports to register SD Card Reader / USB Mass Storage immediately
-            xhci_poll_ports(&xhci_ctrl);
+            // Initial scan of connected USB devices
+            usb_device_t current_dev;
             for (uint8_t p = 1; p <= xhci_ctrl.max_ports && p < 32; p++) {
                 uintptr_t port_reg = xhci_ctrl.op_regs + XHCI_OP_PORTS_BASE + (p - 1) * 0x10;
                 uint32_t portsc = *(volatile uint32_t *)port_reg;
+
                 if (!(portsc & XHCI_PORT_CCS)) continue;
 
                 k_memset(&current_dev, 0, sizeof(current_dev));
@@ -203,8 +504,12 @@ void c_main(boot_info_t *boot_info) {
                     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
                     if (current_dev.has_msc) {
-                        log_info("STAGE3", "Port %u: USB Mass Storage Boot / Logging Drive registered.", p);
-                        disk_log_register_usb_msc(&current_dev);
+                        log_info("STAGE3", "Port %u: USB Mass Storage Block Storage registered.", p);
+                        detected_msc_dev = current_dev;
+                        msc_found = true;
+                        if (detected_usb_dev.slot_id == 0) {
+                            detected_usb_dev = current_dev;
+                        }
                     } else if (current_dev.has_mtp) {
                         detected_usb_dev = current_dev;
                         log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
@@ -233,14 +538,14 @@ void c_main(boot_info_t *boot_info) {
                 }
             }
 
-            // Poll loop: 100 iterations of 200ms delay = 20 seconds for Android MTP selection
-            for (int poll_iter = 0; poll_iter < 100 && !mtp_found; poll_iter++) {
+            // Poll loop: wait if device not yet detected
+            for (int poll_iter = 0; poll_iter < 100 && !mtp_found && !msc_found; poll_iter++) {
                 if (poll_iter > 0) {
                     for (int d = 0; d < 200000; d++) io_wait();
                 }
 
                 if (poll_iter % 25 == 0 && poll_iter > 0) {
-                    log_info("STAGE3", "Waiting for Android phone (File Transfer / MTP)... %u sec left",
+                    log_info("STAGE3", "Waiting for Android phone or USB storage... %u sec left",
                              (100 - poll_iter) / 5);
                 }
 
@@ -258,7 +563,6 @@ void c_main(boot_info_t *boot_info) {
                     }
 
                     if (probed_ports & (1U << p)) continue;
-
                     if (probe_fail_count[p] >= 3) continue;
 
                     k_memset(&current_dev, 0, sizeof(current_dev));
@@ -286,34 +590,20 @@ void c_main(boot_info_t *boot_info) {
                                 sound_phone_connected_tone();
                                 mtp_found = true;
                                 break;
-                            } else {
-                                log_error("STAGE3", "Failed to initialize MTP session (code %d)", mtp_res);
                             }
                         } else if (current_dev.has_msc) {
-                            log_info("STAGE3", "Port %u: USB Mass Storage / SD Card Reader active.", p);
-                            disk_log_register_usb_msc(&current_dev);
-                        } else {
-                            log_info("STAGE3", "Port %u: Attached device (VID 0x%04X, PID 0x%04X) is in Charging/No-Data mode.",
-                                     p, current_dev.dev_desc.idVendor, current_dev.dev_desc.idProduct);
-                            vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
-                            log_info("STAGE3", ">>> PLEASE UNLOCK PHONE AND TAP 'File Transfer / MTP' ON SCREEN! <<<");
-                            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-                            if (!phone_prompted) {
-                                sound_prompt_tone();
-                                phone_prompted = true;
+                            log_info("STAGE3", "Port %u: USB Mass Storage Block Storage registered.", p);
+                            detected_msc_dev = current_dev;
+                            msc_found = true;
+                            if (detected_usb_dev.slot_id == 0) {
+                                detected_usb_dev = current_dev;
                             }
+                            break;
                         }
                     } else {
                         probe_fail_count[p]++;
-                        log_error("STAGE3", "Probe failed on Port %u (attempt %u/3, code %d)",
-                                  p, probe_fail_count[p], probe_res);
                     }
                 }
-            }
-
-            if (!mtp_found) {
-                log_info("STAGE3", "No Android MTP phone detected within timeout. Proceeding to Boot Menu...");
-                sound_error_tone(); // Warning tone: No MTP phone detected
             }
         } else {
             log_error("STAGE3", "Failed to initialize xHCI controller (error %d)", xhci_status);
@@ -331,118 +621,23 @@ void c_main(boot_info_t *boot_info) {
     // Phase 10: Display Interactive Boot Menu
     menu_render(boot_info, &xhci_ctrl, &detected_usb_dev, &active_mtp_session);
 
-    // Wait for user selection or auto-selection timeout (1 second if MTP active, 2 seconds otherwise)
-    boot_choice_t choice = menu_wait_selection(active_mtp_session.session_active ? 1 : 2,
-                                               active_mtp_session.session_active);
+    // Wait for user selection or auto-selection timeout (1 second if device active, 2 seconds otherwise)
+    bool has_active_dev = active_mtp_session.session_active || msc_found;
+    boot_choice_t choice = menu_wait_selection(has_active_dev ? 1 : 2,
+                                               active_mtp_session.session_active,
+                                               msc_found);
 
     switch (choice) {
         case BOOT_CHOICE_ANDROID_MTP:
-            log_info("BOOT", "Attempting boot from Android Phone (MTP)...");
-            if (active_mtp_session.session_active) {
-                boot_source_t *mtp_src = boot_source_mtp_create(&active_mtp_session);
-                if (mtp_src) {
-                    char target_file[64] = {0};
-                    if (mtp_find_boot_file(mtp_src, target_file, sizeof(target_file)) == 0) {
-                        log_info("BOOT", "Boot image found on Android phone: '%s'", target_file);
-                        if (mtp_src->open(mtp_src, target_file) == 0) {
-                            uint64_t fsize = mtp_src->size(mtp_src);
-                            log_info("BOOT", "Opened '%s' (%u MB). Inspecting...",
-                                     target_file, (uint32_t)(fsize / 1024 / 1024));
+            boot_from_android_mtp(&active_mtp_session, boot_info);
+            break;
 
-                            // Check if ISO image
-                            iso_boot_files_t iso_files;
-                            if (iso_find_boot_files(mtp_src, &iso_files) == 0) {
-                                log_info("BOOT", "Alpine Linux ISO detected! Streaming kernel (%u MB) and initramfs (%u MB)...",
-                                         iso_files.kernel_size / 1024 / 1024,
-                                         iso_files.found_initrd ? (iso_files.initrd_size / 1024 / 1024) : 0);
-
-                                void *kernel_buf = (void *)0x02000000;
-                                void *initrd_buf = (void *)0x04000000;
-
-                                mtp_src->seek(mtp_src, (uint64_t)iso_files.kernel_lba * 2048);
-                                mtp_src->read(mtp_src, kernel_buf, iso_files.kernel_size);
-                                log_info("BOOT", "Kernel streamed into RAM at 0x%08X (%u bytes).",
-                                         (uint32_t)kernel_buf, iso_files.kernel_size);
-
-                                if (iso_files.found_initrd) {
-                                    mtp_src->seek(mtp_src, (uint64_t)iso_files.initrd_lba * 2048);
-                                    mtp_src->read(mtp_src, initrd_buf, iso_files.initrd_size);
-                                    log_info("BOOT", "Initramfs streamed into RAM at 0x%08X (%u bytes).",
-                                             (uint32_t)initrd_buf, iso_files.initrd_size);
-                                }
-
-                                linux_kernel_info_t kinfo;
-                                if (linux_check_kernel_image(kernel_buf, iso_files.kernel_size, &kinfo) == 0) {
-                                    linux_boot_params_t *alpine_params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
-                                    const char *alpine_cmdline = "modules=loop,squashfs,sd-mod,usb-storage console=tty0 earlyprintk=vga loglevel=7";
-                                    linux_prepare_boot_params(kernel_buf, iso_files.kernel_size,
-                                                              iso_files.found_initrd ? initrd_buf : NULL,
-                                                              iso_files.found_initrd ? iso_files.initrd_size : 0,
-                                                              alpine_cmdline, boot_info, alpine_params);
-
-                                    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-                                    log_info("BOOT", "==========================================================");
-                                    log_info("BOOT", "  HANDING OFF TO ALPINE LINUX KERNEL ENTRY (0x00100000)   ");
-                                    log_info("BOOT", "==========================================================");
-                                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-
-                                    // 1. Quiesce xHCI host controller & disable DMA to prevent memory corruption
-                                    xhci_stop(&xhci_ctrl);
-
-                                    // 2. Silence PC speaker
-                                    sound_silence();
-
-                                    // 3. Final persistent log flush with audio feedback before handoff
-                                    log_info("LOG", "Final pre-handoff flush: %u flushes, %u errors, %u bytes logged",
-                                             disk_log_get_flush_count(), disk_log_get_error_count(), disk_log_get_length());
-                                    disk_log_flush_with_feedback();
-
-                                    sound_kernel_jump_tone(); // Fanfare: Booting into Linux kernel!
-
-                                    linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
-                                                    LINUX_KERNEL_LOAD_PHYS,
-                                                    kinfo.protected_mode_size,
-                                                    LINUX_BOOT_PARAMS_PHYS,
-                                                    kinfo.code32_start);
-                                }
-                            } else {
-                                // Raw kernel image
-                                void *kernel_buf = (void *)0x02000000;
-                                mtp_src->seek(mtp_src, 0);
-                                mtp_src->read(mtp_src, kernel_buf, (uint32_t)fsize);
-
-                                linux_kernel_info_t kinfo;
-                                if (linux_check_kernel_image(kernel_buf, (uint32_t)fsize, &kinfo) == 0) {
-                                    linux_boot_params_t *raw_params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
-                                    const char *cmdline = "console=tty0 earlyprintk=vga loglevel=7 root=/dev/ram0 rw";
-                                    linux_prepare_boot_params(kernel_buf, (uint32_t)fsize,
-                                                              NULL, 0,
-                                                              cmdline, boot_info, raw_params);
-
-                                    xhci_stop(&xhci_ctrl);
-                                    sound_silence();
-
-                                    log_info("LOG", "Final pre-handoff flush: %u flushes, %u errors, %u bytes logged",
-                                             disk_log_get_flush_count(), disk_log_get_error_count(), disk_log_get_length());
-                                    disk_log_flush_with_feedback();
-
-                                    linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
-                                                    LINUX_KERNEL_LOAD_PHYS,
-                                                    kinfo.protected_mode_size,
-                                                    LINUX_BOOT_PARAMS_PHYS,
-                                                    kinfo.code32_start);
-                                }
-                            }
-                        }
-                    } else {
-                        log_error("BOOT", "No bootable kernel or ISO found in Android /Download/!");
-                        sound_error_tone();
-                    }
-                }
+        case BOOT_CHOICE_USB_MSC:
+            if (msc_found) {
+                boot_from_usb_msc(&detected_msc_dev, boot_info);
             } else {
-                log_error("BOOT", "Android MTP session not active! Falling back to self-test...");
+                log_error("BOOT", "USB Mass Storage device not detected!");
                 sound_error_tone();
-                test_linux_boot_simulation(boot_info);
             }
             break;
 

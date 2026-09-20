@@ -38,7 +38,7 @@ REQUIRED_LOG_PATTERNS = [
     "[STAGE3] Phase 4 USB Enumeration Successfully Verified!",
     "[STAGE3] Phase 1 Legacy BIOS Bootstrap Successfully Verified!",
     "Boot Menu Selection:",
-    "[1] Boot Linux from Android Phone (MTP /Download/bzImage)",
+    "[1] Boot Linux from Android Phone (MTP In-RAM Boot + SD Persistence)",
     "[2] Boot Linux from SD Card (FAT32 Partition)",
     "[3] Hardware Diagnostics & PCI / USB / Memory Inspection",
     "[4] Linux 32-bit Boot Protocol Self-Test & Handoff Simulation",
@@ -55,7 +55,14 @@ def main():
         sys.exit(f"[-] Boot image {BOOT_IMG} not found! Run build first.")
 
     if os.path.exists(SERIAL_LOG):
-        os.remove(SERIAL_LOG)
+        try:
+            os.remove(SERIAL_LOG)
+        except OSError:
+            try:
+                with open(SERIAL_LOG, "w") as f:
+                    f.truncate(0)
+            except OSError:
+                pass
 
     qemu_cmd = [
         "qemu-system-x86_64",

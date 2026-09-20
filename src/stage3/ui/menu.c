@@ -59,6 +59,9 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
         if (usb_dev->has_mtp) {
             printk("|  * Phone Status : Android MTP Device Attached (Slot %u, VID: 0x%04X)   |\n",
                    usb_dev->slot_id, usb_dev->dev_desc.idVendor);
+        } else if (usb_dev->has_msc) {
+            printk("|  * Storage Mode : USB Mass Storage Block Device (Slot %u, VID: 0x%04X)  |\n",
+                   usb_dev->slot_id, usb_dev->dev_desc.idVendor);
         } else {
             printk("|  * USB Device   : Attached (Class 0x%02X, VID: 0x%04X, PID: 0x%04X)       |\n",
                    usb_dev->dev_desc.bDeviceClass, usb_dev->dev_desc.idVendor, usb_dev->dev_desc.idProduct);
@@ -71,7 +74,11 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
     printk("+------------------------------------------------------------------------+\n");
     printk("| Boot Menu Selection:                                                   |\n");
     vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-    printk("|  [1] Boot Linux from Android Phone (MTP /Download/bzImage)             |\n");
+    if (usb_dev && usb_dev->has_msc) {
+        printk("|  [1] Boot Linux from USB Block Device / Rooted Phone (On-Demand Direct)|\n");
+    } else {
+        printk("|  [1] Boot Linux from Android Phone (MTP In-RAM Boot + SD Persistence) |\n");
+    }
     printk("|  [2] Boot Linux from SD Card (FAT32 Partition)                         |\n");
     printk("|  [3] Hardware Diagnostics & PCI / USB / Memory Inspection              |\n");
     printk("|  [4] Linux 32-bit Boot Protocol Self-Test & Handoff Simulation         |\n");
@@ -80,7 +87,7 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 }
 
-boot_choice_t menu_wait_selection(uint32_t timeout_seconds, bool has_mtp) {
+boot_choice_t menu_wait_selection(uint32_t timeout_seconds, bool has_mtp, bool has_msc) {
     printk("[MENU] Select option [1-4] or wait %u sec for auto-selection...\n", timeout_seconds);
 
     for (int sec = (int)timeout_seconds; sec > 0; sec--) {
@@ -90,8 +97,13 @@ boot_choice_t menu_wait_selection(uint32_t timeout_seconds, bool has_mtp) {
         for (int i = 0; i < 1000; i++) {
             int ch = poll_input_char();
             if (ch == '1') {
-                printk("\n[MENU] User selected [1]: Boot Linux from Android Phone (MTP)\n");
-                return BOOT_CHOICE_ANDROID_MTP;
+                if (has_msc) {
+                    printk("\n[MENU] User selected [1]: Boot from USB Block Storage (Direct)\n");
+                    return BOOT_CHOICE_USB_MSC;
+                } else {
+                    printk("\n[MENU] User selected [1]: Boot from Android Phone (MTP In-RAM)\n");
+                    return BOOT_CHOICE_ANDROID_MTP;
+                }
             }
             if (ch == '2') {
                 printk("\n[MENU] User selected [2]: Boot Linux from SD Card (FAT32)\n");
@@ -114,7 +126,9 @@ boot_choice_t menu_wait_selection(uint32_t timeout_seconds, bool has_mtp) {
     }
 
     printk("\n[MENU] Countdown expired! Proceeding with auto-selection...\n");
-    return has_mtp ? BOOT_CHOICE_ANDROID_MTP : BOOT_CHOICE_TEST_PROTOCOL;
+    if (has_msc) return BOOT_CHOICE_USB_MSC;
+    if (has_mtp) return BOOT_CHOICE_ANDROID_MTP;
+    return BOOT_CHOICE_TEST_PROTOCOL;
 }
 
 void menu_show_diagnostics(boot_info_t *boot_info, xhci_controller_t *xhci,

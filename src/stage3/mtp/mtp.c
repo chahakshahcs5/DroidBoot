@@ -216,7 +216,7 @@ int mtp_get_object(mtp_session_t *session, uint32_t handle, void *out_buf, uint3
     uint32_t total_read = copy_first;
     while (total_read < total_payload && total_read < max_len) {
         uint32_t to_read = total_payload - total_read;
-        if (to_read > 4096) to_read = 4096;
+        if (to_read > 65536) to_read = 65536;
         if (total_read + to_read > max_len) to_read = max_len - total_read;
 
         uint32_t chunk_received = 0;
@@ -264,7 +264,7 @@ int mtp_get_partial_object(mtp_session_t *session, uint32_t handle, uint32_t off
     uint32_t total_read = copy_first;
     while (total_read < total_payload && total_read < max_bytes) {
         uint32_t to_read = total_payload - total_read;
-        if (to_read > 4096) to_read = 4096;
+        if (to_read > 65536) to_read = 65536;
         if (total_read + to_read > max_bytes) to_read = max_bytes - total_read;
 
         uint32_t chunk_received = 0;

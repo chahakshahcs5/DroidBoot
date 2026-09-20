@@ -45,4 +45,11 @@ int usb_msc_read_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, void *
 // Write 512-byte sectors to USB Mass Storage device
 int usb_msc_write_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, const void *buf);
 
+// Read capacity (10) from USB Mass Storage device
+int usb_msc_read_capacity(usb_device_t *dev, uint32_t *out_last_lba, uint32_t *out_block_size);
+
+// Create a generic boot_source_t wrapping a USB Mass Storage device
+#include "../../include/boot_source.h"
+boot_source_t *boot_source_msc_create(usb_device_t *dev);
+
 #endif // USB_MSC_H

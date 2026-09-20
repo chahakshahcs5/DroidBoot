@@ -1,6 +1,7 @@
 #include "usb_msc.h"
 #include "../../include/io.h"
 #include "../core/printf.h"
+#include "../memory/memory.h"
 #include <stddef.h>
 
 static uint32_t msc_tag_counter = 0x88000001;
@@ -164,3 +165,144 @@ int usb_msc_write_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, const
 
     return 0;
 }
+
+int usb_msc_read_capacity(usb_device_t *dev, uint32_t *out_last_lba, uint32_t *out_block_size) {
+    if (!dev || !dev->has_msc) return -1;
+
+    uint32_t tag = ++msc_tag_counter;
+    uint8_t cdb[10] = { SCSI_READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    int res = usb_msc_send_cbw(dev, tag, 8, 0x80, 10, cdb);
+    if (res != 0) return res;
+
+    uint8_t cap_data[8];
+    uint32_t transferred = 0;
+    res = usb_bulk_transfer(dev, dev->msc_bulk_in_ep, cap_data, 8, &transferred);
+    if (res != 0) return res;
+
+    res = usb_msc_recv_csw(dev, tag);
+    if (res != 0) return res;
+
+    uint32_t last_lba = ((uint32_t)cap_data[0] << 24) |
+                        ((uint32_t)cap_data[1] << 16) |
+                        ((uint32_t)cap_data[2] << 8)  |
+                        (uint32_t)cap_data[3];
+    uint32_t block_size = ((uint32_t)cap_data[4] << 24) |
+                          ((uint32_t)cap_data[5] << 16) |
+                          ((uint32_t)cap_data[6] << 8)  |
+                          (uint32_t)cap_data[7];
+
+    if (out_last_lba) *out_last_lba = last_lba;
+    if (out_block_size) *out_block_size = block_size;
+
+    return 0;
+}
+
+typedef struct msc_source_priv {
+    usb_device_t *dev;
+    uint64_t      offset;
+    uint64_t      total_size;
+} msc_source_priv_t;
+
+static int msc_src_open(boot_source_t *src, const char *path) {
+    (void)src;
+    (void)path;
+    return 0;
+}
+
+static uint32_t msc_src_read(boot_source_t *src, void *buf, uint32_t size) {
+    msc_source_priv_t *priv = (msc_source_priv_t *)src->priv;
+    if (!priv || !priv->dev || !buf || size == 0) return 0;
+
+    uint32_t bytes_read = 0;
+    uint8_t *dst = (uint8_t *)buf;
+
+    while (bytes_read < size) {
+        uint64_t cur_pos = priv->offset + bytes_read;
+        uint32_t lba = (uint32_t)(cur_pos >> 9);
+        uint32_t sec_offset = (uint32_t)(cur_pos & 511);
+
+        if (sec_offset == 0 && (size - bytes_read) >= 512) {
+            uint32_t sectors_to_read = (size - bytes_read) >> 9;
+            if (sectors_to_read > 64) sectors_to_read = 64; // Max 32KB per bulk transfer
+            if (usb_msc_read_sectors(priv->dev, lba, (uint16_t)sectors_to_read, dst + bytes_read) != 0) {
+                break;
+            }
+            bytes_read += sectors_to_read * 512;
+        } else {
+            static uint8_t bounce[512];
+            if (usb_msc_read_sectors(priv->dev, lba, 1, bounce) != 0) {
+                break;
+            }
+            uint32_t chunk = 512 - sec_offset;
+            if (chunk > (size - bytes_read)) chunk = size - bytes_read;
+            for (uint32_t i = 0; i < chunk; i++) {
+                dst[bytes_read + i] = bounce[sec_offset + i];
+            }
+            bytes_read += chunk;
+        }
+    }
+
+    priv->offset += bytes_read;
+    return bytes_read;
+}
+
+static int msc_src_seek(boot_source_t *src, uint64_t offset) {
+    msc_source_priv_t *priv = (msc_source_priv_t *)src->priv;
+    if (!priv) return -1;
+    priv->offset = offset;
+    return 0;
+}
+
+static uint64_t msc_src_tell(boot_source_t *src) {
+    msc_source_priv_t *priv = (msc_source_priv_t *)src->priv;
+    return priv ? priv->offset : 0;
+}
+
+static uint64_t msc_src_size(boot_source_t *src) {
+    msc_source_priv_t *priv = (msc_source_priv_t *)src->priv;
+    return priv ? priv->total_size : 0;
+}
+
+static void msc_src_close(boot_source_t *src) {
+    (void)src;
+}
+
+boot_source_t *boot_source_msc_create(usb_device_t *dev) {
+    if (!dev || !dev->has_msc) return NULL;
+
+    msc_source_priv_t *priv = (msc_source_priv_t *)kmalloc(sizeof(msc_source_priv_t));
+    if (!priv) return NULL;
+
+    priv->dev = dev;
+    priv->offset = 0;
+    priv->total_size = 0;
+
+    uint32_t last_lba = 0;
+    uint32_t block_size = 512;
+    if (usb_msc_read_capacity(dev, &last_lba, &block_size) == 0 && block_size > 0) {
+        priv->total_size = (uint64_t)(last_lba + 1) * block_size;
+        log_info("MSC", "USB MSC Capacity: %u MB (%u sectors of %u B)",
+                 (uint32_t)(priv->total_size >> 20), last_lba + 1, block_size);
+    } else {
+        log_info("MSC", "Could not read capacity, defaulting to unconstrained block access.");
+    }
+
+    boot_source_t *src = (boot_source_t *)kmalloc(sizeof(boot_source_t));
+    if (!src) {
+        kfree(priv);
+        return NULL;
+    }
+
+    src->name = "USB-MSC";
+    src->open = msc_src_open;
+    src->read = msc_src_read;
+    src->seek = msc_src_seek;
+    src->tell = msc_src_tell;
+    src->size = msc_src_size;
+    src->close = msc_src_close;
+    src->priv = priv;
+
+    return src;
+}
+

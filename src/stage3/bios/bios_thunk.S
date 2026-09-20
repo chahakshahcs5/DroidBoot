@@ -1,6 +1,7 @@
 .code32
 .section .text
 .globl bios_int13_call
+.globl bios_int10_call
 
 # ==============================================================================
 # int bios_int13_call(uint8_t drive, uint32_t dap_phys, uint8_t cmd)
@@ -29,12 +30,76 @@ bios_int13_call:
     # 0x7100: drive (1 byte)
     # 0x7102: dap offset (2 bytes, EDX & 0xFFFF)
     # 0x7104: cmd (1 byte)
+    # 0x7105: op_type (0 = INT 13h, 1 = INT 10h)
     # 0x7106: return code (2 bytes)
     # 0x7108: saved 32-bit ESP (4 bytes)
     movb %al, (0x7100)
     movw %dx, (0x7102)
     movb %cl, (0x7104)
+    movb $0, (0x7105)       # op_type = 0 (INT 13h)
     movl %esp, (0x7108)
+
+    # Copy thunk code and data table to 0x7000
+    movl $thunk_blob_start, %esi
+    movl $0x7000, %edi
+    movl $(thunk_blob_end - thunk_blob_start), %ecx
+    cld
+    rep movsb
+
+    # Load 16-bit GDT from low-memory copy
+    lgdt (0x7000 + (thunk_gdt_desc - thunk_blob_start))
+
+    # Far jump to 16-bit protected mode code selector (0x18) at 0x7000
+    ljmp $0x18, $0x7000
+
+# ==============================================================================
+# uint16_t bios_int10_call(uint16_t ax, uint16_t bx, uint16_t cx, uint16_t dx,
+#                          uint16_t es, uint16_t di)
+#
+# Arguments:
+#   8(%ebp)  = uint16_t ax
+#  12(%ebp)  = uint16_t bx
+#  16(%ebp)  = uint16_t cx
+#  20(%ebp)  = uint16_t dx
+#  24(%ebp)  = uint16_t es
+#  28(%ebp)  = uint16_t di
+#
+# Returns:
+#   AX return code from INT 10h (0x004F = VBE Success)
+# ==============================================================================
+bios_int10_call:
+    pushl %ebp
+    movl %esp, %ebp
+    pushl %ebx
+    pushl %esi
+    pushl %edi
+
+    movw 8(%ebp), %ax
+    movw 12(%ebp), %bx
+    movw 16(%ebp), %cx
+    movw 20(%ebp), %dx
+    movw 24(%ebp), %si      # ES
+    movw 28(%ebp), %di      # DI
+
+    # Mailbox for INT 10h:
+    # 0x7105: op_type = 1 (INT 10h)
+    # 0x7108: saved 32-bit ESP
+    # 0x7110: AX
+    # 0x7112: BX
+    # 0x7114: CX
+    # 0x7116: DX
+    # 0x7118: ES
+    # 0x711A: DI
+    # 0x711C: ret_AX
+    # 0x711E: ret_FLAGS
+    movb $1, (0x7105)
+    movl %esp, (0x7108)
+    movw %ax, (0x7110)
+    movw %bx, (0x7112)
+    movw %cx, (0x7114)
+    movw %dx, (0x7116)
+    movw %si, (0x7118)
+    movw %di, (0x711A)
 
     # Copy thunk code and data table to 0x7000
     movl $thunk_blob_start, %esi
@@ -65,9 +130,21 @@ pmode_return:
     # Restore 32-bit ESP
     movl (0x7108), %esp
 
-    # Read return code from mailbox
-    movzwl (0x7106), %eax
+    # Check op_type
+    cmpb $1, (0x7105)
+    je .pmode_ret_int10
 
+    # Read INT 13h return code from mailbox
+    movzwl (0x7106), %eax
+    popl %edi
+    popl %esi
+    popl %ebx
+    popl %ebp
+    ret
+
+.pmode_ret_int10:
+    # Read INT 10h return code (AX) from mailbox
+    movzwl (0x711C), %eax
     popl %edi
     popl %esi
     popl %ebx
@@ -109,7 +186,11 @@ thunk_rm_entry:
     # Load Real Mode IVT (Limit 0x3FF, Base 0)
     lidt (0x7000 + (thunk_rm_idt - thunk_blob_start))
 
-    # Read mailbox parameters
+    # Check op_type (0 = INT 13h, 1 = INT 10h)
+    cmpb $1, (0x7105)
+    je .rm_int10
+
+    # --- INT 13h Disk Service ---
     movb (0x7100), %dl      # drive
     movw (0x7102), %si      # DS:SI = DAP pointer
     movb (0x7104), %ah      # cmd (0x42 / 0x43)
@@ -131,6 +212,23 @@ thunk_rm_entry:
     movb $0xFF, %ah
 .save_code:
     movw %ax, (0x7106)
+    jmp .switch_back
+
+.rm_int10:
+    # --- INT 10h Video / VBE Service ---
+    movw (0x7118), %es      # ES
+    movw (0x711A), %di      # DI
+    movw (0x7110), %ax      # AX
+    movw (0x7112), %bx      # BX
+    movw (0x7114), %cx      # CX
+    movw (0x7116), %dx      # DX
+
+    clc
+    sti
+    int $0x10
+    cli
+    movw %ax, (0x711C)      # Save return AX
+    jmp .switch_back
 
 .switch_back:
     cli

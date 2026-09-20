@@ -105,6 +105,8 @@ int linux_check_kernel_image(const void *image_buf, uint32_t size, linux_kernel_
 int linux_prepare_boot_params(const void *kernel_image, uint32_t kernel_size,
                                const void *initrd_buf, uint32_t initrd_size,
                                const char *cmdline, boot_info_t *boot_info,
+                               const vbe_mode_info_t *vbe_mode,
+                               uint32_t ram_iso_addr, uint32_t ram_iso_size,
                                linux_boot_params_t *out_params) {
     (void)kernel_size;
     if (!kernel_image || !out_params) return -1;
@@ -122,15 +124,44 @@ int linux_prepare_boot_params(const void *kernel_image, uint32_t kernel_size,
     out_params->hdr.loadflags |= LINUX_LOADFLAGS_LOADED_HIGH | LINUX_LOADFLAGS_CAN_USE_HEAP;
     out_params->hdr.heap_end_ptr = 0x9000;
 
-    // Setup standard 80x25 VGA text mode screen_info (prevents early kernel console crash)
-    out_params->screen_info[0] = 0;      // orig_x = 0
-    out_params->screen_info[1] = 0;      // orig_y = 0
-    out_params->screen_info[4] = 0;      // orig_video_page = 0
-    out_params->screen_info[6] = 3;      // orig_video_mode = 3 (80x25 color text)
-    out_params->screen_info[7] = 80;     // orig_video_cols = 80
-    out_params->screen_info[14] = 25;    // orig_video_lines = 25
-    out_params->screen_info[15] = 0x22;  // orig_video_isVGA = 0x22 (VIDEO_TYPE_VGAC)
-    out_params->screen_info[16] = 16;    // orig_video_points = 16 (font 8x16)
+    // Setup screen_info: VBE Linear Framebuffer or fallback to 80x25 VGA text mode
+    linux_screen_info_t *si = &out_params->screen_info;
+    if (vbe_mode && vbe_mode->phys_base_ptr != 0) {
+        si->orig_video_isVGA = VIDEO_TYPE_VLFB; // 0x23: VBE Linear Framebuffer
+        si->orig_video_mode = 0x18;             // VBE mode flag
+        si->orig_video_cols = vbe_mode->x_res / 8;
+        si->orig_video_lines = vbe_mode->y_res / 16;
+        si->orig_video_points = 16;
+        si->lfb_width = vbe_mode->x_res;
+        si->lfb_height = vbe_mode->y_res;
+        si->lfb_depth = vbe_mode->bits_per_pixel;
+        si->lfb_base = vbe_mode->phys_base_ptr;
+        si->lfb_size = (vbe_mode->y_res * vbe_mode->bytes_per_scanline + 65535) / 65536;
+        si->lfb_linelength = vbe_mode->bytes_per_scanline;
+        si->red_size = vbe_mode->red_mask_size ? vbe_mode->red_mask_size : 8;
+        si->red_pos = vbe_mode->red_field_position ? vbe_mode->red_field_position : 16;
+        si->green_size = vbe_mode->green_mask_size ? vbe_mode->green_mask_size : 8;
+        si->green_pos = vbe_mode->green_field_position ? vbe_mode->green_field_position : 8;
+        si->blue_size = vbe_mode->blue_mask_size ? vbe_mode->blue_mask_size : 8;
+        si->blue_pos = vbe_mode->blue_field_position ? vbe_mode->blue_field_position : 0;
+        si->rsvd_size = vbe_mode->rsvd_mask_size ? vbe_mode->rsvd_mask_size : 8;
+        si->rsvd_pos = vbe_mode->rsvd_field_position ? vbe_mode->rsvd_field_position : 24;
+        si->vesa_attributes = vbe_mode->attributes;
+        si->capabilities = 0;
+
+        log_info("LINUX", "Configured VESA Linear Framebuffer screen_info: %ux%ux%u @ 0x%08X (Pitch %u B)",
+                 si->lfb_width, si->lfb_height, si->lfb_depth, si->lfb_base, si->lfb_linelength);
+    } else {
+        // Fallback: standard 80x25 VGA text mode
+        si->orig_x = 0;
+        si->orig_y = 0;
+        si->orig_video_page = 0;
+        si->orig_video_mode = 3;
+        si->orig_video_cols = 80;
+        si->orig_video_lines = 25;
+        si->orig_video_isVGA = VIDEO_TYPE_VGAC; // 0x22
+        si->orig_video_points = 16;
+    }
 
     // Fill in alt_mem_k from usable RAM
     uint32_t mem_k = (uint32_t)(memory_get_total_usable() / 1024);
@@ -157,24 +188,112 @@ int linux_prepare_boot_params(const void *kernel_image, uint32_t kernel_size,
                  (uint32_t)initrd_buf, initrd_size);
     }
 
-    // Transfer E820 memory map from boot_info
+    // Transfer E820 memory map from boot_info, and reserve in-RAM ISO region if active
     if (boot_info && boot_info->e820_count > 0) {
         e820_entry_t *src_e820 = (e820_entry_t *)boot_info->e820_map_addr;
         uint32_t count = boot_info->e820_count;
-        if (count > 128) count = 128;
+        if (count > 120) count = 120;
 
-        for (uint32_t i = 0; i < count; i++) {
-            out_params->e820_table[i].addr = src_e820[i].base;
-            out_params->e820_table[i].size = src_e820[i].length;
-            out_params->e820_table[i].type = src_e820[i].type;
+        uint32_t dst_idx = 0;
+        uint64_t iso_start = ram_iso_addr;
+        uint64_t iso_len_aligned = (ram_iso_size > 0) ? ((ram_iso_size + 0x1FFFFF) & ~0x1FFFFFULL) : 0;
+        uint64_t iso_end = iso_start + iso_len_aligned;
+        bool iso_reserved = false;
+
+        for (uint32_t i = 0; i < count && dst_idx < 126; i++) {
+            uint64_t base = src_e820[i].base;
+            uint64_t length = src_e820[i].length;
+            uint32_t type = src_e820[i].type;
+            uint64_t end = base + length;
+
+            // Check if this USABLE entry contains the in-RAM ISO
+            if (ram_iso_addr > 0 && ram_iso_size > 0 && !iso_reserved &&
+                type == 1 && base <= iso_start && end >= iso_end) {
+
+                // 1. Portion before ISO (if any)
+                if (iso_start > base) {
+                    out_params->e820_table[dst_idx].addr = base;
+                    out_params->e820_table[dst_idx].size = iso_start - base;
+                    out_params->e820_table[dst_idx].type = 1; // USABLE
+                    dst_idx++;
+                }
+
+                // 2. ISO memory region -> Marked RESERVED (Type 2) so kernel never overwrites it!
+                out_params->e820_table[dst_idx].addr = iso_start;
+                out_params->e820_table[dst_idx].size = iso_end - iso_start;
+                out_params->e820_table[dst_idx].type = 2; // RESERVED
+                log_info("LINUX", "E820: Reserved In-RAM ISO: 0x%08X - 0x%08X (%u MB, Type 2 RESERVED)",
+                         (uint32_t)iso_start, (uint32_t)iso_end, (uint32_t)(iso_len_aligned >> 20));
+                dst_idx++;
+
+                // 3. Portion after ISO (if any)
+                if (end > iso_end) {
+                    out_params->e820_table[dst_idx].addr = iso_end;
+                    out_params->e820_table[dst_idx].size = end - iso_end;
+                    out_params->e820_table[dst_idx].type = 1; // USABLE
+                    dst_idx++;
+                }
+
+                iso_reserved = true;
+            } else {
+                out_params->e820_table[dst_idx].addr = base;
+                out_params->e820_table[dst_idx].size = length;
+                out_params->e820_table[dst_idx].type = type;
+                dst_idx++;
+            }
         }
-        out_params->e820_entries = (uint8_t)count;
-        log_info("LINUX", "Transferred %u E820 memory entries to boot_params", count);
+        out_params->e820_entries = (uint8_t)dst_idx;
+        log_info("LINUX", "Transferred %u E820 memory entries to boot_params (ISO protected)", dst_idx);
     }
 
     log_info("LINUX", "Prepared Linux boot_params at 0x%08X", (uint32_t)out_params);
     return 0;
 }
+
+void linux_setup_mbft(uint32_t iso_phys_addr, uint32_t iso_size) {
+    if (iso_phys_addr == 0 || iso_size == 0) return;
+
+    // Deploy mBFT at standard ACPI/ROM scan area 0x000E0000
+    // memdiskfind scans 0x80000..0xA0000 and 0xE0000..0x100000
+    linux_mbft_t *mbft = (linux_mbft_t *)0x000E0000;
+    kmemset(mbft, 0, sizeof(linux_mbft_t));
+
+    // ACPI Header
+    mbft->acpi.signature[0] = 'm';
+    mbft->acpi.signature[1] = 'B';
+    mbft->acpi.signature[2] = 'F';
+    mbft->acpi.signature[3] = 'T';
+    mbft->acpi.length = sizeof(linux_mbft_t);
+    mbft->acpi.revision = 1;
+    mbft->acpi.oem_id[0] = 'S'; mbft->acpi.oem_id[1] = 'Y'; mbft->acpi.oem_id[2] = 'S';
+    mbft->acpi.oem_id[3] = 'L'; mbft->acpi.oem_id[4] = 'N'; mbft->acpi.oem_id[5] = 'X';
+    mbft->acpi.oem_table_id[0] = 'M'; mbft->acpi.oem_table_id[1] = 'E'; mbft->acpi.oem_table_id[2] = 'M';
+    mbft->acpi.oem_table_id[3] = 'D'; mbft->acpi.oem_table_id[4] = 'I'; mbft->acpi.oem_table_id[5] = 'S';
+    mbft->acpi.oem_table_id[6] = 'K'; mbft->acpi.oem_table_id[7] = ' ';
+    mbft->acpi.oem_revision = 1;
+
+    // MEMDISK Info (MDI)
+    mbft->mdi.bytes = sizeof(mbft->mdi);
+    mbft->mdi.version_minor = 0;
+    mbft->mdi.version_major = 1;
+    mbft->mdi.diskbuf = iso_phys_addr;
+    mbft->mdi.disksize = (iso_size + 2047) / 2048; // CD/ISO sector count
+    mbft->mdi.olddosmem = 640;
+    mbft->mdi.bootloaderid = 0x30;
+    mbft->mdi.sector_shift = 11; // 2048-byte CD sectors
+
+    // Checksum calculation (sum over length == 0)
+    uint8_t *bytes = (uint8_t *)mbft;
+    uint8_t csum = 0;
+    for (uint32_t i = 0; i < sizeof(linux_mbft_t); i++) {
+        csum += bytes[i];
+    }
+    mbft->acpi.checksum = (uint8_t)(0x100 - csum);
+
+    log_info("LINUX", "Installed mBFT table at 0x000E0000 (diskbuf=0x%08X, size=%u MB, csum=0x%02X)",
+             iso_phys_addr, iso_size / 1024 / 1024, mbft->acpi.checksum);
+}
+
 
 void linux_boot_jump(uint32_t kernel_source_addr, uint32_t kernel_target_addr,
                     uint32_t kernel_size, uint32_t boot_params_addr,

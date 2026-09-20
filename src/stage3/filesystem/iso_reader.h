@@ -12,6 +12,7 @@ typedef struct iso_boot_files {
     uint32_t initrd_size;
     bool     found_kernel;
     bool     found_initrd;
+    bool     is_casper;
 } iso_boot_files_t;
 
 int iso_find_boot_files(boot_source_t *iso_src, iso_boot_files_t *out_files);

@@ -376,7 +376,6 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
                                                    out_dev->msc_bulk_out_ep, out_dev->msc_bulk_out_max_packet);
         if (msc_cfg == 0) {
             usb_msc_init_device(out_dev);
-            disk_log_register_usb_msc(out_dev);
         }
     }
 
@@ -528,7 +527,7 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
     xhci_write32(db_reg, doorbell_target);
 
     // Poll Event Ring for Transfer Event
-    int timeout = 20000;
+    int timeout = 100000;
     while (--timeout > 0) {
         xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
         uint32_t cycle = evt->control & 1U;

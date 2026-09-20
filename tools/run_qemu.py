@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""
+tools/run_qemu.py - Unified Desktop QEMU Test Runner for Bootloader
+Tests both Pathway 1 (In-RAM Alpine Boot with SD Persistence)
+and Pathway 2 (Rooted Phone / USB Mass Storage On-Demand Boot for Ubuntu 6GB)
+in an interactive graphical desktop window without rebooting your laptop!
+"""
+
+import os
+import sys
+import argparse
+import subprocess
+import time
+
+WORKSPACE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BUILD_DIR = os.path.join(WORKSPACE_ROOT, "build")
+BOOT_IMG = os.path.join(BUILD_DIR, "boot.img")
+SERIAL_LOG = os.path.join(BUILD_DIR, "serial.log")
+
+DEFAULT_UBUNTU_ISO = r"C:\Users\chaha\Downloads\ubuntu-26.04.1-desktop-amd64.iso"
+DEFAULT_ALPINE_ISO = r"C:\Users\chaha\Downloads\alpine-standard-3.24.2-x86_64.iso"
+
+def check_build():
+    if not os.path.exists(BOOT_IMG):
+        print(f"[*] Boot image not found at {BOOT_IMG}. Building now...")
+        res = subprocess.run([sys.executable, os.path.join(WORKSPACE_ROOT, "build.py")], cwd=WORKSPACE_ROOT)
+        if res.returncode != 0:
+            sys.exit("[-] Build failed! Please resolve errors before running QEMU.")
+
+def build_qemu_command(mode, iso_path, memory, headless, usb_host):
+    check_build()
+
+    if os.path.exists(SERIAL_LOG):
+        try:
+            os.remove(SERIAL_LOG)
+        except OSError:
+            pass
+
+    cmd = [
+        "qemu-system-x86_64",
+        "-drive", f"file={BOOT_IMG},format=raw,if=ide",
+        "-device", "qemu-xhci,id=xhci",
+        "-m", memory,
+        "-serial", "stdio"
+    ]
+
+    if headless:
+        cmd.extend(["-display", "none"])
+
+    if usb_host:
+        # Pass-through physical USB device (e.g. your physical Android phone)
+        # Format: vid:pid (e.g. 18d1:4ee7 or 2717:ff40)
+        parts = usb_host.split(":")
+        if len(parts) == 2:
+            vid, pid = parts[0], parts[1]
+            cmd.extend(["-device", f"usb-host,bus=xhci.0,vendorid=0x{vid},productid=0x{pid}"])
+            print(f"[+] Attached physical USB device ({vid}:{pid}) to xHCI via usb-host pass-through.")
+        else:
+            print(f"[-] Invalid --usb-host format: {usb_host} (expected VID:PID, e.g. 2717:ff40)")
+
+    elif mode in ["block", "ubuntu"]:
+        # Pathway 2: Rooted Phone / USB Mass Storage emulation (Ubuntu 6GB)
+        if not os.path.exists(iso_path):
+            print(f"[-] Ubuntu ISO not found at {iso_path}!")
+            print("    Please provide a valid ISO with --iso <path>.")
+            sys.exit(1)
+
+        print(f"[+] Mimicking Rooted Android Phone (USB Mass Storage) with: {iso_path}")
+        print("    * Bootloader will read ONLY vmlinuz (17MB) and initrd (95MB) in ~1-2 sec.")
+        print("    * Linux kernel will mount the 6GB OS directly from the block device.")
+        print("    * RAM consumed by OS image: 0 MB!")
+        cmd.extend([
+            "-drive", f"id=phone_disk,file={iso_path},format=raw,if=none,readonly=on",
+            "-device", "usb-storage,bus=xhci.0,drive=phone_disk"
+        ])
+
+    elif mode in ["alpine-block"]:
+        # Pathway 2 with Alpine ISO on USB block storage
+        if not os.path.exists(iso_path):
+            print(f"[-] Alpine ISO not found at {iso_path}!")
+            sys.exit(1)
+
+        print(f"[+] Mimicking Rooted Android Phone (USB Mass Storage) with Alpine: {iso_path}")
+        cmd.extend([
+            "-drive", f"id=phone_disk,file={iso_path},format=raw,if=none,readonly=on",
+            "-device", "usb-storage,bus=xhci.0,drive=phone_disk"
+        ])
+
+    elif mode in ["ram", "mtp"]:
+        # Pathway 1: In-RAM Boot + SD Card Persistence (Alpine Linux ~370MB)
+        if not os.path.exists(iso_path):
+            print(f"[-] ISO not found at {iso_path}!")
+            sys.exit(1)
+
+        iso_size_mb = os.path.getsize(iso_path) // (1024 * 1024)
+        print(f"[+] Preloading ISO into RAM simulation (256MB boundary, 0x10000000): {iso_path} ({iso_size_mb} MB)")
+        print("    * Bootloader configures phram=iso,0x10000000,<len> and mBFT at 0x000E0000.")
+        print("    * E820 memory table reserves ISO region (Type 2 RESERVED).")
+        print("    * Alpine Linux creates /dev/mtdblock0 in RAM.")
+        print("    * Persistence writes to SD Card FAT32 partition via apkovl=sda1:.")
+
+        # In QEMU, preloading an image directly to physical memory at 0x10000000
+        cmd.extend([
+            "-device", "loader,file=" + iso_path + ",addr=0x10000000,force-raw=on"
+        ])
+
+    return cmd
+
+def main():
+    parser = argparse.ArgumentParser(description="Desktop QEMU Bootloader Runner")
+    parser.add_argument("--mode", choices=["block", "ubuntu", "alpine-block", "ram", "mtp"], default="block",
+                        help="Boot pathway: 'block' (USB Mass Storage 6GB Ubuntu on-demand) or 'ram' (In-RAM Alpine with persistence)")
+    parser.add_argument("--iso", default="",
+                        help="Path to ISO image (defaults to Downloads folder)")
+    parser.add_argument("--memory", default="2048M",
+                        help="RAM size for VM (default: 2048M)")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run without graphical display window")
+    parser.add_argument("--usb-host", default="",
+                        help="Pass-through real physical USB phone (VID:PID, e.g. 2717:ff40)")
+
+    args = parser.parse_args()
+
+    # Determine default ISO based on mode
+    iso_path = args.iso
+    if not iso_path:
+        if args.mode in ["block", "ubuntu"]:
+            iso_path = DEFAULT_UBUNTU_ISO
+        else:
+            iso_path = DEFAULT_ALPINE_ISO
+
+    qemu_cmd = build_qemu_command(args.mode, iso_path, args.memory, args.headless, args.usb_host)
+
+    print("\n" + "=" * 70)
+    print("  LAUNCHING DESKTOP QEMU TEST ENVIRONMENT")
+    print(f"  Mode       : {args.mode.upper()}")
+    print(f"  Target ISO : {iso_path}")
+    print(f"  Memory     : {args.memory}")
+    print(f"  Display    : {'Headless' if args.headless else 'Interactive Graphical Window'}")
+    print("=" * 70 + "\n")
+
+    print("[*] Running command:")
+    print(" ".join(qemu_cmd))
+    print("\n[!] A graphical QEMU window will now open on your desktop.")
+    print("    Press Ctrl+Alt+G to release mouse if captured, or close the window to exit.\n")
+
+    try:
+        proc = subprocess.Popen(qemu_cmd, cwd=WORKSPACE_ROOT)
+        proc.wait()
+    except KeyboardInterrupt:
+        print("\n[*] Terminating QEMU...")
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    except Exception as e:
+        print(f"[-] Error launching QEMU: {e}")
+
+if __name__ == "__main__":
+    main()

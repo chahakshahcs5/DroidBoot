@@ -19,6 +19,7 @@ STAGE3_SRCS_C := $(SRC_DIR)/stage3/core/main.c \
                  $(SRC_DIR)/stage3/debug/vga.c \
                  $(SRC_DIR)/stage3/debug/disk_log.c \
                  $(SRC_DIR)/stage3/bios/bios_disk.c \
+                 $(SRC_DIR)/stage3/bios/vbe.c \
                  $(SRC_DIR)/stage3/memory/memory.c \
                  $(SRC_DIR)/stage3/pci/pci.c \
                  $(SRC_DIR)/stage3/xhci/xhci.c \

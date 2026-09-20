@@ -3,11 +3,15 @@
 
 #include <stdarg.h>
 #include <stdint.h>
+#include <stddef.h>
 
 void printk(const char *fmt, ...);
 void vprintk(const char *fmt, va_list args);
 
 void log_info(const char *tag, const char *fmt, ...);
 void log_error(const char *tag, const char *fmt, ...);
+
+int snprintf(char *str, size_t size, const char *fmt, ...);
+int vsnprintf(char *str, size_t size, const char *fmt, va_list args);
 
 #endif // PRINTF_H

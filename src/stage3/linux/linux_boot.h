@@ -2,9 +2,12 @@
 #define LINUX_BOOT_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include "../../include/boot.h"
+#include "../bios/vbe.h"
 
+// Linux 32-bit Boot Protocol definitions (Protocol 2.00+)
 #define LINUX_HDRS_MAGIC        0x53726448  // "HdrS"
 #define LINUX_BOOT_FLAG_MAGIC   0xAA55
 #define LINUX_BOOT_LOADER_TYPE  0xFF        // Undefined / Custom Bootloader
@@ -63,8 +66,46 @@ typedef struct linux_e820_entry {
     uint32_t type;
 } linux_e820_entry_t;
 
+typedef struct linux_screen_info {
+    uint8_t  orig_x;                // 0x00
+    uint8_t  orig_y;                // 0x01
+    uint16_t ext_mem_k;             // 0x02
+    uint16_t orig_video_page;       // 0x04
+    uint8_t  orig_video_mode;       // 0x06
+    uint8_t  orig_video_cols;       // 0x07
+    uint8_t  flags;                 // 0x08
+    uint8_t  unused2;               // 0x09
+    uint16_t orig_video_ega_bx;     // 0x0A
+    uint16_t unused3;               // 0x0C
+    uint8_t  orig_video_lines;      // 0x0E
+    uint8_t  orig_video_isVGA;      // 0x0F: 0x22 = VIDEO_TYPE_VGAC, 0x23 = VIDEO_TYPE_VLFB
+    uint16_t orig_video_points;     // 0x10: font height (16)
+    uint16_t lfb_width;             // 0x12
+    uint16_t lfb_height;            // 0x14
+    uint16_t lfb_depth;             // 0x16
+    uint32_t lfb_base;              // 0x18: 32-bit physical address of framebuffer
+    uint32_t lfb_size;              // 0x1C: framebuffer size in 64KB units
+    uint16_t cl_magic, cl_offset;   // 0x20
+    uint16_t lfb_linelength;        // 0x24: pitch in bytes
+    uint8_t  red_size;              // 0x26
+    uint8_t  red_pos;               // 0x27
+    uint8_t  green_size;            // 0x28
+    uint8_t  green_pos;             // 0x29
+    uint8_t  blue_size;             // 0x2A
+    uint8_t  blue_pos;              // 0x2B
+    uint8_t  rsvd_size;             // 0x2C
+    uint8_t  rsvd_pos;              // 0x2D
+    uint16_t vesapm_seg;            // 0x2E
+    uint16_t vesapm_off;            // 0x30
+    uint16_t pages;                 // 0x32
+    uint16_t vesa_attributes;       // 0x34
+    uint32_t capabilities;          // 0x36
+    uint32_t ext_lfb_base;          // 0x3A
+    uint8_t  _reserved[2];          // 0x3E
+} linux_screen_info_t;
+
 typedef struct linux_boot_params {
-    uint8_t              screen_info[64];
+    linux_screen_info_t  screen_info;       // Offset 0x000 (64 bytes)
     uint8_t              apm_bios_info[20];
     uint8_t              _pad2[4];
     uint64_t             tboot_addr;
@@ -96,6 +137,36 @@ typedef struct linux_boot_params {
     uint8_t              _pad8[4096 - 0x2D0 - (128 * sizeof(linux_e820_entry_t))];
 } linux_boot_params_t;
 
+// MEMDISK Boot Firmware Table (mBFT) for Alpine memdiskfind
+typedef struct linux_mbft {
+    struct {
+        char     signature[4];    // "mBFT"
+        uint32_t length;          // sizeof(struct linux_mbft) = 66
+        uint8_t  revision;        // 1
+        uint8_t  checksum;        // byte sum of entire struct == 0
+        char     oem_id[6];       // "SYSLNX"
+        char     oem_table_id[8]; // "MEMDISK "
+        uint32_t oem_revision;    // 1
+        uint32_t creator_id;      // 0
+        uint32_t creator_rev;     // 0
+    } acpi;
+    uint32_t safe_hook;           // 0
+    struct {
+        uint16_t bytes;           // 26
+        uint8_t  version_minor;   // 0
+        uint8_t  version_major;   // 1
+        uint32_t diskbuf;         // Physical start address of ISO
+        uint32_t disksize;        // Total sectors
+        uint32_t cmdline;         // 0
+        uint32_t oldint13;        // 0
+        uint32_t oldint15;        // 0
+        uint16_t olddosmem;       // 640
+        uint8_t  bootloaderid;    // 0x30
+        uint8_t  sector_shift;    // 11 (2048 bytes/sector for ISO)
+        uint16_t dpt_ptr;         // 0
+    } mdi;
+} linux_mbft_t;
+
 #pragma pack(pop)
 
 // Standard physical addresses for 32-bit Linux boot
@@ -103,6 +174,10 @@ typedef struct linux_boot_params {
 #define LINUX_CMDLINE_PHYS      0x0009A000
 #define LINUX_KERNEL_LOAD_PHYS  0x00100000
 #define LINUX_TRAMPOLINE_PHYS   0x00006000
+#define LINUX_RAM_ISO_PHYS      0x10000000  // 256 MiB physical address for in-RAM ISO
+
+#define VIDEO_TYPE_VGAC         0x22
+#define VIDEO_TYPE_VLFB         0x23
 
 typedef struct linux_kernel_info {
     uint32_t realmode_sectors;
@@ -117,7 +192,10 @@ int  linux_check_kernel_image(const void *image_buf, uint32_t size, linux_kernel
 int  linux_prepare_boot_params(const void *kernel_image, uint32_t kernel_size,
                                const void *initrd_buf, uint32_t initrd_size,
                                const char *cmdline, boot_info_t *boot_info,
+                               const vbe_mode_info_t *vbe_mode,
+                               uint32_t ram_iso_addr, uint32_t ram_iso_size,
                                linux_boot_params_t *out_params);
+void linux_setup_mbft(uint32_t iso_phys_addr, uint32_t iso_size);
 void linux_boot_jump(uint32_t kernel_source_addr, uint32_t kernel_target_addr,
                     uint32_t kernel_size, uint32_t boot_params_addr,
                     uint32_t entry_point);
