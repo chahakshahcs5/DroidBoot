@@ -165,6 +165,25 @@ void c_main(boot_info_t *boot_info) {
             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
             // Phase 4: Enumerate Connected USB Devices
+            // Debounce / wait up to 2 seconds for physical USB PHY connection & device attachment
+            log_info("XHCI", "Waiting for USB devices to connect and stabilize on root hub...");
+            bool has_connected_port = false;
+            for (int retry = 0; retry < 20; retry++) {
+                for (uint8_t p = 1; p <= xhci_ctrl.max_ports; p++) {
+                    uintptr_t port_reg = xhci_ctrl.op_regs + XHCI_OP_PORTS_BASE + (p - 1) * 0x10;
+                    uint32_t portsc = *(volatile uint32_t *)port_reg;
+                    if (portsc & XHCI_PORT_CCS) {
+                        has_connected_port = true;
+                        break;
+                    }
+                }
+                if (has_connected_port) {
+                    for (int d = 0; d < 50000; d++) io_wait();
+                    break;
+                }
+                for (int d = 0; d < 100000; d++) io_wait();
+            }
+
             xhci_poll_ports(&xhci_ctrl);
 
             bool device_found = false;
@@ -224,7 +243,7 @@ void c_main(boot_info_t *boot_info) {
     menu_render(boot_info, &xhci_ctrl, &detected_usb_dev, &active_mtp_session);
 
     // Wait for user selection or auto-selection timeout (2 seconds in automated mode)
-    boot_choice_t choice = menu_wait_selection(2);
+    boot_choice_t choice = menu_wait_selection(2, active_mtp_session.session_active);
 
     switch (choice) {
         case BOOT_CHOICE_ANDROID_MTP:

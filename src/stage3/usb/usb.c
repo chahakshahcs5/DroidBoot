@@ -72,9 +72,11 @@ int usb_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *dat
     xhci_write32(db_reg, 1);
 
     uintptr_t status_trb_phys = (uintptr_t)trb_status;
+    uintptr_t setup_trb_phys = (uintptr_t)trb_setup;
+    uintptr_t data_trb_phys = trb_data ? (uintptr_t)trb_data : 0;
 
     // Poll Event Ring for Transfer Event
-    int timeout = 1000;
+    int timeout = 20000;
     while (--timeout > 0) {
         xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
         uint32_t cycle = evt->control & 1U;
@@ -82,7 +84,8 @@ int usb_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *dat
         if (cycle == ctrl->event_cycle_state) {
             uint32_t type = (evt->control >> TRB_TYPE_SHIFT) & 0x3F;
             if (type == TRB_TRANSFER_EVENT) {
-                if (evt->parameter == status_trb_phys) {
+                uintptr_t p = (uintptr_t)evt->parameter;
+                if (p == status_trb_phys || p == setup_trb_phys || p == data_trb_phys) {
                     ctrl->event_dequeue_idx++;
                     if (ctrl->event_dequeue_idx == XHCI_EVENT_RING_TRBS) {
                         ctrl->event_dequeue_idx = 0;
@@ -166,10 +169,9 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
 
     // Endpoint 0 Context (offset 0x40)
     uint32_t *ep0_ctx = (uint32_t *)(input_ctx + 0x40);
-    ep0_ctx[0] = (3U << 1) | (4U << 3); // CErr=3, EP Type = 4 (Control)
-
     uint16_t max_packet = (speed == 4) ? 512 : ((speed == 2) ? 8 : 64);
-    ep0_ctx[1] = ((uint32_t)max_packet << 16);
+    ep0_ctx[0] = 0;
+    ep0_ctx[1] = (3U << 1) | (4U << 3) | ((uint32_t)max_packet << 16); // CErr=3, EP Type = 4 (Control), MaxPacket
 
     // Allocate EP0 Transfer Ring
     uint32_t ep0_bytes = EP_RING_TRBS * sizeof(xhci_trb_t);
@@ -268,14 +270,20 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
             usb_interface_desc_t *iface = (usb_interface_desc_t *)ptr;
             cur_iface_num = iface->bInterfaceNumber;
 
-            // Check if MTP (Class 0x06, Subclass 0x01, Protocol 0x01)
-            if (iface->bInterfaceClass == MTP_INTERFACE_CLASS &&
-                iface->bInterfaceSubClass == MTP_INTERFACE_SUBCLASS &&
-                iface->bInterfaceProtocol == MTP_INTERFACE_PROTOCOL) {
+            // Check if MTP: standard Still Image (0x06/0x01/0x01) or Android Gadget (0xFF/0xFF)
+            bool is_std_mtp = (iface->bInterfaceClass == MTP_INTERFACE_CLASS &&
+                               iface->bInterfaceSubClass == MTP_INTERFACE_SUBCLASS &&
+                               iface->bInterfaceProtocol == MTP_INTERFACE_PROTOCOL);
+            bool is_android_mtp = (iface->bInterfaceClass == ANDROID_MTP_CLASS &&
+                                   iface->bInterfaceSubClass == ANDROID_MTP_SUBCLASS);
+
+            if (is_std_mtp || is_android_mtp) {
                 current_is_mtp = true;
                 out_dev->has_mtp = true;
                 out_dev->mtp_iface_num = cur_iface_num;
-                log_info("USB", "  Interface %u: STANDARD MTP / PTP INTERFACE FOUND!", cur_iface_num);
+                log_info("USB", "  Interface %u: %s MTP INTERFACE (Class=0x%02X, Subclass=0x%02X, Proto=0x%02X)",
+                         cur_iface_num, is_android_mtp ? "ANDROID" : "STANDARD",
+                         iface->bInterfaceClass, iface->bInterfaceSubClass, iface->bInterfaceProtocol);
             } else {
                 current_is_mtp = false;
                 log_info("USB", "  Interface %u: Class=0x%02X, Subclass=0x%02X, Protocol=0x%02X",
@@ -287,15 +295,17 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
             uint8_t ep_type = ep->bmAttributes & 0x03; // 2 = Bulk
             uint16_t ep_max_pkt = ep->wMaxPacketSize;
 
+            log_info("USB", "    Endpoint 0x%02X: Type=%u, MaxPacket=%u", ep_addr, ep_type, ep_max_pkt);
+
             if (current_is_mtp && ep_type == 2) {
                 if (ep_addr & 0x80) {
                     out_dev->mtp_bulk_in_ep = ep_addr;
                     out_dev->mtp_bulk_in_max_packet = ep_max_pkt;
-                    log_info("MTP", "  MTP Bulk IN Endpoint:  0x%02X (MaxPacket: %u)", ep_addr, ep_max_pkt);
+                    log_info("MTP", "    -> MTP Bulk IN Endpoint:  0x%02X (MaxPacket: %u)", ep_addr, ep_max_pkt);
                 } else {
                     out_dev->mtp_bulk_out_ep = ep_addr;
                     out_dev->mtp_bulk_out_max_packet = ep_max_pkt;
-                    log_info("MTP", "  MTP Bulk OUT Endpoint: 0x%02X (MaxPacket: %u)", ep_addr, ep_max_pkt);
+                    log_info("MTP", "    -> MTP Bulk OUT Endpoint: 0x%02X (MaxPacket: %u)", ep_addr, ep_max_pkt);
                 }
             }
         }
@@ -313,6 +323,8 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
     int set_cfg_res = usb_control_transfer(out_dev, &req_set_cfg, NULL, 0);
     if (set_cfg_res == 0) {
         log_info("USB", "Device Configuration 1 Activated.");
+    } else {
+        log_info("USB", "Set Configuration 1 status: %d (device already active). Continuing...", set_cfg_res);
     }
 
     if (out_dev->has_mtp) {
@@ -349,8 +361,8 @@ int usb_configure_mtp_endpoints(usb_device_t *dev) {
 
     // Bulk IN Endpoint Context
     uint32_t *ep_in_ctx = (uint32_t *)(input_ctx + (in_ep_ctx_idx + 1) * 32);
-    ep_in_ctx[0] = (3U << 1) | (6U << 3); // CErr=3, EP Type = 6 (Bulk IN)
-    ep_in_ctx[1] = ((uint32_t)dev->mtp_bulk_in_max_packet << 16);
+    ep_in_ctx[0] = 0;
+    ep_in_ctx[1] = (3U << 1) | (6U << 3) | ((uint32_t)dev->mtp_bulk_in_max_packet << 16); // CErr=3, EP Type = 6 (Bulk IN)
 
     // Allocate Bulk IN Ring
     dev->bulk_in_ring = (xhci_trb_t *)kmalloc_aligned(64 * sizeof(xhci_trb_t), 64);
@@ -368,8 +380,8 @@ int usb_configure_mtp_endpoints(usb_device_t *dev) {
 
     // Bulk OUT Endpoint Context
     uint32_t *ep_out_ctx = (uint32_t *)(input_ctx + (out_ep_ctx_idx + 1) * 32);
-    ep_out_ctx[0] = (3U << 1) | (2U << 3); // CErr=3, EP Type = 2 (Bulk OUT)
-    ep_out_ctx[1] = ((uint32_t)dev->mtp_bulk_out_max_packet << 16);
+    ep_out_ctx[0] = 0;
+    ep_out_ctx[1] = (3U << 1) | (2U << 3) | ((uint32_t)dev->mtp_bulk_out_max_packet << 16); // CErr=3, EP Type = 2 (Bulk OUT)
 
     // Allocate Bulk OUT Ring
     dev->bulk_out_ring = (xhci_trb_t *)kmalloc_aligned(64 * sizeof(xhci_trb_t), 64);

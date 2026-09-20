@@ -18,7 +18,7 @@ typedef enum boot_choice {
 
 void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
                  usb_device_t *usb_dev, mtp_session_t *mtp_session);
-boot_choice_t menu_wait_selection(uint32_t timeout_seconds);
+boot_choice_t menu_wait_selection(uint32_t timeout_seconds, bool has_mtp);
 void menu_show_diagnostics(boot_info_t *boot_info, xhci_controller_t *xhci,
                           usb_device_t *usb_dev, mtp_session_t *mtp_session);
 

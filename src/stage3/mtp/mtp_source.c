@@ -96,8 +96,13 @@ int mtp_find_boot_file(boot_source_t *src, char *out_name, uint32_t max_len) {
 
     uint32_t handles[256];
     uint32_t hcount = 0;
-    int res = mtp_get_object_handles(fs->session, fs->session->active_storage_id, 0x00000000, handles, 256, &hcount);
-    if (res != 0) return res;
+    // Query with parent = 0xFFFFFFFF (all objects across all folders including /Download/)
+    int res = mtp_get_object_handles(fs->session, fs->session->active_storage_id, 0xFFFFFFFF, handles, 256, &hcount);
+    if (res != 0 || hcount == 0) {
+        // Fallback to root directory
+        res = mtp_get_object_handles(fs->session, fs->session->active_storage_id, 0x00000000, handles, 256, &hcount);
+        if (res != 0) return res;
+    }
 
     // First search for .iso files
     for (uint32_t i = 0; i < hcount; i++) {

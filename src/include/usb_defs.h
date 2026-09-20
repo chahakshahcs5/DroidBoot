@@ -31,10 +31,15 @@
 #define USB_CLASS_HUB               0x09
 #define USB_CLASS_VENDOR_SPEC       0xFF
 
-// MTP Standard Interface Identifiers
+// MTP Standard Interface Identifiers (PTP/Still Image)
 #define MTP_INTERFACE_CLASS         0x06
 #define MTP_INTERFACE_SUBCLASS      0x01
 #define MTP_INTERFACE_PROTOCOL      0x01
+
+// Android Vendor Specific MTP Identifiers (Linux Gadget f_mtp)
+#define ANDROID_MTP_CLASS           0xFF
+#define ANDROID_MTP_SUBCLASS        0xFF
+#define ANDROID_MTP_PROTOCOL        0x00
 
 #pragma pack(push, 1)
 

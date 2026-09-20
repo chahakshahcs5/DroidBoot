@@ -80,7 +80,7 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 }
 
-boot_choice_t menu_wait_selection(uint32_t timeout_seconds) {
+boot_choice_t menu_wait_selection(uint32_t timeout_seconds, bool has_mtp) {
     printk("[MENU] Select option [1-4] or wait %u sec for auto-selection...\n", timeout_seconds);
 
     for (int sec = (int)timeout_seconds; sec > 0; sec--) {
@@ -114,7 +114,7 @@ boot_choice_t menu_wait_selection(uint32_t timeout_seconds) {
     }
 
     printk("\n[MENU] Countdown expired! Proceeding with auto-selection...\n");
-    return BOOT_CHOICE_TEST_PROTOCOL;
+    return has_mtp ? BOOT_CHOICE_ANDROID_MTP : BOOT_CHOICE_TEST_PROTOCOL;
 }
 
 void menu_show_diagnostics(boot_info_t *boot_info, xhci_controller_t *xhci,

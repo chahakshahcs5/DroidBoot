@@ -48,13 +48,16 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
     xhci_write32(db_reg, doorbell_target);
 
     // Poll Event Ring for Transfer Event
-    int timeout = 2000;
+    int timeout = 20000;
     while (--timeout > 0) {
         xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
         uint32_t cycle = evt->control & 1U;
 
         if (cycle == ctrl->event_cycle_state) {
             uint32_t type = (evt->control >> TRB_TYPE_SHIFT) & 0x3F;
+            uint8_t cc = (uint8_t)((evt->status >> 24) & 0xFF);
+            log_info("MTP", "  Event: Type=%u, CC=%u, Param=0x%08X (expect=0x%08X)",
+                     type, cc, (uint32_t)evt->parameter, (uint32_t)trb_phys);
             if (type == TRB_TRANSFER_EVENT) {
                 if (evt->parameter == trb_phys) {
                     ctrl->event_dequeue_idx++;
