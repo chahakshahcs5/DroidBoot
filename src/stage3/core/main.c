@@ -249,6 +249,103 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
                     kinfo.code32_start);
 }
 
+static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_files_t *iso_files, boot_info_t *boot_info, const persistence_profile_t *prof) {
+    uint8_t *ram_iso = (uint8_t *)LINUX_RAM_ISO_PHYS;
+    void *kernel_buf = (void *)0x02000000;
+    void *initrd_buf = (void *)0x04000000;
+
+    for (uint32_t b = 0; b < iso_files->kernel_size; b++) {
+        ((uint8_t *)kernel_buf)[b] = ram_iso[(iso_files->kernel_lba * 2048) + b];
+    }
+    log_info("BOOT", "Kernel extracted into RAM at 0x%08X (%u bytes).",
+             (uint32_t)kernel_buf, iso_files->kernel_size);
+
+    if (iso_files->found_initrd) {
+        for (uint32_t b = 0; b < iso_files->initrd_size; b++) {
+            ((uint8_t *)initrd_buf)[b] = ram_iso[(iso_files->initrd_lba * 2048) + b];
+        }
+        log_info("BOOT", "Initramfs extracted into RAM at 0x%08X (%u bytes).",
+                 (uint32_t)initrd_buf, iso_files->initrd_size);
+    }
+
+    linux_kernel_info_t kinfo;
+    if (linux_check_kernel_image(kernel_buf, iso_files->kernel_size, &kinfo) != 0) {
+        log_error("BOOT", "Failed to validate in-RAM kernel image!");
+        sound_error_tone();
+        return;
+    }
+
+    // Install mBFT table at 0x000E0000 for Alpine memdiskfind
+    linux_setup_mbft(LINUX_RAM_ISO_PHYS, total_iso_bytes);
+
+    char alpine_cmdline[256];
+    if (prof && prof->is_clean_session) {
+        snprintf(alpine_cmdline, sizeof(alpine_cmdline),
+                 "modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes console=tty0 loglevel=7",
+                 LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
+    } else {
+        snprintf(alpine_cmdline, sizeof(alpine_cmdline),
+                 "modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes console=tty0 loglevel=7 apkovl=sda1:",
+                 LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
+    }
+
+    // Switch to VBE Linear Framebuffer mode
+    vbe_mode_info_t vbe_mode = {0};
+    uint16_t vbe_mode_num = 0;
+    int vbe_ok = vbe_setup_linear_framebuffer(&vbe_mode, &vbe_mode_num);
+    if (vbe_ok == 0) {
+        log_info("BOOT", "VBE Linear Framebuffer active: Mode 0x%04X (%ux%ux%u)",
+                 vbe_mode_num, vbe_mode.x_res, vbe_mode.y_res, vbe_mode.bits_per_pixel);
+    } else {
+        log_info("BOOT", "VBE unavailable; falling back to VGA text mode.");
+    }
+
+    linux_boot_params_t *alpine_params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
+    linux_prepare_boot_params(kernel_buf, iso_files->kernel_size,
+                              iso_files->found_initrd ? initrd_buf : NULL,
+                              iso_files->found_initrd ? iso_files->initrd_size : 0,
+                              alpine_cmdline, boot_info,
+                              (vbe_ok == 0) ? &vbe_mode : NULL,
+                              LINUX_RAM_ISO_PHYS, total_iso_bytes,
+                              alpine_params);
+
+    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    log_info("BOOT", "==========================================================");
+    log_info("BOOT", "  HANDING OFF TO IN-RAM LINUX WITH SD PERSISTENCE         ");
+    log_info("BOOT", "  * In-RAM ISO     : 0x%08X (%u MB, Type 2 RESERVED)     ",
+             LINUX_RAM_ISO_PHYS, total_iso_bytes / 1024 / 1024);
+    if (prof && prof->is_clean_session) {
+        log_info("BOOT", "  * Persistence    : Clean Session (100%% In-RAM, no saved changes)");
+    } else {
+        log_info("BOOT", "  * Persistence    : %s (apkovl=sda1: / /BootManager/persistence/)",
+                 prof ? prof->profile_name : "Default");
+    }
+    log_info("BOOT", "==========================================================");
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+    xhci_stop(&xhci_ctrl);
+    sound_silence();
+
+    log_info("LOG", "Final pre-handoff flush: %u flushes, %u errors, %u bytes logged",
+             disk_log_get_flush_count(), disk_log_get_error_count(), disk_log_get_length());
+    disk_log_flush_with_feedback();
+
+    sound_kernel_jump_tone();
+
+    linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
+                    LINUX_KERNEL_LOAD_PHYS,
+                    kinfo.protected_mode_size,
+                    LINUX_BOOT_PARAMS_PHYS,
+                    kinfo.code32_start);
+}
+
+static void boot_from_in_ram_iso(os_entry_t *entry, boot_info_t *boot_info, const persistence_profile_t *prof) {
+    if (!entry) return;
+    log_info("BOOT", "Booting preloaded In-RAM ISO at 0x%08X (%u MB)...",
+             LINUX_RAM_ISO_PHYS, (uint32_t)(entry->file_size / 1024 / 1024));
+    boot_in_ram_iso_handoff((uint32_t)entry->file_size, &entry->iso_files, boot_info, prof);
+}
+
 static void boot_from_android_mtp(mtp_session_t *session, boot_info_t *boot_info, const persistence_profile_t *prof) {
     log_info("BOOT", "Attempting boot from Android Phone (MTP)...");
     if (!session || !session->session_active) {
@@ -334,90 +431,7 @@ static void boot_from_android_mtp(mtp_session_t *session, boot_info_t *boot_info
         log_info("BOOT", "Full ISO successfully cached in RAM (%u MB)!", total_iso_bytes / 1024 / 1024);
         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-        void *kernel_buf = (void *)0x02000000;
-        void *initrd_buf = (void *)0x04000000;
-
-        // Fast extraction from in-RAM ISO buffer
-        for (uint32_t b = 0; b < iso_files.kernel_size; b++) {
-            ((uint8_t *)kernel_buf)[b] = ram_iso[(iso_files.kernel_lba * 2048) + b];
-        }
-        log_info("BOOT", "Kernel extracted into RAM at 0x%08X (%u bytes).",
-                 (uint32_t)kernel_buf, iso_files.kernel_size);
-
-        if (iso_files.found_initrd) {
-            for (uint32_t b = 0; b < iso_files.initrd_size; b++) {
-                ((uint8_t *)initrd_buf)[b] = ram_iso[(iso_files.initrd_lba * 2048) + b];
-            }
-            log_info("BOOT", "Initramfs extracted into RAM at 0x%08X (%u bytes).",
-                     (uint32_t)initrd_buf, iso_files.initrd_size);
-        }
-
-        linux_kernel_info_t kinfo;
-        if (linux_check_kernel_image(kernel_buf, iso_files.kernel_size, &kinfo) == 0) {
-            // Install mBFT table at 0x000E0000 for Alpine memdiskfind
-            linux_setup_mbft(LINUX_RAM_ISO_PHYS, total_iso_bytes);
-
-            // Kernel command line: phram + memmap + memdisk + (optional) apkovl (persistence)
-            char alpine_cmdline[256];
-            if (prof && prof->is_clean_session) {
-                snprintf(alpine_cmdline, sizeof(alpine_cmdline),
-                         "modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes console=tty0 loglevel=7",
-                         LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
-            } else {
-                snprintf(alpine_cmdline, sizeof(alpine_cmdline),
-                         "modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes console=tty0 loglevel=7 apkovl=sda1:",
-                         LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
-            }
-
-            // Switch to VBE Linear Framebuffer mode
-            vbe_mode_info_t vbe_mode = {0};
-            uint16_t vbe_mode_num = 0;
-            int vbe_ok = vbe_setup_linear_framebuffer(&vbe_mode, &vbe_mode_num);
-            if (vbe_ok == 0) {
-                log_info("BOOT", "VBE Linear Framebuffer active: Mode 0x%04X (%ux%ux%u)",
-                         vbe_mode_num, vbe_mode.x_res, vbe_mode.y_res, vbe_mode.bits_per_pixel);
-            } else {
-                log_info("BOOT", "VBE unavailable; falling back to VGA text mode.");
-            }
-
-            linux_boot_params_t *alpine_params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
-            linux_prepare_boot_params(kernel_buf, iso_files.kernel_size,
-                                      iso_files.found_initrd ? initrd_buf : NULL,
-                                      iso_files.found_initrd ? iso_files.initrd_size : 0,
-                                      alpine_cmdline, boot_info,
-                                      (vbe_ok == 0) ? &vbe_mode : NULL,
-                                      LINUX_RAM_ISO_PHYS, total_iso_bytes,
-                                      alpine_params);
-
-            vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-            log_info("BOOT", "==========================================================");
-            log_info("BOOT", "  HANDING OFF TO IN-RAM LINUX WITH SD PERSISTENCE         ");
-            log_info("BOOT", "  * In-RAM ISO     : 0x%08X (%u MB, Type 2 RESERVED)     ",
-                     LINUX_RAM_ISO_PHYS, total_iso_bytes / 1024 / 1024);
-            if (prof && prof->is_clean_session) {
-                log_info("BOOT", "  * Persistence    : Clean Session (100%% In-RAM, no saved changes)");
-            } else {
-                log_info("BOOT", "  * Persistence    : %s (apkovl=sda1: / /BootManager/persistence/)",
-                         prof ? prof->profile_name : "Default");
-            }
-            log_info("BOOT", "==========================================================");
-            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-
-            xhci_stop(&xhci_ctrl);
-            sound_silence();
-
-            log_info("LOG", "Final pre-handoff flush: %u flushes, %u errors, %u bytes logged",
-                     disk_log_get_flush_count(), disk_log_get_error_count(), disk_log_get_length());
-            disk_log_flush_with_feedback();
-
-            sound_kernel_jump_tone();
-
-            linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
-                            LINUX_KERNEL_LOAD_PHYS,
-                            kinfo.protected_mode_size,
-                            LINUX_BOOT_PARAMS_PHYS,
-                            kinfo.code32_start);
-        }
+        boot_in_ram_iso_handoff(total_iso_bytes, &iso_files, boot_info, prof);
     } else {
         // Raw kernel image fallback
         void *kernel_buf = (void *)0x02000000;
@@ -722,7 +736,11 @@ void c_main(boot_info_t *boot_info) {
                         boot_from_sd_fat(selected, boot_info);
                     }
                 } else if (selected->approach == BOOT_APPROACH_MTP_IN_RAM) {
-                    boot_from_android_mtp(&active_mtp_session, boot_info, prof);
+                    if (active_mtp_session.session_active) {
+                        boot_from_android_mtp(&active_mtp_session, boot_info, prof);
+                    } else {
+                        boot_from_in_ram_iso(selected, boot_info, prof);
+                    }
                 }
             }
             break;

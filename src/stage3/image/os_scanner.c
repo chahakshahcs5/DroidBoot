@@ -409,6 +409,112 @@ static void scan_sd_storage(uint8_t boot_drive, os_registry_t *reg) {
 }
 
 // -----------------------------------------------------------------------------
+// 4. Scan Preloaded In-RAM ISO Storage (Pathway 2: MTP Stream / QEMU RAM Simulation)
+// -----------------------------------------------------------------------------
+typedef struct {
+    boot_source_t src;
+    uint8_t      *base;
+    uint64_t      len;
+    uint64_t      pos;
+} mem_source_internal_t;
+
+static int mem_src_open(boot_source_t *src, const char *path) {
+    (void)path;
+    mem_source_internal_t *m = (mem_source_internal_t *)src->priv;
+    m->pos = 0;
+    return 0;
+}
+
+static uint32_t mem_src_read(boot_source_t *src, void *buf, uint32_t size) {
+    mem_source_internal_t *m = (mem_source_internal_t *)src->priv;
+    if (m->pos >= m->len) return 0;
+    uint32_t avail = (uint32_t)(m->len - m->pos);
+    uint32_t to_read = size > avail ? avail : size;
+    uint8_t *d = (uint8_t *)buf;
+    uint8_t *s = m->base + m->pos;
+    for (uint32_t i = 0; i < to_read; i++) d[i] = s[i];
+    m->pos += to_read;
+    return to_read;
+}
+
+static int mem_src_seek(boot_source_t *src, uint64_t offset) {
+    mem_source_internal_t *m = (mem_source_internal_t *)src->priv;
+    m->pos = offset;
+    return 0;
+}
+
+static uint64_t mem_src_tell(boot_source_t *src) {
+    mem_source_internal_t *m = (mem_source_internal_t *)src->priv;
+    return m->pos;
+}
+
+static uint64_t mem_src_size(boot_source_t *src) {
+    mem_source_internal_t *m = (mem_source_internal_t *)src->priv;
+    return m->len;
+}
+
+static void mem_src_close(boot_source_t *src) {
+    (void)src;
+}
+
+static void scan_ram_storage(os_registry_t *reg) {
+    if (reg->count >= MAX_OS_ENTRIES) return;
+
+    // Check if ISO9660 PVD exists at 0x10000000 + 0x8000 (LBA 16)
+    uint8_t *iso_base = (uint8_t *)0x10000000;
+    uint8_t *pvd = iso_base + 0x8000;
+
+    if (pvd[1] == 'C' && pvd[2] == 'D' && pvd[3] == '0' && pvd[4] == '0' && pvd[5] == '1') {
+        uint32_t total_blocks = *(uint32_t *)(pvd + 80);
+        uint64_t total_bytes = (uint64_t)total_blocks * 2048;
+
+        log_info("SCAN", "Preloaded In-RAM ISO detected at 0x10000000 (%u MB)!",
+                 (uint32_t)(total_bytes / 1024 / 1024));
+
+        static mem_source_internal_t mem_src_obj;
+        k_memset(&mem_src_obj, 0, sizeof(mem_src_obj));
+        mem_src_obj.base = iso_base;
+        mem_src_obj.len = total_bytes;
+        mem_src_obj.pos = 0;
+        mem_src_obj.src.name = "In-RAM ISO";
+        mem_src_obj.src.priv = &mem_src_obj;
+        mem_src_obj.src.open = mem_src_open;
+        mem_src_obj.src.read = mem_src_read;
+        mem_src_obj.src.seek = mem_src_seek;
+        mem_src_obj.src.tell = mem_src_tell;
+        mem_src_obj.src.size = mem_src_size;
+        mem_src_obj.src.close = mem_src_close;
+
+        iso_boot_files_t iso_files;
+        if (iso_find_boot_files(&mem_src_obj.src, &iso_files) == 0 && iso_files.found_kernel) {
+            os_entry_t *entry = &reg->entries[reg->count];
+            k_memset(entry, 0, sizeof(os_entry_t));
+
+            if (iso_files.is_casper) {
+                copy_str(entry->title, "Ubuntu Desktop Live (In-RAM)", sizeof(entry->title));
+                copy_str(entry->filename, "ubuntu-desktop.iso (In-RAM)", sizeof(entry->filename));
+            } else {
+                copy_str(entry->title, "Alpine Linux Standard", sizeof(entry->title));
+                copy_str(entry->filename, "alpine-standard.iso (In-RAM)", sizeof(entry->filename));
+            }
+            copy_str(entry->storage_desc, "Phone MTP Streamed / In-RAM Cache", sizeof(entry->storage_desc));
+            entry->file_size = total_bytes;
+            entry->storage_type = OS_STORAGE_MTP_ANDROID;
+            entry->approach = BOOT_APPROACH_MTP_IN_RAM;
+            entry->iso_files = iso_files;
+
+            populate_os_persistence_profiles(entry);
+
+            log_info("SCAN", "[+] Registered OS #%u: '%s' (%u MB In-RAM)",
+                     reg->count + 1, entry->title, (uint32_t)(total_bytes / 1024 / 1024));
+            log_info("SCAN", "    * Profiles: %u data profiles in /BootManager/persistence/",
+                     entry->profile_count);
+            reg->count++;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Main Orchestration: Scan All Available Storage Layers
 // -----------------------------------------------------------------------------
 int os_scan_all_storages(boot_info_t *boot_info,
@@ -434,7 +540,10 @@ int os_scan_all_storages(boot_info_t *boot_info,
         scan_mtp_storage(mtp_session, out_registry);
     }
 
-    // 3. Scan Local SD Card FAT32 Storage (Bootloader Home Storage)
+    // 3. Scan Preloaded In-RAM ISO Storage (Simulation / Pre-cached MTP)
+    scan_ram_storage(out_registry);
+
+    // 4. Scan Local SD Card FAT32 Storage (Bootloader Home Storage)
     uint8_t boot_drive = boot_info ? (uint8_t)boot_info->boot_drive : 0x80;
     scan_sd_storage(boot_drive, out_registry);
 

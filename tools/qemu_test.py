@@ -19,6 +19,7 @@ BOOT_IMG = os.path.join(BUILD_DIR, "boot.img")
 SERIAL_LOG = os.path.join(BUILD_DIR, "serial.log")
 
 DEFAULT_UBUNTU_ISO = r"C:\Users\chaha\Downloads\ubuntu-26.04.1-desktop-amd64.iso"
+DEFAULT_ALPINE_ISO = r"C:\Users\chaha\Downloads\alpine-standard-3.24.2-x86_64.iso"
 
 REQUIRED_LOG_PATTERNS = [
     "ANDROID -> LINUX BOOTLOADER (LEGACY BIOS)",
@@ -59,7 +60,7 @@ REQUIRED_LOG_PATTERNS = [
     "Phase 10 Interactive Boot Menu Successfully Verified!"
 ]
 
-def run_headless_test(port, extra_qemu_args, trigger_input_fn, timeout_sec=25):
+def run_headless_test(port, extra_qemu_args, trigger_input_fn, timeout_sec=25, memory="1024M"):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("127.0.0.1", port))
@@ -72,7 +73,7 @@ def run_headless_test(port, extra_qemu_args, trigger_input_fn, timeout_sec=25):
         "-device", "qemu-xhci,id=xhci",
         "-serial", f"tcp:127.0.0.1:{port}",
         "-display", "none",
-        "-m", "1024M"
+        "-m", memory
     ] + extra_qemu_args
 
     print(f"[*] Launching QEMU: {' '.join(qemu_cmd)}")
@@ -259,6 +260,59 @@ def test_custom_capacity_selection(port=4446):
 
     return all_passed
 
+def test_in_ram_iso_boot(port=4447):
+    if not os.path.exists(DEFAULT_ALPINE_ISO):
+        print(f"[*] Skipping In-RAM ISO test (ISO not present at {DEFAULT_ALPINE_ISO})")
+        return True
+
+    print("\n" + "=" * 70)
+    print("  TEST 4: In-RAM ISO Detection & Persistence Handoff Test (Alpine)")
+    print("=" * 70)
+
+    extra_args = [
+        "-device", f"loader,file={DEFAULT_ALPINE_ISO},addr=0x10000000,force-raw=on"
+    ]
+
+    def trigger(conn, current_log, state):
+        if not state.get("sent_os") and "[MENU] Select option" in current_log:
+            print("[*] Main boot menu detected! Selecting OS [1] (Alpine Linux Standard)...")
+            time.sleep(0.1)
+            conn.sendall(b"1")
+            state["sent_os"] = True
+
+        if not state.get("sent_prof") and "[PROFILE] Select persistence profile" in current_log:
+            print("[*] Profile sub-menu detected! Selecting [1] (Saved Profile)...")
+            time.sleep(0.1)
+            conn.sendall(b"1")
+            state["sent_prof"] = True
+
+        if "HANDING OFF TO IN-RAM LINUX WITH SD PERSISTENCE" in current_log:
+            time.sleep(0.3)
+            return True
+        return False
+
+    captured_log = run_headless_test(port, extra_args, trigger, timeout_sec=30, memory="2048M")
+
+    checks = [
+        ("Preloaded In-RAM ISO detected at 0x10000000", "In-RAM ISO detected at 0x10000000"),
+        ("Alpine Linux Standard", "Alpine Linux identified in ISO9660"),
+        ("Phone MTP Streamed / In-RAM Cache", "RAM storage type recognized"),
+        ("PERSISTENCE PROFILE SELECTOR: Alpine Linux Standard", "Profile menu triggered for In-RAM OS"),
+        ("HANDING OFF TO IN-RAM LINUX WITH SD PERSISTENCE", "Kernel handoff reached for In-RAM Linux"),
+        ("phram=iso,0x10000000", "phram kernel parameter attached"),
+        ("apkovl=sda1:", "apkovl persistence parameter attached")
+    ]
+
+    all_passed = True
+    for needle, desc in checks:
+        if needle in captured_log:
+            print(f"[PASS] {desc}: '{needle}'")
+        else:
+            print(f"[FAIL] Missing {desc}: '{needle}'")
+            all_passed = False
+
+    return all_passed
+
 def main():
     if not os.path.exists(BOOT_IMG):
         sys.exit(f"[-] Boot image {BOOT_IMG} not found! Run build first.")
@@ -266,8 +320,9 @@ def main():
     t1_pass = test_baseline_self_test(port=4444)
     t2_pass = test_multiprofile_persistence(port=4445)
     t3_pass = test_custom_capacity_selection(port=4446)
+    t4_pass = test_in_ram_iso_boot(port=4447)
 
-    if t1_pass and t2_pass and t3_pass:
+    if t1_pass and t2_pass and t3_pass and t4_pass:
         print("\n" + "=" * 70)
         print("[+] ALL AUTOMATED QEMU VERIFICATION ASSERTIONS PASSED!")
         print("[+] Phase 1 Legacy BIOS Bootstrap: VERIFIED")
@@ -280,6 +335,7 @@ def main():
         print("[+] Multi-Profile Persistence Sub-Menu (/BootManager/persistence/): VERIFIED")
         print("[+] Dynamic Custom Profile Creation (2GB, 4GB, 8GB, 16GB): VERIFIED")
         print("[+] Clean Disposable Session (100% In-RAM): VERIFIED")
+        print("[+] In-RAM ISO Detection & Boot Handoff (--mode ram): VERIFIED")
         print("[+] Zero auto-selection: Menus waited indefinitely for user choice!")
         print("=" * 70 + "\n")
         sys.exit(0)

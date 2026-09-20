@@ -21,8 +21,21 @@ DEFAULT_UBUNTU_ISO = r"C:\Users\chaha\Downloads\ubuntu-26.04.1-desktop-amd64.iso
 DEFAULT_ALPINE_ISO = r"C:\Users\chaha\Downloads\alpine-standard-3.24.2-x86_64.iso"
 
 def check_build():
-    if not os.path.exists(BOOT_IMG):
-        print(f"[*] Boot image not found at {BOOT_IMG}. Building now...")
+    needs_build = not os.path.exists(BOOT_IMG)
+    if not needs_build:
+        img_mtime = os.path.getmtime(BOOT_IMG)
+        for root, _, files in os.walk(os.path.join(WORKSPACE_ROOT, "src")):
+            for f in files:
+                if f.endswith((".c", ".h", ".asm", ".ld")):
+                    p = os.path.join(root, f)
+                    if os.path.getmtime(p) > img_mtime:
+                        needs_build = True
+                        break
+            if needs_build:
+                break
+
+    if needs_build:
+        print(f"[*] Source changes detected or boot image missing. Building now...")
         res = subprocess.run([sys.executable, os.path.join(WORKSPACE_ROOT, "build.py")], cwd=WORKSPACE_ROOT)
         if res.returncode != 0:
             sys.exit("[-] Build failed! Please resolve errors before running QEMU.")
