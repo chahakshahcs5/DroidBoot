@@ -3,16 +3,18 @@
 #include "../memory/memory.h"
 #include "../../include/io.h"
 
-// 39-byte self-contained relocation trampoline for 32-bit Linux handoff
+// 59-byte self-contained relocation trampoline for 32-bit Linux handoff
 static const uint8_t trampoline_template[] = {
     0xFA,                               // cli
     0xFC,                               // cld
     0x8B, 0x74, 0x24, 0x04,             // mov esi, [esp+4]   (src)
     0x8B, 0x7C, 0x24, 0x08,             // mov edi, [esp+8]   (dst)
-    0x8B, 0x4C, 0x24, 0x0C,             // mov ecx, [esp+12]  (len)
+    0x8B, 0x4C, 0x24, 0x0C,             // mov ecx, [esp+12]  (len in bytes)
+    0x83, 0xC1, 0x03,                   // add ecx, 3
+    0xC1, 0xE9, 0x02,                   // shr ecx, 2         (len in dwords)
     0x8B, 0x54, 0x24, 0x10,             // mov edx, [esp+16]  (params)
     0x8B, 0x5C, 0x24, 0x14,             // mov ebx, [esp+20]  (entry)
-    0xF3, 0xA4,                         // rep movsb
+    0xF3, 0xA5,                         // rep movsd          (fast 32-bit move)
     0xB8, 0x10, 0x00, 0x00, 0x00,       // mov eax, 0x00000010
     0x8E, 0xD8,                         // mov ds, eax
     0x8E, 0xC0,                         // mov es, eax

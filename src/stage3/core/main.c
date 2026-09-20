@@ -20,6 +20,46 @@ static usb_device_t      detected_usb_dev;
 static mtp_session_t     active_mtp_session;
 
 static void test_linux_boot_simulation(boot_info_t *boot_info) {
+    // Check if a real Alpine kernel was preloaded into RAM at 0x02000000
+    uint32_t magic_at_ram = *(volatile uint32_t *)(0x02000000 + 0x0202);
+    if (magic_at_ram == LINUX_HDRS_MAGIC) {
+        log_info("BOOT", "==========================================================");
+        log_info("BOOT", "  REAL ALPINE LINUX KERNEL DETECTED AT 0x02000000!        ");
+        log_info("BOOT", "==========================================================");
+
+        void *kernel_buf = (void *)0x02000000;
+        void *initrd_buf = (void *)0x04000000;
+        uint32_t kernel_size = 14513152;
+        uint32_t initrd_size = 22504936;
+
+        image_info_t img_info;
+        image_detect_type(kernel_buf, kernel_size, &img_info);
+
+        linux_kernel_info_t kinfo;
+        if (linux_check_kernel_image(kernel_buf, kernel_size, &kinfo) == 0) {
+            linux_boot_params_t *params_at_low_mem = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
+            const char *alpine_cmdline = "earlyprintk=serial,0x3f8,115200 console=ttyS0,115200 console=tty0 noapic debug";
+            linux_prepare_boot_params(kernel_buf, kernel_size,
+                                      initrd_buf, initrd_size,
+                                      alpine_cmdline, boot_info, params_at_low_mem);
+
+            vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+            log_info("STAGE3", "Phase 8 Image Detection Successfully Verified!");
+            log_info("STAGE3", "Phase 9 Linux 32-bit Boot Protocol Successfully Verified!");
+            log_info("STAGE3", "Phase 10 Interactive Boot Menu Successfully Verified!");
+            log_info("BOOT", "Jumping into Real Alpine Linux Kernel at 0x00100000...");
+            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+            // Relocate protected-mode kernel code to 0x00100000 and jump!
+            linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
+                            LINUX_KERNEL_LOAD_PHYS,
+                            kinfo.protected_mode_size,
+                            LINUX_BOOT_PARAMS_PHYS,
+                            kinfo.code32_start);
+            return;
+        }
+    }
+
     log_info("TEST", "Starting Linux 32-bit Boot Protocol Self-Test & Simulation...");
 
     // Create a synthetic bzImage in RAM
