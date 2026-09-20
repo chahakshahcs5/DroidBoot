@@ -61,14 +61,29 @@ entry:
     mov si, msg_ok
     call print_str
 
-    ; 3. Load Stage 3 into low memory buffer (0x1000:0x0000 = physical 0x10000)
+    ; 3. Load Stage 3 into low memory buffer (starting at 0x1000:0x0000 = physical 0x10000)
     mov si, msg_loading_stage3
     call print_str
 
     mov eax, [stage3_start_lba]
     mov [stage3_dap_lba], eax
-    mov ax, [stage3_sectors]
+    mov cx, [stage3_sectors]                ; Remaining sectors to read
+    mov word [stage3_dap_segment], 0x1000   ; Initial buffer segment 0x1000
+    mov word [stage3_dap_offset], 0x0000
+
+.read_stage3_loop:
+    test cx, cx
+    jz .read_stage3_done
+
+    mov ax, cx
+    cmp ax, 64                              ; Read max 64 sectors (32KB) per call to prevent 64KB boundary wrap
+    jbe .do_chunk
+    mov ax, 64
+
+.do_chunk:
     mov [stage3_dap_count], ax
+    push cx
+    push ax
 
     mov si, stage3_dap
     mov ah, 0x42
@@ -76,6 +91,20 @@ entry:
     int 0x13
     jc .stage3_read_error
 
+    pop ax                                  ; Sectors read in this chunk
+    pop cx                                  ; Total remaining sectors
+
+    sub cx, ax                              ; Decrement remaining sectors
+    movzx edx, ax
+    add [stage3_dap_lba], edx               ; Advance LBA
+
+    ; Advance segment by (ax * 512) >> 4 = ax * 32 = ax << 5
+    shl ax, 5
+    add [stage3_dap_segment], ax
+
+    jmp .read_stage3_loop
+
+.read_stage3_done:
     mov si, msg_ok
     call print_str
 

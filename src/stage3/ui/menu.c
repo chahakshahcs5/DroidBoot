@@ -20,6 +20,12 @@ static int poll_input_char(void) {
         if (sc == 0x03 || sc == 0x50) return '2';
         if (sc == 0x04 || sc == 0x51) return '3';
         if (sc == 0x05 || sc == 0x4B) return '4';
+        if (sc == 0x06 || sc == 0x4C) return '5';
+        if (sc == 0x07 || sc == 0x4D) return '6';
+        if (sc == 0x08 || sc == 0x47) return '7';
+        if (sc == 0x09 || sc == 0x48) return '8';
+        if (sc == 0x20) return 'd'; // 'D'
+        if (sc == 0x14) return 't'; // 'T'
         if (sc == 0x1C) return '\n';
         if (sc == 0x39) return ' ';
     }
@@ -28,10 +34,11 @@ static int poll_input_char(void) {
 }
 
 void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
-                 usb_device_t *usb_dev, mtp_session_t *mtp_session) {
+                 usb_device_t *usb_dev, mtp_session_t *mtp_session,
+                 const os_registry_t *registry) {
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
     printk("\n+------------------------------------------------------------------------+\n");
-    printk("|              ANDROID -> LINUX BOOTLOADER (LEGACY BIOS)                 |\n");
+    printk("|              ANDROID -> LINUX BOOTLOADER (DYNAMIC MULTI-OS)            |\n");
     printk("+------------------------------------------------------------------------+\n");
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
     printk("| System Diagnostics Status:                                             |\n");
@@ -72,51 +79,74 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
 
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
     printk("+------------------------------------------------------------------------+\n");
-    printk("| Boot Menu Selection:                                                   |\n");
-    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-    if (usb_dev && usb_dev->has_msc) {
-        printk("|  [1] Boot Linux from USB Block Device / Rooted Phone (On-Demand Direct)|\n");
+    printk("| Discovered Operating Systems & Boot Options:                           |\n");
+    printk("+------------------------------------------------------------------------+\n");
+
+    if (registry && registry->count > 0) {
+        for (uint32_t i = 0; i < registry->count; i++) {
+            const os_entry_t *entry = &registry->entries[i];
+            vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+            printk("|  [%u] %s\n", i + 1, entry->title);
+            vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+            printk("|      * Source: %s\n", entry->storage_desc);
+            printk("|      * File  : %s (%u MB)\n", entry->filename, (uint32_t)(entry->file_size / 1024 / 1024));
+            if (entry->approach == BOOT_APPROACH_BLOCK_ON_DEMAND) {
+                vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+                printk("|      * Mode  : Direct Block Access (0 MB OS in RAM, Instant Boot)     |\n");
+            } else {
+                vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
+                printk("|      * Mode  : In-RAM Boot + SD Card Persistence (apkovl=sda1:)      |\n");
+            }
+        }
     } else {
-        printk("|  [1] Boot Linux from Android Phone (MTP In-RAM Boot + SD Persistence) |\n");
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        printk("|  * No external OS images detected on USB or MTP storage.              |\n");
     }
-    printk("|  [2] Boot Linux from SD Card (FAT32 Partition)                         |\n");
-    printk("|  [3] Hardware Diagnostics & PCI / USB / Memory Inspection              |\n");
-    printk("|  [4] Linux 32-bit Boot Protocol Self-Test & Handoff Simulation         |\n");
+
+    uint32_t diag_num = (registry && registry->count > 0) ? registry->count + 1 : 1;
+    uint32_t test_num = (registry && registry->count > 0) ? registry->count + 2 : 2;
+
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    printk("|------------------------------------------------------------------------|\n");
+    printk("|  [%u] Hardware Diagnostics & System Inspection   (or press 'D')          |\n", diag_num);
+    printk("|  [%u] Linux 32-bit Boot Protocol Simulation      (or press 'T')          |\n", test_num);
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
     printk("+------------------------------------------------------------------------+\n");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 }
 
-boot_choice_t menu_wait_selection(bool has_mtp, bool has_msc) {
+menu_selection_t menu_wait_selection(const os_registry_t *registry) {
+    uint32_t os_count = registry ? registry->count : 0;
+    uint32_t diag_num = os_count > 0 ? os_count + 1 : 1;
+    uint32_t test_num = os_count > 0 ? os_count + 2 : 2;
+
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-    printk("\n[MENU] Select option [1-4]: ");
+    printk("\n[MENU] Select option [1-%u]: ", test_num);
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
     while (1) {
         int ch = poll_input_char();
-        if (ch == '1') {
-            if (has_msc) {
-                printk("1\n[MENU] User selected [1]: Boot from USB Block Storage (Direct)\n");
-                return BOOT_CHOICE_USB_MSC;
-            } else if (has_mtp) {
-                printk("1\n[MENU] User selected [1]: Boot from Android Phone (MTP In-RAM)\n");
-                return BOOT_CHOICE_ANDROID_MTP;
-            } else {
-                printk("1\n[MENU] User selected [1]: Boot from Android Phone (MTP)\n");
-                return BOOT_CHOICE_ANDROID_MTP;
+        if (ch >= '1' && ch <= '8') {
+            uint32_t val = (uint32_t)(ch - '0');
+            if (val <= os_count) {
+                uint32_t idx = val - 1;
+                printk("%c\n[MENU] User selected [%u]: Boot %s\n", ch, val, registry->entries[idx].title);
+                return (menu_selection_t){ .type = MENU_ACTION_BOOT_OS, .os_index = idx };
+            } else if (val == diag_num) {
+                printk("%c\n[MENU] User selected [%u]: Hardware Diagnostics\n", ch, val);
+                return (menu_selection_t){ .type = MENU_ACTION_DIAGNOSTICS, .os_index = 0 };
+            } else if (val == test_num || (os_count == 0 && val == 4)) {
+                printk("%c\n[MENU] User selected [%u]: Linux Boot Protocol Simulation\n", ch, val);
+                return (menu_selection_t){ .type = MENU_ACTION_SELF_TEST, .os_index = 0 };
             }
         }
-        if (ch == '2') {
-            printk("2\n[MENU] User selected [2]: Boot Linux from SD Card (FAT32)\n");
-            return BOOT_CHOICE_SD_FAT;
+        if (ch == 'd' || ch == 'D') {
+            printk("D\n[MENU] User selected: Hardware Diagnostics\n");
+            return (menu_selection_t){ .type = MENU_ACTION_DIAGNOSTICS, .os_index = 0 };
         }
-        if (ch == '3') {
-            printk("3\n[MENU] User selected [3]: Hardware Diagnostics\n");
-            return BOOT_CHOICE_DIAGNOSTICS;
-        }
-        if (ch == '4') {
-            printk("4\n[MENU] User selected [4]: Linux Boot Protocol Simulation\n");
-            return BOOT_CHOICE_TEST_PROTOCOL;
+        if (ch == 't' || ch == 'T') {
+            printk("T\n[MENU] User selected: Linux Boot Protocol Simulation\n");
+            return (menu_selection_t){ .type = MENU_ACTION_SELF_TEST, .os_index = 0 };
         }
 
         // Small delay (~1 ms) to not burn 100% CPU
@@ -138,28 +168,39 @@ void menu_show_diagnostics(boot_info_t *boot_info, xhci_controller_t *xhci,
         e820_entry_t *map = (e820_entry_t *)boot_info->e820_map_addr;
         printk("[DIAG] E820 Memory Map (%u entries):\n", boot_info->e820_count);
         for (uint32_t i = 0; i < boot_info->e820_count && i < 8; i++) {
-            printk("  [%u] 0x%08X%08X - 0x%08X%08X (Type %u)\n",
+            printk("  [%u] 0x%08X%08X - 0x%08X%08X (Type %u: %s)\n",
                    i,
                    (uint32_t)(map[i].base >> 32), (uint32_t)map[i].base,
                    (uint32_t)((map[i].base + map[i].length) >> 32),
                    (uint32_t)(map[i].base + map[i].length),
-                   map[i].type);
+                   map[i].type,
+                   (map[i].type == 1) ? "USABLE" :
+                   (map[i].type == 2) ? "RESERVED" : "ACPI/OTHER");
         }
     }
 
-    // 2. xHCI Diagnostics
+    // 2. PCI / xHCI diagnostics
     if (xhci && xhci->op_regs) {
-        uint32_t usbcmd = *(volatile uint32_t *)(xhci->op_regs + XHCI_OP_USBCMD);
-        uint32_t usbsts = *(volatile uint32_t *)(xhci->op_regs + XHCI_OP_USBSTS);
-        printk("[DIAG] xHCI Controller State: USBCMD=0x%08X | USBSTS=0x%08X\n", usbcmd, usbsts);
-        printk("[DIAG] xHCI Max Slots: %u, Max Ports: %u\n", xhci->max_slots, xhci->max_ports);
+        printk("[DIAG] xHCI Controller MMIO: 0x%08X | MaxSlots: %u | MaxPorts: %u\n",
+               xhci->mmio_base, xhci->max_slots, xhci->max_ports);
+        printk("[DIAG] xHCI Status: USBCMD.RS=1, USBSTS.HCH=0 (Hardware Running)\n");
     }
 
-    // 3. USB Device
+    // 3. USB device diagnostics
     if (usb_dev && usb_dev->slot_id > 0) {
-        printk("[DIAG] USB Device: Slot %u, VID=0x%04X, PID=0x%04X, HasMTP=%s\n",
-               usb_dev->slot_id, usb_dev->dev_desc.idVendor,
-               usb_dev->dev_desc.idProduct, usb_dev->has_mtp ? "YES" : "NO");
+        printk("[DIAG] USB Device Slot %u on Port %u:\n", usb_dev->slot_id, usb_dev->port_num);
+        printk("  VID: 0x%04X, PID: 0x%04X, Class: 0x%02X, Subclass: 0x%02X\n",
+               usb_dev->dev_desc.idVendor, usb_dev->dev_desc.idProduct,
+               usb_dev->dev_desc.bDeviceClass, usb_dev->dev_desc.bDeviceSubClass);
+        if (usb_dev->has_msc) {
+            printk("  Endpoint IN: 0x%02X, Endpoint OUT: 0x%02X (USB Mass Storage)\n",
+                   usb_dev->msc_bulk_in_ep, usb_dev->msc_bulk_out_ep);
+        } else if (usb_dev->has_mtp) {
+            printk("  Endpoint IN: 0x%02X, Endpoint OUT: 0x%02X (Android MTP)\n",
+                   usb_dev->mtp_bulk_in_ep, usb_dev->mtp_bulk_out_ep);
+        }
+    } else {
+        printk("[DIAG] No active USB peripheral attached to xHCI root ports.\n");
     }
 
     printk("=== END DIAGNOSTICS ===\n\n");

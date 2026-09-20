@@ -37,13 +37,14 @@ REQUIRED_LOG_PATTERNS = [
     "[USB] Device Configuration 1 Activated.",
     "[STAGE3] Phase 4 USB Enumeration Successfully Verified!",
     "[STAGE3] Phase 1 Legacy BIOS Bootstrap Successfully Verified!",
-    "Boot Menu Selection:",
-    "[1] Boot Linux from Android Phone (MTP In-RAM Boot + SD Persistence)",
-    "[2] Boot Linux from SD Card (FAT32 Partition)",
-    "[3] Hardware Diagnostics & PCI / USB / Memory Inspection",
-    "[4] Linux 32-bit Boot Protocol Self-Test & Handoff Simulation",
-    "[MENU] Select option [1-4]:",
-    "[MENU] User selected [4]: Linux Boot Protocol Simulation",
+    "COMMENCING CONNECTED STORAGE & OPERATING SYSTEM SCAN",
+    "Storage scan complete.",
+    "ANDROID -> LINUX BOOTLOADER (DYNAMIC MULTI-OS)",
+    "Discovered Operating Systems & Boot Options:",
+    "Hardware Diagnostics & System Inspection",
+    "Linux 32-bit Boot Protocol Simulation",
+    "[MENU] Select option",
+    "Linux Boot Protocol Simulation",
     "[TEST] Phase 8 Image Detection: SUCCESS",
     "[TEST] Phase 9 Kernel Header Check: SUCCESS",
     "[TEST] Phase 9 Boot Params Setup: SUCCESS",
@@ -53,91 +54,95 @@ REQUIRED_LOG_PATTERNS = [
 ]
 
 def main():
-    import threading
+    import socket
 
     if not os.path.exists(BOOT_IMG):
         sys.exit(f"[-] Boot image {BOOT_IMG} not found! Run build first.")
 
-    if os.path.exists(SERIAL_LOG):
-        try:
-            os.remove(SERIAL_LOG)
-        except OSError:
-            try:
-                with open(SERIAL_LOG, "w") as f:
-                    f.truncate(0)
-            except OSError:
-                pass
-
+    port = 4444
     qemu_cmd = [
         "qemu-system-x86_64",
         "-snapshot",
         "-drive", f"file={BOOT_IMG},format=raw,if=ide",
         "-device", "qemu-xhci,id=xhci",
         "-device", "usb-tablet,bus=xhci.0",
-        "-serial", "stdio",
+        "-serial", f"tcp:127.0.0.1:{port},server,nowait",
         "-display", "none",
         "-m", "512M"
     ]
 
     print(f"[*] Launching QEMU headless verification: {' '.join(qemu_cmd)}")
-    proc = subprocess.Popen(
-        qemu_cmd,
-        cwd=WORKSPACE_ROOT,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT
-    )
+    proc = subprocess.Popen(qemu_cmd, cwd=WORKSPACE_ROOT)
+
+    # Connect to QEMU serial socket
+    sock = None
+    for _ in range(30):
+        time.sleep(0.1)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect(("127.0.0.1", port))
+            sock.setblocking(False)
+            break
+        except (ConnectionRefusedError, OSError):
+            if sock:
+                sock.close()
+            sock = None
+
+    if not sock:
+        proc.terminate()
+        sys.exit("[-] Failed to connect to QEMU serial socket!")
 
     captured_chunks = []
-    stop_event = threading.Event()
-
-    def reader_thread():
-        with open(SERIAL_LOG, "w", encoding="utf-8", errors="ignore") as log_f:
-            while not stop_event.is_set():
-                byte = proc.stdout.read(1)
-                if not byte:
-                    break
-                ch = byte.decode("utf-8", errors="ignore")
-                captured_chunks.append(ch)
-                log_f.write(ch)
-                log_f.flush()
-
-    t = threading.Thread(target=reader_thread, daemon=True)
-    t.start()
-
-    timeout_sec = 35
-    start_time = time.time()
     sent_menu_choice = False
     success = False
+    timeout_sec = 35
+    start_time = time.time()
 
     try:
-        while time.time() - start_time < timeout_sec:
-            time.sleep(0.3)
-            current_log = "".join(captured_chunks)
-
-            # Detect interactive menu prompt without auto-selection and send choice '4'
-            if not sent_menu_choice and "[MENU] Select option [1-4]:" in current_log:
-                print("[*] Detected interactive boot menu prompt! Sending selection '4' via COM1 serial...")
+        with open(SERIAL_LOG, "w", encoding="utf-8", errors="ignore") as log_f:
+            while time.time() - start_time < timeout_sec:
                 try:
-                    proc.stdin.write(b"4\n")
-                    proc.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    pass
-                sent_menu_choice = True
+                    chunk = sock.recv(1024)
+                    if chunk:
+                        text = chunk.decode("utf-8", errors="ignore")
+                        captured_chunks.append(text)
+                        log_f.write(text)
+                        log_f.flush()
 
-            if "Phase 10 Interactive Boot Menu Successfully Verified!" in current_log:
-                # Wait briefly for any remaining output
-                time.sleep(1.0)
-                success = True
-                break
+                        current_log = "".join(captured_chunks)
+
+                        # Detect dynamic interactive menu prompt and send choice 't' (Self-Test)
+                        if not sent_menu_choice and "[MENU] Select option" in current_log:
+                            print("[*] Detected dynamic boot menu prompt! Sending selection 't' via COM1 serial...")
+                            try:
+                                sock.sendall(b"t\n")
+                            except (BrokenPipeError, OSError):
+                                pass
+                            sent_menu_choice = True
+
+                        if "Phase 10 Interactive Boot Menu Successfully Verified!" in current_log:
+                            time.sleep(0.5)
+                            # Drain any remaining bytes
+                            try:
+                                extra = sock.recv(1024)
+                                if extra:
+                                    t_extra = extra.decode("utf-8", errors="ignore")
+                                    captured_chunks.append(t_extra)
+                                    log_f.write(t_extra)
+                                    log_f.flush()
+                            except (BlockingIOError, OSError):
+                                pass
+                            success = True
+                            break
+                except (BlockingIOError, OSError):
+                    time.sleep(0.1)
     finally:
-        stop_event.set()
+        sock.close()
         proc.terminate()
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             proc.kill()
-        t.join(timeout=1)
 
     captured_log = "".join(captured_chunks)
     print("\n--- CAPTURED SERIAL LOG ---")

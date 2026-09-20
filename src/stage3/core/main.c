@@ -18,6 +18,8 @@
 #include "../debug/disk_log.h"
 #include "../debug/sound.h"
 #include "../bios/vbe.h"
+#include "../bios/bios_disk.h"
+#include "../image/os_scanner.h"
 
 static xhci_controller_t xhci_ctrl;
 static usb_device_t      detected_usb_dev;
@@ -432,6 +434,51 @@ static void boot_from_android_mtp(mtp_session_t *session, boot_info_t *boot_info
     }
 }
 
+static int sd_read_sectors(void *priv, uint32_t lba, uint32_t count, void *buf) {
+    uint8_t drive = (uint8_t)(uintptr_t)priv;
+    return bios_disk_read(drive, lba, (uint16_t)count, buf);
+}
+
+static void boot_from_sd_fat(os_entry_t *entry, boot_info_t *boot_info) {
+    if (!entry) return;
+    log_info("BOOT", "Attempting boot from SD Card FAT32: '%s'...", entry->filename);
+    uint8_t boot_drive = boot_info ? (uint8_t)boot_info->boot_drive : 0x80;
+    boot_source_t *fat_src = boot_source_fat_create(sd_read_sectors, (void *)(uintptr_t)boot_drive, entry->partition_lba);
+    if (!fat_src) {
+        log_error("BOOT", "Failed to mount SD Card FAT32 partition!");
+        sound_error_tone();
+        return;
+    }
+
+    if (fat_src->open(fat_src, entry->filename) != 0) {
+        log_error("BOOT", "Failed to open '%s' on SD card!", entry->filename);
+        fat_src->close(fat_src);
+        sound_error_tone();
+        return;
+    }
+
+    uint32_t fsize = (uint32_t)fat_src->size(fat_src);
+    void *kernel_buf = (void *)0x02000000;
+    fat_src->read(fat_src, kernel_buf, fsize);
+    fat_src->close(fat_src);
+
+    linux_kernel_info_t kinfo;
+    if (linux_check_kernel_image(kernel_buf, fsize, &kinfo) == 0) {
+        linux_boot_params_t *params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
+        const char *cmdline = "console=tty0 root=/dev/sda1 rw loglevel=7";
+        linux_prepare_boot_params(kernel_buf, fsize, NULL, 0, cmdline, boot_info, NULL, 0, 0, params);
+        sound_kernel_jump_tone();
+        linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
+                        LINUX_KERNEL_LOAD_PHYS,
+                        kinfo.protected_mode_size,
+                        LINUX_BOOT_PARAMS_PHYS,
+                        kinfo.code32_start);
+    } else {
+        log_error("BOOT", "Kernel image '%s' on SD card verification failed!", entry->filename);
+        sound_error_tone();
+    }
+}
+
 void c_main(boot_info_t *boot_info) {
     // 1. Initialize Serial Port & VGA Console
     serial_init();
@@ -618,37 +665,42 @@ void c_main(boot_info_t *boot_info) {
     log_info("STAGE3", "Phase 1 Legacy BIOS Bootstrap Successfully Verified!");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-    // Phase 10: Display Interactive Boot Menu
-    menu_render(boot_info, &xhci_ctrl, &detected_usb_dev, &active_mtp_session);
+    // Phase 10: Scan Connected Storage & Display Dynamic Interactive Boot Menu
+    os_registry_t os_reg;
+    os_scan_all_storages(boot_info, &xhci_ctrl,
+                         msc_found ? &detected_msc_dev : NULL,
+                         active_mtp_session.session_active ? &active_mtp_session : NULL,
+                         &os_reg);
+
+    menu_render(boot_info, &xhci_ctrl, &detected_usb_dev, &active_mtp_session, &os_reg);
 
     // Wait for explicit user selection (no auto-boot countdown)
-    boot_choice_t choice = menu_wait_selection(active_mtp_session.session_active,
-                                               msc_found);
+    menu_selection_t choice = menu_wait_selection(&os_reg);
 
-    switch (choice) {
-        case BOOT_CHOICE_ANDROID_MTP:
-            boot_from_android_mtp(&active_mtp_session, boot_info);
-            break;
-
-        case BOOT_CHOICE_USB_MSC:
-            if (msc_found) {
-                boot_from_usb_msc(&detected_msc_dev, boot_info);
-            } else {
-                log_error("BOOT", "USB Mass Storage device not detected!");
-                sound_error_tone();
+    switch (choice.type) {
+        case MENU_ACTION_BOOT_OS: {
+            if (choice.os_index < os_reg.count) {
+                os_entry_t *selected = &os_reg.entries[choice.os_index];
+                log_info("BOOT", "Booting selected OS #%u: '%s'...", choice.os_index + 1, selected->title);
+                if (selected->approach == BOOT_APPROACH_BLOCK_ON_DEMAND) {
+                    if (selected->storage_type == OS_STORAGE_BLOCK_USB) {
+                        boot_from_usb_msc(selected->usb_dev, boot_info);
+                    } else if (selected->storage_type == OS_STORAGE_BLOCK_SD) {
+                        boot_from_sd_fat(selected, boot_info);
+                    }
+                } else if (selected->approach == BOOT_APPROACH_MTP_IN_RAM) {
+                    boot_from_android_mtp(&active_mtp_session, boot_info);
+                }
             }
             break;
+        }
 
-        case BOOT_CHOICE_SD_FAT:
-            log_info("BOOT", "Attempting boot from SD Card (FAT32)...");
-            break;
-
-        case BOOT_CHOICE_DIAGNOSTICS:
+        case MENU_ACTION_DIAGNOSTICS:
             menu_show_diagnostics(boot_info, &xhci_ctrl, &detected_usb_dev, &active_mtp_session);
             test_linux_boot_simulation(boot_info);
             break;
 
-        case BOOT_CHOICE_TEST_PROTOCOL:
+        case MENU_ACTION_SELF_TEST:
         default:
             test_linux_boot_simulation(boot_info);
             break;

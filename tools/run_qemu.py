@@ -86,6 +86,24 @@ def build_qemu_command(mode, iso_path, memory, headless, usb_host):
             "-device", "usb-storage,bus=xhci.0,drive=phone_disk"
         ])
 
+    elif mode in ["dual"]:
+        # Dual mode: Attach Ubuntu as USB Mass Storage block device AND preload Alpine into RAM
+        if not os.path.exists(DEFAULT_UBUNTU_ISO):
+            print(f"[-] Ubuntu ISO not found at {DEFAULT_UBUNTU_ISO}!")
+            sys.exit(1)
+        if not os.path.exists(DEFAULT_ALPINE_ISO):
+            print(f"[-] Alpine ISO not found at {DEFAULT_ALPINE_ISO}!")
+            sys.exit(1)
+
+        print("[+] Mimicking Dual Connected Storages:")
+        print(f"    1. USB Mass Storage (Rooted Phone): {DEFAULT_UBUNTU_ISO} (Approach 1: Direct Block)")
+        print(f"    2. In-RAM Simulation (MTP Phone)   : {DEFAULT_ALPINE_ISO} (Approach 2: In-RAM + SD Persistence)")
+        cmd.extend([
+            "-drive", f"id=phone_disk,file={DEFAULT_UBUNTU_ISO},format=raw,if=none,readonly=on",
+            "-device", "usb-storage,bus=xhci.0,drive=phone_disk",
+            "-device", "loader,file=" + DEFAULT_ALPINE_ISO + ",addr=0x10000000,force-raw=on"
+        ])
+
     elif mode in ["ram", "mtp"]:
         # Pathway 1: In-RAM Boot + SD Card Persistence (Alpine Linux ~370MB)
         if not os.path.exists(iso_path):
@@ -108,8 +126,8 @@ def build_qemu_command(mode, iso_path, memory, headless, usb_host):
 
 def main():
     parser = argparse.ArgumentParser(description="Desktop QEMU Bootloader Runner")
-    parser.add_argument("--mode", choices=["block", "ubuntu", "alpine-block", "ram", "mtp"], default="block",
-                        help="Boot pathway: 'block' (USB Mass Storage 6GB Ubuntu on-demand) or 'ram' (In-RAM Alpine with persistence)")
+    parser.add_argument("--mode", choices=["block", "ubuntu", "alpine-block", "ram", "mtp", "dual"], default="block",
+                        help="Boot mode: 'block' (Rooted phone UMS), 'mtp' (In-RAM Alpine), or 'dual' (Both storages attached)")
     parser.add_argument("--iso", default="",
                         help="Path to ISO image (defaults to Downloads folder)")
     parser.add_argument("--memory", default="2048M",

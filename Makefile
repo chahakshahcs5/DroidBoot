@@ -31,6 +31,7 @@ STAGE3_SRCS_C := $(SRC_DIR)/stage3/core/main.c \
                  $(SRC_DIR)/stage3/linux/linux_boot.c \
                  $(SRC_DIR)/stage3/image/image_detect.c \
                  $(SRC_DIR)/stage3/filesystem/iso_reader.c \
+                 $(SRC_DIR)/stage3/image/os_scanner.c \
                  $(SRC_DIR)/stage3/ui/menu.c
 
 STAGE3_SRCS_S := $(SRC_DIR)/stage3/core/entry.S \
