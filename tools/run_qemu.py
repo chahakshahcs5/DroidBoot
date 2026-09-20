@@ -151,6 +151,8 @@ def main():
                         help="Run without graphical display window")
     parser.add_argument("--profile", choices=["work", "personal", "clean", ""], default="",
                         help="Target persistence profile to select at runtime (e.g. 'work', 'personal', 'clean')")
+    parser.add_argument("--usb-host", default="",
+                        help="Pass-through real physical USB phone (VID:PID, e.g. 2717:ff40)")
     parser.add_argument("--clean", action="store_true",
                         help="Wipe build artifacts and regenerate a clean, pristine boot.img before launching")
 
