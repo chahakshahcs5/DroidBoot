@@ -17,6 +17,8 @@ STAGE3_SRCS_C := $(SRC_DIR)/stage3/core/main.c \
                  $(SRC_DIR)/stage3/core/printf.c \
                  $(SRC_DIR)/stage3/debug/serial.c \
                  $(SRC_DIR)/stage3/debug/vga.c \
+                 $(SRC_DIR)/stage3/debug/disk_log.c \
+                 $(SRC_DIR)/stage3/bios/bios_disk.c \
                  $(SRC_DIR)/stage3/memory/memory.c \
                  $(SRC_DIR)/stage3/pci/pci.c \
                  $(SRC_DIR)/stage3/xhci/xhci.c \
@@ -29,7 +31,8 @@ STAGE3_SRCS_C := $(SRC_DIR)/stage3/core/main.c \
                  $(SRC_DIR)/stage3/filesystem/iso_reader.c \
                  $(SRC_DIR)/stage3/ui/menu.c
 
-STAGE3_SRCS_S := $(SRC_DIR)/stage3/core/entry.S
+STAGE3_SRCS_S := $(SRC_DIR)/stage3/core/entry.S \
+                 $(SRC_DIR)/stage3/bios/bios_thunk.S
 
 STAGE3_OBJS   := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(STAGE3_SRCS_C)) \
                  $(patsubst $(SRC_DIR)/%.S, $(BUILD_DIR)/%.o, $(STAGE3_SRCS_S))
@@ -40,6 +43,7 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/stage3/core
 	mkdir -p $(BUILD_DIR)/stage3/debug
+	mkdir -p $(BUILD_DIR)/stage3/bios
 	mkdir -p $(BUILD_DIR)/stage3/memory
 	mkdir -p $(BUILD_DIR)/stage3/pci
 

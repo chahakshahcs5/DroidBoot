@@ -14,6 +14,7 @@
 #include "../linux/linux_boot.h"
 #include "../ui/menu.h"
 #include "../filesystem/iso_reader.h"
+#include "../debug/disk_log.h"
 
 static xhci_controller_t xhci_ctrl;
 static usb_device_t      detected_usb_dev;
@@ -113,6 +114,7 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
     } else {
         log_error("TEST", "Phase 9 Boot Params Setup FAILED!");
     }
+    disk_log_flush();
 }
 
 void c_main(boot_info_t *boot_info) {
@@ -136,6 +138,9 @@ void c_main(boot_info_t *boot_info) {
     } else {
         log_error("STAGE3", "boot_info pointer is NULL!");
     }
+
+    // 4. Initialize Persistent SD Disk Logging
+    disk_log_init(boot_info);
 
     // 4. Memory Management & E820 Map
     memory_init(boot_info);
@@ -238,6 +243,7 @@ void c_main(boot_info_t *boot_info) {
     vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
     log_info("STAGE3", "Phase 1 Legacy BIOS Bootstrap Successfully Verified!");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    disk_log_flush();
 
     // Phase 10: Display Interactive Boot Menu
     menu_render(boot_info, &xhci_ctrl, &detected_usb_dev, &active_mtp_session);
@@ -288,6 +294,7 @@ void c_main(boot_info_t *boot_info) {
                                     log_info("BOOT", "  HANDING OFF TO ALPINE LINUX KERNEL ENTRY (0x00100000)   ");
                                     log_info("BOOT", "==========================================================");
                                     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                                    disk_log_flush();
 
                                     linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
                                                     LINUX_KERNEL_LOAD_PHYS,
@@ -340,6 +347,8 @@ void c_main(boot_info_t *boot_info) {
             test_linux_boot_simulation(boot_info);
             break;
     }
+
+    disk_log_flush();
 
     // Main execution loop / halt
     while (1) {

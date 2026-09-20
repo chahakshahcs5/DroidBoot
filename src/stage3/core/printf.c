@@ -1,10 +1,12 @@
 #include "printf.h"
 #include "../debug/serial.h"
 #include "../debug/vga.h"
+#include "../debug/disk_log.h"
 
 static void putc_both(char c) {
     serial_putchar(c);
     vga_putchar(c);
+    disk_log_putc(c);
 }
 
 static void puts_both(const char *s) {
