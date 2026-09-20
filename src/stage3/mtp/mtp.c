@@ -281,3 +281,210 @@ int mtp_get_partial_object(mtp_session_t *session, uint32_t handle, uint32_t off
     ptp_container_t resp;
     return mtp_recv_resp(session, &resp);
 }
+
+static void mtp_k_memset(void *dst, uint8_t val, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    for (size_t i = 0; i < n; i++) d[i] = val;
+}
+
+static void mtp_k_memcpy(void *dst, const void *src, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    for (size_t i = 0; i < n; i++) d[i] = s[i];
+}
+
+static bool mtp_str_eq_nocase(const char *a, const char *b) {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        char ca = *a++;
+        char cb = *b++;
+        if (ca >= 'a' && ca <= 'z') ca -= 32;
+        if (cb >= 'a' && cb <= 'z') cb -= 32;
+        if (ca != cb) return false;
+    }
+    return (*a == '\0' && *b == '\0');
+}
+
+static int mtp_send_data(mtp_session_t *s, uint16_t opcode, const void *payload, uint32_t payload_len) {
+    uint32_t total_len = 12 + payload_len;
+    ptp_container_t header;
+    header.length = total_len;
+    header.type = PTP_CONTAINER_TYPE_DATA;
+    header.code = opcode;
+    header.transaction_id = s->transaction_id - 1;
+
+    uint32_t sent = 0;
+    if (payload_len == 0) {
+        return usb_bulk_transfer(s->usb_dev, s->usb_dev->mtp_bulk_out_ep, &header, 12, &sent);
+    }
+
+    uint8_t buf[512];
+    if (total_len <= sizeof(buf)) {
+        mtp_k_memcpy(buf, &header, 12);
+        mtp_k_memcpy(buf + 12, payload, payload_len);
+        return usb_bulk_transfer(s->usb_dev, s->usb_dev->mtp_bulk_out_ep, buf, total_len, &sent);
+    }
+
+    int res = usb_bulk_transfer(s->usb_dev, s->usb_dev->mtp_bulk_out_ep, &header, 12, &sent);
+    if (res != 0) return res;
+    return usb_bulk_transfer(s->usb_dev, s->usb_dev->mtp_bulk_out_ep, (void *)payload, payload_len, &sent);
+}
+
+int mtp_create_folder(mtp_session_t *session, uint32_t storage_id, uint32_t parent_handle, const char *folder_name, uint32_t *out_handle) {
+    if (!session || !folder_name) return -1;
+
+    int res = mtp_send_cmd(session, PTP_OC_SendObjectInfo, 2, storage_id, parent_handle, 0);
+    if (res != 0) return res;
+
+    uint8_t dataset[256];
+    mtp_k_memset(dataset, 0, sizeof(dataset));
+    *(uint32_t *)(dataset + 0) = storage_id;
+    *(uint16_t *)(dataset + 4) = PTP_OFC_Association; // 0x3001
+    *(uint32_t *)(dataset + 38) = parent_handle;
+    *(uint16_t *)(dataset + 42) = PTP_AT_GenericFolder; // 0x0001
+
+    uint32_t name_len = 0;
+    while (folder_name[name_len]) name_len++;
+    uint8_t *str_ptr = dataset + 52;
+    *str_ptr++ = (uint8_t)(name_len + 1);
+    for (uint32_t i = 0; i < name_len; i++) {
+        *str_ptr++ = (uint8_t)folder_name[i];
+        *str_ptr++ = 0x00;
+    }
+    *str_ptr++ = 0x00;
+    *str_ptr++ = 0x00;
+
+    uint32_t dataset_len = (uint32_t)(str_ptr - dataset);
+    res = mtp_send_data(session, PTP_OC_SendObjectInfo, dataset, dataset_len);
+    if (res != 0) return res;
+
+    ptp_container_t resp;
+    res = mtp_recv_resp(session, &resp);
+    if (res == 0 && out_handle) {
+        *out_handle = resp.params[2];
+    }
+    return res;
+}
+
+int mtp_create_empty_file(mtp_session_t *session, uint32_t storage_id, uint32_t parent_handle, const char *file_name, uint32_t *out_handle) {
+    if (!session || !file_name) return -1;
+
+    int res = mtp_send_cmd(session, PTP_OC_SendObjectInfo, 2, storage_id, parent_handle, 0);
+    if (res != 0) return res;
+
+    uint8_t dataset[256];
+    mtp_k_memset(dataset, 0, sizeof(dataset));
+    *(uint32_t *)(dataset + 0) = storage_id;
+    *(uint16_t *)(dataset + 4) = PTP_OFC_Undefined; // 0x3000
+    *(uint32_t *)(dataset + 8) = 0; // 0 bytes
+    *(uint32_t *)(dataset + 38) = parent_handle;
+
+    uint32_t name_len = 0;
+    while (file_name[name_len]) name_len++;
+    uint8_t *str_ptr = dataset + 52;
+    *str_ptr++ = (uint8_t)(name_len + 1);
+    for (uint32_t i = 0; i < name_len; i++) {
+        *str_ptr++ = (uint8_t)file_name[i];
+        *str_ptr++ = 0x00;
+    }
+    *str_ptr++ = 0x00;
+    *str_ptr++ = 0x00;
+
+    uint32_t dataset_len = (uint32_t)(str_ptr - dataset);
+    res = mtp_send_data(session, PTP_OC_SendObjectInfo, dataset, dataset_len);
+    if (res != 0) return res;
+
+    ptp_container_t resp;
+    res = mtp_recv_resp(session, &resp);
+    if (res != 0) return res;
+
+    uint32_t assigned_handle = resp.params[2];
+    if (out_handle) *out_handle = assigned_handle;
+
+    // Send SendObject with 0-byte payload
+    res = mtp_send_cmd(session, PTP_OC_SendObject, 0, 0, 0, 0);
+    if (res != 0) return res;
+
+    res = mtp_send_data(session, PTP_OC_SendObject, NULL, 0);
+    if (res != 0) return res;
+
+    return mtp_recv_resp(session, &resp);
+}
+
+int mtp_ensure_bootmanager_dirs(mtp_session_t *session, uint32_t storage_id) {
+    if (!session) return -1;
+    log_info("MTP", "Checking for /BootManager/persistence/ on Android storage...");
+
+    uint32_t handles[128];
+    uint32_t count = 0;
+    uint32_t bm_handle = 0;
+    uint32_t pers_handle = 0;
+    bool nomedia_found = false;
+
+    // 1. Check root directory for BootManager
+    if (mtp_get_object_handles(session, storage_id, PTP_OBJECT_HANDLE_ROOT, handles, 128, &count) == 0) {
+        for (uint32_t i = 0; i < count; i++) {
+            char name[64] = {0};
+            if (mtp_get_object_info(session, handles[i], name, sizeof(name), NULL) == 0) {
+                if (mtp_str_eq_nocase(name, "BootManager")) {
+                    bm_handle = handles[i];
+                    break;
+                }
+            }
+        }
+    }
+
+    if (bm_handle == 0) {
+        log_info("MTP", "Auto-creating /BootManager/ folder on phone...");
+        if (mtp_create_folder(session, storage_id, PTP_OBJECT_HANDLE_ROOT, "BootManager", &bm_handle) != 0) {
+            log_info("MTP", "Note: /BootManager/ folder auto-creation skipped or unsupported over MTP.");
+            return 0;
+        }
+    }
+
+    // 2. Check inside BootManager for persistence/
+    if (bm_handle != 0) {
+        count = 0;
+        if (mtp_get_object_handles(session, storage_id, bm_handle, handles, 128, &count) == 0) {
+            for (uint32_t i = 0; i < count; i++) {
+                char name[64] = {0};
+                if (mtp_get_object_info(session, handles[i], name, sizeof(name), NULL) == 0) {
+                    if (mtp_str_eq_nocase(name, "persistence")) {
+                        pers_handle = handles[i];
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (pers_handle == 0) {
+            log_info("MTP", "Auto-creating /BootManager/persistence/ folder on phone...");
+            mtp_create_folder(session, storage_id, bm_handle, "persistence", &pers_handle);
+        }
+    }
+
+    // 3. Check inside persistence/ for .nomedia
+    if (pers_handle != 0) {
+        count = 0;
+        if (mtp_get_object_handles(session, storage_id, pers_handle, handles, 128, &count) == 0) {
+            for (uint32_t i = 0; i < count; i++) {
+                char name[64] = {0};
+                if (mtp_get_object_info(session, handles[i], name, sizeof(name), NULL) == 0) {
+                    if (mtp_str_eq_nocase(name, ".nomedia")) {
+                        nomedia_found = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!nomedia_found) {
+            log_info("MTP", "Auto-generating .nomedia file in /BootManager/persistence/...");
+            mtp_create_empty_file(session, storage_id, pers_handle, ".nomedia", NULL);
+        }
+        log_info("MTP", "Verified /BootManager/persistence/ (.nomedia protected)");
+    }
+
+    return 0;
+}
+

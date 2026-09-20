@@ -64,11 +64,18 @@ typedef struct mtp_session {
 
 #pragma pack(pop)
 
+#define PTP_OFC_Undefined               0x3000
+#define PTP_OFC_Association             0x3001
+#define PTP_AT_GenericFolder            0x0001
+
 int  mtp_init_session(usb_device_t *dev, mtp_session_t *session);
 int  mtp_get_storage_ids(mtp_session_t *session, uint32_t *storage_ids, uint32_t max_ids, uint32_t *out_count);
 int  mtp_get_object_handles(mtp_session_t *session, uint32_t storage_id, uint32_t parent_handle, uint32_t *handles, uint32_t max_handles, uint32_t *out_count);
 int  mtp_get_object_info(mtp_session_t *session, uint32_t handle, char *out_name, uint32_t max_name_len, uint64_t *out_size);
 int  mtp_get_object(mtp_session_t *session, uint32_t handle, void *out_buf, uint32_t max_len, uint32_t *actual_len);
 int  mtp_get_partial_object(mtp_session_t *session, uint32_t handle, uint32_t offset, uint32_t max_bytes, void *out_buf, uint32_t *actual_len);
+int  mtp_create_folder(mtp_session_t *session, uint32_t storage_id, uint32_t parent_handle, const char *folder_name, uint32_t *out_handle);
+int  mtp_create_empty_file(mtp_session_t *session, uint32_t storage_id, uint32_t parent_handle, const char *file_name, uint32_t *out_handle);
+int  mtp_ensure_bootmanager_dirs(mtp_session_t *session, uint32_t storage_id);
 
 #endif // MTP_H

@@ -244,6 +244,9 @@ static void scan_mtp_storage(mtp_session_t *session, os_registry_t *reg) {
 
     uint32_t storage_id = session->active_storage_id;
 
+    // Automatically verify / create /BootManager/persistence/ and .nomedia on phone
+    mtp_ensure_bootmanager_dirs(session, storage_id);
+
     // Enumerate root items
     uint32_t root_handles[128];
     uint32_t root_count = 0;
