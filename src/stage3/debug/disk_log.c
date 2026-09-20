@@ -64,6 +64,7 @@ static uint32_t bootlog_file_lba = 0;
 static uint32_t bootlog_dir_lba = 0;
 static uint32_t bootlog_dir_offset = 0;
 static uint32_t flush_counter = 0;
+static bool     bios_disk_disabled = false;
 
 static int k_memcmp(const void *s1, const void *s2, size_t n) {
     const uint8_t *p1 = (const uint8_t *)s1;
@@ -114,7 +115,16 @@ void disk_log_init(boot_info_t *boot_info) {
 
     // 1. Read MBR at LBA 0 to find Partition 1
     uint32_t part1_lba = 2048; // Default 1 MiB alignment
-    if (bios_disk_read(disk_boot_drive, 0, 1, sec_buf) == 0) {
+    int mbr_err = bios_disk_read(disk_boot_drive, 0, 1, sec_buf);
+    if (mbr_err != 0) {
+        uint8_t alt_drive = (disk_boot_drive == 0x80) ? 0x81 : 0x80;
+        if (bios_disk_read(alt_drive, 0, 1, sec_buf) == 0) {
+            disk_boot_drive = alt_drive;
+            mbr_err = 0;
+        }
+    }
+
+    if (mbr_err == 0) {
         if (sec_buf[510] == 0x55 && sec_buf[511] == 0xAA) {
             uint32_t mbr_lba = *(uint32_t *)(&sec_buf[0x1BE + 8]);
             if (mbr_lba > 0 && mbr_lba < 10000000) {
@@ -189,8 +199,12 @@ void disk_log_init(boot_info_t *boot_info) {
     disk_log_flush();
 }
 
+void disk_log_disable_bios(void) {
+    bios_disk_disabled = true;
+}
+
 void disk_log_flush(void) {
-    if (!log_initialized || is_flushing) return;
+    if (!log_initialized || is_flushing || bios_disk_disabled) return;
     is_flushing = true;
 
     flush_counter++;

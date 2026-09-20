@@ -62,6 +62,7 @@ def run_qemu(xhci=False, headless=False):
     qemu_bin = "qemu-system-x86_64"
     args = [
         qemu_bin,
+        "-snapshot",
         "-drive", f"file={boot_img},format=raw,if=ide",
         "-serial", "stdio",
         "-m", "512M"

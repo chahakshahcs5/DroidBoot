@@ -15,10 +15,16 @@
 #include "../ui/menu.h"
 #include "../filesystem/iso_reader.h"
 #include "../debug/disk_log.h"
+#include "../debug/sound.h"
 
 static xhci_controller_t xhci_ctrl;
 static usb_device_t      detected_usb_dev;
 static mtp_session_t     active_mtp_session;
+
+static void k_memset(void *dst, uint8_t val, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    for (size_t i = 0; i < n; i++) d[i] = val;
+}
 
 static void test_linux_boot_simulation(boot_info_t *boot_info) {
     // Check if a real Alpine kernel was preloaded into RAM at 0x02000000
@@ -121,6 +127,7 @@ void c_main(boot_info_t *boot_info) {
     // 1. Initialize Serial Port & VGA Console
     serial_init();
     vga_init();
+    sound_boot_tone(); // PC speaker tone indicating Stage 3 is alive!
 
     // 2. Banner
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
@@ -150,6 +157,11 @@ void c_main(boot_info_t *boot_info) {
 
     pci_device_t *xhci_pci = pci_find_xhci();
     if (xhci_pci) {
+        // Flush all bootstrap and PCI detection logs to SD card while BIOS INT 13h is still operational!
+        disk_log_flush();
+        // Deactivate BIOS INT 13h disk access before xHCI controller reset
+        disk_log_disable_bios();
+
         // Phase 3: Initialize xHCI Host Controller
         log_info("STAGE3", "Initializing xHCI Host Controller hardware...");
         int xhci_status = xhci_init(xhci_pci, &xhci_ctrl);
@@ -169,87 +181,81 @@ void c_main(boot_info_t *boot_info) {
             log_info("STAGE3", "Phase 3 xHCI Controller Initialization Successfully Verified!");
             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-            // Phase 4: Enumerate Connected USB Devices
-            // Debounce / wait up to 2 seconds for physical USB PHY connection & device attachment
-            log_info("XHCI", "Waiting for USB devices to connect and stabilize on root hub...");
-            bool has_connected_port = false;
-            for (int retry = 0; retry < 20; retry++) {
+            // Phase 4 & 5: Detect Connected USB Devices & Android MTP Phone
+            // Multi-pass debounce & poll loop (up to 3 seconds) for Android USB PHY negotiation
+            log_info("XHCI", "Waiting for Android phone to connect and stabilize on root hub...");
+            bool mtp_found = false;
+
+            for (int poll_iter = 0; poll_iter < 30 && !mtp_found; poll_iter++) {
+                if (poll_iter > 0) {
+                    // 100ms delay between port scans
+                    for (int d = 0; d < 100000; d++) io_wait();
+                }
+
+                xhci_poll_ports(&xhci_ctrl);
+
                 for (uint8_t p = 1; p <= xhci_ctrl.max_ports; p++) {
                     uintptr_t port_reg = xhci_ctrl.op_regs + XHCI_OP_PORTS_BASE + (p - 1) * 0x10;
                     uint32_t portsc = *(volatile uint32_t *)port_reg;
+
                     if (portsc & XHCI_PORT_CCS) {
-                        has_connected_port = true;
-                        break;
-                    }
-                }
-                if (has_connected_port) {
-                    for (int d = 0; d < 50000; d++) io_wait();
-                    break;
-                }
-                for (int d = 0; d < 100000; d++) io_wait();
-            }
+                        usb_device_t current_dev;
+                        k_memset(&current_dev, 0, sizeof(current_dev));
+                        log_info("STAGE3", "Probing USB device on Port %u...", p);
+                        int probe_res = usb_probe_port(&xhci_ctrl, p, &current_dev);
+                        if (probe_res == 0) {
+                            if (current_dev.has_mtp) {
+                                detected_usb_dev = current_dev;
+                                log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
+                                int mtp_res = mtp_init_session(&detected_usb_dev, &active_mtp_session);
+                                if (mtp_res == 0) {
+                                    uint32_t storage_ids[8];
+                                    uint32_t count = 0;
+                                    mtp_get_storage_ids(&active_mtp_session, storage_ids, 8, &count);
 
-            xhci_poll_ports(&xhci_ctrl);
-
-            bool device_found = false;
-            for (uint8_t p = 1; p <= xhci_ctrl.max_ports; p++) {
-                uintptr_t port_reg = xhci_ctrl.op_regs + XHCI_OP_PORTS_BASE + (p - 1) * 0x10;
-                uint32_t portsc = *(volatile uint32_t *)port_reg;
-
-                if (portsc & XHCI_PORT_CCS) {
-                    log_info("STAGE3", "Probing USB device on Port %u...", p);
-                    int probe_res = usb_probe_port(&xhci_ctrl, p, &detected_usb_dev);
-                    if (probe_res == 0) {
-                        device_found = true;
-                        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-                        log_info("STAGE3", "Phase 4 USB Enumeration Successfully Verified!");
-                        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-
-                        // Phase 5: Android MTP Detection & Session Setup
-                        if (detected_usb_dev.has_mtp) {
-                            log_info("STAGE3", "Android MTP interface detected! Initializing MTP session...");
-                            int mtp_res = mtp_init_session(&detected_usb_dev, &active_mtp_session);
-                            if (mtp_res == 0) {
-                                uint32_t storage_ids[8];
-                                uint32_t count = 0;
-                                mtp_get_storage_ids(&active_mtp_session, storage_ids, 8, &count);
-
-                                vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-                                log_info("STAGE3", "Phase 5 Android MTP Detection Successfully Verified!");
-                                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                                    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                                    log_info("STAGE3", "Phase 5 Android MTP Detection Successfully Verified!");
+                                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                                    sound_phone_connected_tone(); // High chime: Phone connected!
+                                    mtp_found = true;
+                                    break;
+                                } else {
+                                    log_error("STAGE3", "Failed to initialize MTP session (code %d)", mtp_res);
+                                }
                             } else {
-                                log_error("STAGE3", "Failed to initialize MTP session (code %d)", mtp_res);
+                                log_info("STAGE3", "Port %u: Attached device is not MTP (Class 0x%02X)",
+                                         p, current_dev.dev_desc.bDeviceClass);
                             }
-                        } else {
-                            log_info("STAGE3", "Connected device is not MTP (Class 0x%02X)",
-                                     detected_usb_dev.dev_desc.bDeviceClass);
                         }
-                    } else {
-                        log_error("STAGE3", "Failed to probe device on port %u (code %d)", p, probe_res);
                     }
                 }
             }
 
-            if (!device_found) {
-                log_info("STAGE3", "Phase 4 USB Enumeration ready (waiting for physical device / emulation).");
+            if (!mtp_found) {
+                log_info("STAGE3", "Waiting for Android phone... (plug phone into USB with File Transfer mode)");
+                sound_error_tone(); // Warning tone: No MTP phone detected
             }
         } else {
             log_error("STAGE3", "Failed to initialize xHCI controller (error %d)", xhci_status);
+            sound_error_tone();
         }
     } else {
         log_info("STAGE3", "No xHCI controller detected on PCI bus.");
+        disk_log_flush();
+        disk_log_disable_bios();
+        sound_error_tone();
     }
 
     vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
     log_info("STAGE3", "Phase 1 Legacy BIOS Bootstrap Successfully Verified!");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-    disk_log_flush();
 
     // Phase 10: Display Interactive Boot Menu
     menu_render(boot_info, &xhci_ctrl, &detected_usb_dev, &active_mtp_session);
 
-    // Wait for user selection or auto-selection timeout (2 seconds in automated mode)
-    boot_choice_t choice = menu_wait_selection(2, active_mtp_session.session_active);
+    // Wait for user selection or auto-selection timeout (1 second if MTP active, 2 seconds otherwise)
+    boot_choice_t choice = menu_wait_selection(active_mtp_session.session_active ? 1 : 2,
+                                               active_mtp_session.session_active);
 
     switch (choice) {
         case BOOT_CHOICE_ANDROID_MTP:
@@ -295,6 +301,7 @@ void c_main(boot_info_t *boot_info) {
                                     log_info("BOOT", "==========================================================");
                                     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                                     disk_log_flush();
+                                    sound_kernel_jump_tone(); // Fanfare: Booting into Linux kernel!
 
                                     linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
                                                     LINUX_KERNEL_LOAD_PHYS,
@@ -325,10 +332,12 @@ void c_main(boot_info_t *boot_info) {
                         }
                     } else {
                         log_error("BOOT", "No bootable kernel or ISO found in Android /Download/!");
+                        sound_error_tone();
                     }
                 }
             } else {
                 log_error("BOOT", "Android MTP session not active! Falling back to self-test...");
+                sound_error_tone();
                 test_linux_boot_simulation(boot_info);
             }
             break;

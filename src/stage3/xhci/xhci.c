@@ -29,6 +29,47 @@ static const char *get_speed_name(uint8_t speed) {
     }
 }
 
+static void xhci_bios_handoff(xhci_controller_t *ctrl) {
+    uint32_t hccparams1 = xhci_read32(ctrl->mmio_base + XHCI_CAP_HCCPARAMS1);
+    uint32_t xecp = (hccparams1 >> 16) & 0xFFFF;
+    if (xecp == 0) return;
+
+    uintptr_t ext_cap = ctrl->mmio_base + (xecp << 2);
+
+    while (ext_cap) {
+        uint32_t val = xhci_read32(ext_cap);
+        uint8_t id = val & 0xFF;
+        uint8_t next = (val >> 8) & 0xFF;
+
+        if (id == 0x01) { // USB Legacy Support (USBLEGSUP)
+            if (val & (1U << 16)) { // BIOS Owned Semaphore
+                log_info("XHCI", "Requesting xHCI ownership from BIOS SMM...");
+                xhci_write32(ext_cap, val | (1U << 24)); // Set OS Owned
+
+                int wait_ms = 1000;
+                while ((xhci_read32(ext_cap) & (1U << 16)) && --wait_ms > 0) {
+                    mdelay(1);
+                }
+
+                if (wait_ms == 0) {
+                    log_error("XHCI", "BIOS ownership release timed out, proceeding...");
+                } else {
+                    log_info("XHCI", "BIOS successfully released xHCI ownership.");
+                }
+
+                // Clear SMI enable bits in USBLEGCTLSTS (offset + 4)
+                uint32_t legctl = xhci_read32(ext_cap + 4);
+                legctl &= 0x1FEE0000;
+                xhci_write32(ext_cap + 4, legctl);
+            }
+            break;
+        }
+
+        if (next == 0) break;
+        ext_cap += (next << 2);
+    }
+}
+
 int xhci_init(pci_device_t *pci_dev, xhci_controller_t *ctrl) {
     if (!pci_dev || !ctrl) return -1;
 
@@ -43,9 +84,9 @@ int xhci_init(pci_device_t *pci_dev, xhci_controller_t *ctrl) {
     log_info("XHCI", "Initializing xHCI Controller at MMIO Base 0x%08X", (uint32_t)ctrl->mmio_base);
 
     // 3. Read Capability Registers (using 32-bit aligned MMIO read)
-    uint32_t cap_reg0 = xhci_read32(ctrl->mmio_base + 0x00);
-    ctrl->cap_len = (uint8_t)(cap_reg0 & 0xFF);
-    ctrl->hci_version = (uint16_t)(cap_reg0 >> 16);
+    uint32_t caplength_version = xhci_read32(ctrl->mmio_base + XHCI_CAP_CAPLENGTH);
+    ctrl->cap_len = (uint8_t)(caplength_version & 0xFF);
+    ctrl->hci_version = (uint16_t)(caplength_version >> 16);
 
     uint32_t hcsparams1 = xhci_read32(ctrl->mmio_base + XHCI_CAP_HCSPARAMS1);
     ctrl->max_slots = (uint8_t)(hcsparams1 & 0xFF);
@@ -68,7 +109,9 @@ int xhci_init(pci_device_t *pci_dev, xhci_controller_t *ctrl) {
              ctrl->hci_version >> 8, (ctrl->hci_version >> 4) & 0xF,
              ctrl->max_slots, ctrl->max_ports, ctrl->max_scratchpad_bufs);
 
-    // 4. Controller Reset
+    // 4. BIOS Handoff & Controller Reset
+    xhci_bios_handoff(ctrl);
+
     // Stop controller: clear USBCMD.RS
     uint32_t cmd = xhci_read32(ctrl->op_regs + XHCI_OP_USBCMD);
     cmd &= ~XHCI_CMD_RS;

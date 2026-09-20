@@ -22,6 +22,7 @@ INITIAL_BOOTLOG_TEXT = (
     "  Media: SD Card / USB Boot Disk (FAT32 Partition 1)\r\n"
     "======================================================================\r\n"
     "[BOOT] Persistent logging subsystem initialized.\r\n"
+    "[STATUS] Ready for hardware boot. Power on target PC.\r\n"
 ).encode('ascii')
 
 def build_mbr_partition(active: bool, ptype: int, start_lba: int, total_sectors: int) -> bytes:

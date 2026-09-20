@@ -30,6 +30,9 @@ void disk_log_putc(char c);
 // Flush in-memory log buffer to SD card (both FAT32 BOOTLOG.TXT and raw LBA 256)
 void disk_log_flush(void);
 
+// Disable BIOS INT 13h disk access (called before xHCI reset to prevent hangs)
+void disk_log_disable_bios(void);
+
 // Get current log buffer stats
 uint32_t disk_log_get_length(void);
 const char *disk_log_get_buffer(void);

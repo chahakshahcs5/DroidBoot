@@ -8,7 +8,7 @@
 #define BIOS_BOUNCE_ADDR        0x00010000
 #define BIOS_BOUNCE_SEG         0x1000
 #define BIOS_BOUNCE_OFF         0x0000
-#define BIOS_MAX_CHUNK_SECTORS  64
+#define BIOS_MAX_CHUNK_SECTORS  16
 #define BIOS_SECTOR_SIZE        512
 
 #define BIOS_CMD_READ_EXT       0x42
