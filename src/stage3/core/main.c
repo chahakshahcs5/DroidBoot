@@ -204,18 +204,18 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
     if (iso_files.is_casper) {
         if (prof && prof->is_clean_session) {
             snprintf(cmdline, sizeof(cmdline),
-                     "boot=casper nosplash console=tty0 console=ttyS0,115200");
+                     "boot=casper noapic nosplash console=tty0 console=ttyS0,115200");
         } else {
             snprintf(cmdline, sizeof(cmdline),
-                     "boot=casper persistent persistent-path=/BootManager/persistence/ nosplash console=tty0 console=ttyS0,115200");
+                     "boot=casper persistent persistent-path=/BootManager/persistence/ noapic nosplash console=tty0 console=ttyS0,115200");
         }
     } else {
         if (prof && prof->is_clean_session) {
             snprintf(cmdline, sizeof(cmdline),
-                     "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 modules=loop,squashfs,sd-mod,usb-storage");
+                     "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 noapic modules=loop,squashfs,sd-mod,usb-storage");
         } else {
             snprintf(cmdline, sizeof(cmdline),
-                     "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 modules=loop,squashfs,sd-mod,usb-storage apkovl=sda1:");
+                     "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 noapic modules=loop,squashfs,sd-mod,usb-storage apkovl=sda1:");
         }
     }
 
@@ -296,11 +296,11 @@ static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_fil
     char alpine_cmdline[512];
     if (prof && prof->is_clean_session) {
         snprintf(alpine_cmdline, sizeof(alpine_cmdline),
-                 "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes loglevel=7",
+                 "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 noapic modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes loglevel=7",
                  LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
     } else {
         snprintf(alpine_cmdline, sizeof(alpine_cmdline),
-                 "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes loglevel=7 apkovl=sda1:",
+                 "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 noapic modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes loglevel=7 apkovl=sda1:",
                  LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
     }
 
