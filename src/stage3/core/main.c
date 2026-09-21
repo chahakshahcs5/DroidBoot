@@ -34,6 +34,37 @@ static void k_memset(void *dst, uint8_t val, size_t n) {
     for (size_t i = 0; i < n; i++) d[i] = val;
 }
 
+static int k_memcmp(const void *s1, const void *s2, size_t n) {
+    const uint8_t *p1 = (const uint8_t *)s1;
+    const uint8_t *p2 = (const uint8_t *)s2;
+    for (size_t i = 0; i < n; i++) {
+        if (p1[i] != p2[i]) return (int)p1[i] - (int)p2[i];
+    }
+    return 0;
+}
+
+static bool is_boot_drive_msc(usb_device_t *dev) {
+    if (!dev || !dev->has_msc) return false;
+    static uint8_t sec[512];
+    if (usb_msc_read_sectors(dev, 0, 1, sec) != 0) return false;
+    if (sec[510] != 0x55 || sec[511] != 0xAA) return false;
+
+    // Read Partition 1 LBA from MBR (offset 0x1BE + 8)
+    uint32_t part1_lba = *(uint32_t *)(&sec[0x1BE + 8]);
+    if (part1_lba == 0 || part1_lba > 10000000) part1_lba = 2048;
+
+    if (usb_msc_read_sectors(dev, part1_lba, 1, sec) != 0) return false;
+    if (sec[510] != 0x55 || sec[511] != 0xAA) return false;
+
+    // Check FAT32 volume label ("BOOTLOADER ") or OEM name ("MSWIN4.1")
+    if (k_memcmp(&sec[0x47], "BOOTLOADER ", 11) == 0 ||
+        k_memcmp(&sec[3], "MSWIN4.1", 8) == 0 ||
+        k_memcmp(&sec[0x52], "FAT32   ", 8) == 0) {
+        return true;
+    }
+    return false;
+}
+
 static void test_linux_boot_simulation(boot_info_t *boot_info) {
     // Check if a real Alpine kernel was preloaded into RAM at 0x02000000
     uint32_t magic_at_ram = *(volatile uint32_t *)(0x02000000 + 0x0202);
@@ -643,11 +674,16 @@ void c_main(boot_info_t *boot_info) {
                     }
 
                     if (current_dev.has_msc) {
-                        log_info("STAGE3", "Port %u: USB Mass Storage Block Storage registered.", p);
-                        detected_msc_dev = current_dev;
-                        msc_found = true;
-                        if (detected_usb_dev.slot_id == 0) {
-                            detected_usb_dev = current_dev;
+                        if (is_boot_drive_msc(&current_dev)) {
+                            log_info("STAGE3", "Port %u: Boot Drive SD/USB verified! Enabling direct xHCI logging.", p);
+                            disk_log_register_usb_msc(&current_dev);
+                        } else {
+                            log_info("STAGE3", "Port %u: USB Mass Storage Block Storage registered.", p);
+                            detected_msc_dev = current_dev;
+                            msc_found = true;
+                            if (detected_usb_dev.slot_id == 0) {
+                                detected_usb_dev = current_dev;
+                            }
                         }
                     } else if (detected_usb_dev.has_mtp && !active_mtp_session.session_active) {
                         log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
@@ -726,13 +762,18 @@ void c_main(boot_info_t *boot_info) {
                         }
 
                         if (current_dev.has_msc) {
-                            log_info("STAGE3", "Port %u: USB Mass Storage Block Storage registered.", p);
-                            detected_msc_dev = current_dev;
-                            msc_found = true;
-                            if (detected_usb_dev.slot_id == 0) {
-                                detected_usb_dev = current_dev;
+                            if (is_boot_drive_msc(&current_dev)) {
+                                log_info("STAGE3", "Port %u: Boot Drive SD/USB verified! Enabling direct xHCI logging.", p);
+                                disk_log_register_usb_msc(&current_dev);
+                            } else {
+                                log_info("STAGE3", "Port %u: USB Mass Storage Block Storage registered.", p);
+                                detected_msc_dev = current_dev;
+                                msc_found = true;
+                                if (detected_usb_dev.slot_id == 0) {
+                                    detected_usb_dev = current_dev;
+                                }
+                                break;
                             }
-                            break;
                         } else if (current_dev.has_mtp) {
                             detected_usb_dev = current_dev;
                             log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
@@ -802,9 +843,14 @@ void c_main(boot_info_t *boot_info) {
                             adb_init_session(&detected_usb_dev, &active_adb_session);
                         }
                         if (current_dev.has_msc) {
-                            detected_msc_dev = current_dev;
-                            msc_found = true;
-                            if (detected_usb_dev.slot_id == 0) detected_usb_dev = current_dev;
+                            if (is_boot_drive_msc(&current_dev)) {
+                                log_info("STAGE3", "Port %u: Boot Drive SD/USB verified! Enabling direct xHCI logging.", p);
+                                disk_log_register_usb_msc(&current_dev);
+                            } else {
+                                detected_msc_dev = current_dev;
+                                msc_found = true;
+                                if (detected_usb_dev.slot_id == 0) detected_usb_dev = current_dev;
+                            }
                         } else if (detected_usb_dev.has_mtp && !active_mtp_session.session_active) {
                             if (mtp_init_session(&detected_usb_dev, &active_mtp_session) == 0) {
                                 mtp_found = true;
@@ -833,6 +879,32 @@ void c_main(boot_info_t *boot_info) {
                 }
                 const persistence_profile_t *prof = (sel_img->profile_count > 0) ?
                     &sel_img->profiles[sel_img->selected_profile] : NULL;
+
+                // If phone is ALREADY operating as USB Mass Storage, hot-swap image without dropping bus!
+                if (msc_found && detected_msc_dev.has_msc) {
+                    vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+                    log_info("STAGE3", "Phone already in UMS mode. Hot-swapping backing image to '%s'...", sel_img->filename);
+                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                    disk_log_flush();
+
+                    int upd_res = adb_update_mass_storage_file(&active_adb_session, sel_img->filename);
+                    if (upd_res == 0) {
+                        for (int w = 0; w < 200000; w++) io_wait();
+                        uint32_t last_lba = 0, block_sz = 0;
+                        usb_msc_init_device(&detected_msc_dev);
+                        usb_msc_read_capacity(&detected_msc_dev, &last_lba, &block_sz);
+
+                        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                        log_info("STAGE3", "SUCCESS: USB Mass Storage image updated to '%s'!", sel_img->filename);
+                        log_info("BOOT", "Booting '%s' with Direct Block Access (0 MB in RAM)...", sel_img->title);
+                        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                        disk_log_flush();
+                        boot_from_usb_msc(&detected_msc_dev, boot_info, prof);
+                        break;
+                    } else {
+                        log_error("STAGE3", "Hot-swap failed (%d), falling back to full gadget switch...", upd_res);
+                    }
+                }
 
                 vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
                 log_info("STAGE3", "Attaching '%s' as USB Mass Storage...", sel_img->filename);
@@ -913,8 +985,39 @@ void c_main(boot_info_t *boot_info) {
                         &selected->profiles[selected->selected_profile] : NULL;
 
                     bool ums_booted = false;
+
+                    // If phone is ALREADY operating as USB Mass Storage and ADB is connected, hot-swap immediately!
+                    if (msc_found && detected_msc_dev.has_msc) {
+                        active_adb_session.usb_dev = &detected_usb_dev;
+                        if (!active_adb_session.is_connected && detected_usb_dev.has_adb) {
+                            adb_init_session(&detected_usb_dev, &active_adb_session);
+                        }
+                        if (active_adb_session.is_connected) {
+                            vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+                            log_info("BOOT", "Phone already in UMS mode. Hot-swapping to '%s' (0 MB in RAM)...", selected->filename);
+                            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                            disk_log_flush();
+
+                            int upd = adb_update_mass_storage_file(&active_adb_session, selected->filename);
+                            if (upd == 0) {
+                                for (int w = 0; w < 200000; w++) io_wait();
+                                uint32_t last_lba = 0, block_sz = 0;
+                                usb_msc_init_device(&detected_msc_dev);
+                                usb_msc_read_capacity(&detected_msc_dev, &last_lba, &block_sz);
+
+                                vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                                log_info("BOOT", "USB Mass Storage updated! Booting '%s' directly...", selected->title);
+                                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                                disk_log_flush();
+                                boot_from_usb_msc(&detected_msc_dev, boot_info, prof);
+                                ums_booted = true;
+                                break;
+                            }
+                        }
+                    }
+
                     // If image is on Android MTP and ADB is available, try Root USB Mass Storage switch first!
-                    if (selected->approach == BOOT_APPROACH_MTP_IN_RAM) {
+                    if (!ums_booted && selected->approach == BOOT_APPROACH_MTP_IN_RAM) {
                         active_adb_session.usb_dev = &detected_usb_dev;
                         if (!active_adb_session.is_connected && detected_usb_dev.has_adb) {
                             adb_init_session(&detected_usb_dev, &active_adb_session);
@@ -926,6 +1029,7 @@ void c_main(boot_info_t *boot_info) {
                             disk_log_flush();
                             int trg = adb_trigger_mass_storage(&active_adb_session, selected->filename);
                             disk_log_flush();
+
 
                             // Try to reprobe as MSC regardless of trigger result.
                             // The phone's background job runs independently — even if the ADB

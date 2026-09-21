@@ -412,6 +412,12 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
         if (msc_cfg == 0) {
             usb_msc_init_device(out_dev);
         }
+        if (out_dev->has_adb) {
+            log_info("USB", "Composite device: configuring concurrent ADB endpoints...");
+            usb_configure_adb_endpoints(out_dev);
+        }
+    } else if (out_dev->has_adb) {
+        usb_configure_adb_endpoints(out_dev);
     }
 
     return 0;

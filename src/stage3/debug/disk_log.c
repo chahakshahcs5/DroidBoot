@@ -134,6 +134,60 @@ bool disk_log_last_flush_ok(void) {
     return last_flush_ok;
 }
 
+static bool resolve_fat_bootlog_bios(uint8_t drive) {
+    static uint8_t sec_buf[512];
+    uint32_t part1_lba = 2048;
+    if (bios_disk_read(drive, 0, 1, sec_buf) != 0) return false;
+
+    if (sec_buf[510] == 0x55 && sec_buf[511] == 0xAA) {
+        uint32_t mbr_lba = *(uint32_t *)(&sec_buf[0x1BE + 8]);
+        if (mbr_lba > 0 && mbr_lba < 10000000) {
+            part1_lba = mbr_lba;
+        }
+    }
+
+    if (bios_disk_read(drive, part1_lba, 1, sec_buf) != 0) return false;
+    fat32_vbr_t *vbr = (fat32_vbr_t *)sec_buf;
+    if (vbr->bytes_per_sector != 512 || vbr->sectors_per_cluster == 0 ||
+        vbr->fat_size_32 == 0 || vbr->root_cluster < 2) {
+        return false;
+    }
+
+    uint8_t  spc = vbr->sectors_per_cluster;
+    uint16_t res_sec = vbr->reserved_sector_count;
+    uint8_t  nfats = vbr->num_fats;
+    uint32_t fat_sz = vbr->fat_size_32;
+    uint32_t root_cl = vbr->root_cluster;
+
+    uint32_t fat_start_lba = part1_lba + res_sec;
+    uint32_t data_start_lba = fat_start_lba + (nfats * fat_sz);
+    uint32_t root_lba = data_start_lba + (root_cl - 2) * spc;
+
+    const char target_83[11] = "BOOTLOG TXT";
+    for (uint8_t s = 0; s < spc; s++) {
+        uint32_t cur_sec_lba = root_lba + s;
+        if (bios_disk_read(drive, cur_sec_lba, 1, sec_buf) != 0) break;
+
+        fat_dir_entry_t *entries = (fat_dir_entry_t *)sec_buf;
+        for (int e = 0; e < 16; e++) {
+            if ((uint8_t)entries[e].name[0] == 0x00) return false;
+            if ((uint8_t)entries[e].name[0] == 0xE5 || entries[e].attr == 0x0F) continue;
+
+            if (k_memcmp(entries[e].name, target_83, 11) == 0) {
+                uint32_t first_cluster = ((uint32_t)entries[e].first_cluster_hi << 16) | entries[e].first_cluster_lo;
+                if (first_cluster < 2) return false;
+                bootlog_file_lba = data_start_lba + (first_cluster - 2) * spc;
+                bootlog_dir_lba = cur_sec_lba;
+                bootlog_dir_offset = e * sizeof(fat_dir_entry_t);
+                bootlog_fat_resolved = true;
+                disk_boot_drive = drive;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void disk_log_init(boot_info_t *boot_info) {
     disk_boot_drive = boot_info ? boot_info->boot_drive : 0x80;
     bootlog_fat_resolved = false;
@@ -141,77 +195,13 @@ void disk_log_init(boot_info_t *boot_info) {
     bootlog_dir_lba = 0;
     bootlog_dir_offset = 0;
 
-    static uint8_t sec_buf[512];
-
-    // 1. Read MBR at LBA 0 to find Partition 1
-    uint32_t part1_lba = 2048; // Default 1 MiB alignment
-    int mbr_err = bios_disk_read(disk_boot_drive, 0, 1, sec_buf);
-    if (mbr_err != 0) {
-        uint8_t alt_drive = (disk_boot_drive == 0x80) ? 0x81 : 0x80;
-        if (bios_disk_read(alt_drive, 0, 1, sec_buf) == 0) {
-            disk_boot_drive = alt_drive;
-            mbr_err = 0;
-        }
-    }
-
-    if (mbr_err == 0) {
-        if (sec_buf[510] == 0x55 && sec_buf[511] == 0xAA) {
-            uint32_t mbr_lba = *(uint32_t *)(&sec_buf[0x1BE + 8]);
-            if (mbr_lba > 0 && mbr_lba < 10000000) {
-                part1_lba = mbr_lba;
-            }
-        }
-    }
-
-    // 2. Read VBR at Partition 1 LBA
-    if (bios_disk_read(disk_boot_drive, part1_lba, 1, sec_buf) == 0) {
-        fat32_vbr_t *vbr = (fat32_vbr_t *)sec_buf;
-        if (vbr->bytes_per_sector == 512 &&
-            vbr->sectors_per_cluster > 0 &&
-            vbr->fat_size_32 > 0 &&
-            vbr->root_cluster >= 2) {
-
-            uint8_t  spc = vbr->sectors_per_cluster;
-            uint16_t res_sec = vbr->reserved_sector_count;
-            uint8_t  nfats = vbr->num_fats;
-            uint32_t fat_sz = vbr->fat_size_32;
-            uint32_t root_cl = vbr->root_cluster;
-
-            uint32_t fat_start_lba = part1_lba + res_sec;
-            uint32_t data_start_lba = fat_start_lba + (nfats * fat_sz);
-            uint32_t root_lba = data_start_lba + (root_cl - 2) * spc;
-
-            // Search root directory for "BOOTLOG TXT"
-            const char target_83[11] = "BOOTLOG TXT";
-            bool found = false;
-
-            for (uint8_t s = 0; s < spc && !found; s++) {
-                uint32_t cur_sec_lba = root_lba + s;
-                if (bios_disk_read(disk_boot_drive, cur_sec_lba, 1, sec_buf) != 0) {
-                    break;
-                }
-
-                fat_dir_entry_t *entries = (fat_dir_entry_t *)sec_buf;
-                for (int e = 0; e < 16; e++) {
-                    if ((uint8_t)entries[e].name[0] == 0x00) {
-                        found = false;
-                        s = spc; // Stop scanning
-                        break;
-                    }
-                    if ((uint8_t)entries[e].name[0] == 0xE5 || entries[e].attr == 0x0F) {
-                        continue;
-                    }
-
-                    if (k_memcmp(entries[e].name, target_83, 11) == 0) {
-                        uint32_t first_cluster = ((uint32_t)entries[e].first_cluster_hi << 16) | entries[e].first_cluster_lo;
-                        bootlog_file_lba = data_start_lba + (first_cluster - 2) * spc;
-                        bootlog_dir_lba = cur_sec_lba;
-                        bootlog_dir_offset = e * sizeof(fat_dir_entry_t);
-                        bootlog_fat_resolved = true;
-                        found = true;
-                        break;
-                    }
-                }
+    // 1. Try initial drive provided by BIOS
+    if (!resolve_fat_bootlog_bios(disk_boot_drive)) {
+        // 2. Scan alternate BIOS drives (0x80..0x83) to locate BootManager partition
+        uint8_t candidates[4] = {0x80, 0x81, 0x82, 0x83};
+        for (int i = 0; i < 4; i++) {
+            if (candidates[i] != disk_boot_drive) {
+                if (resolve_fat_bootlog_bios(candidates[i])) break;
             }
         }
     }
@@ -242,9 +232,56 @@ void disk_log_register_usb_msc(void *usb_dev) {
     k_memcpy(&msc_log_dev_storage, dev, sizeof(usb_device_t));
     msc_log_registered = true;
 
-    log_info("LOG", "Native USB Mass Storage registered for persistent logging (Port %u)!",
-             msc_log_dev_storage.port_num);
-    // Flush all accumulated logs to disk immediately!
+    // Resolve BOOTLOG.TXT LBAs directly on the native USB MSC device
+    static uint8_t sec_buf[512];
+    uint32_t part1_lba = 2048;
+    if (usb_msc_read_sectors(&msc_log_dev_storage, 0, 1, sec_buf) == 0) {
+        if (sec_buf[510] == 0x55 && sec_buf[511] == 0xAA) {
+            uint32_t mbr_lba = *(uint32_t *)(&sec_buf[0x1BE + 8]);
+            if (mbr_lba > 0 && mbr_lba < 10000000) part1_lba = mbr_lba;
+        }
+        if (usb_msc_read_sectors(&msc_log_dev_storage, part1_lba, 1, sec_buf) == 0) {
+            fat32_vbr_t *vbr = (fat32_vbr_t *)sec_buf;
+            if (vbr->bytes_per_sector == 512 && vbr->sectors_per_cluster > 0 &&
+                vbr->fat_size_32 > 0 && vbr->root_cluster >= 2) {
+                uint8_t  spc = vbr->sectors_per_cluster;
+                uint16_t res_sec = vbr->reserved_sector_count;
+                uint8_t  nfats = vbr->num_fats;
+                uint32_t fat_sz = vbr->fat_size_32;
+                uint32_t root_cl = vbr->root_cluster;
+
+                uint32_t fat_start_lba = part1_lba + res_sec;
+                uint32_t data_start_lba = fat_start_lba + (nfats * fat_sz);
+                uint32_t root_lba = data_start_lba + (root_cl - 2) * spc;
+
+                const char target_83[11] = "BOOTLOG TXT";
+                for (uint8_t s = 0; s < spc; s++) {
+                    uint32_t cur_sec_lba = root_lba + s;
+                    if (usb_msc_read_sectors(&msc_log_dev_storage, cur_sec_lba, 1, sec_buf) != 0) break;
+                    fat_dir_entry_t *entries = (fat_dir_entry_t *)sec_buf;
+                    for (int e = 0; e < 16; e++) {
+                        if ((uint8_t)entries[e].name[0] == 0x00) break;
+                        if ((uint8_t)entries[e].name[0] == 0xE5 || entries[e].attr == 0x0F) continue;
+                        if (k_memcmp(entries[e].name, target_83, 11) == 0) {
+                            uint32_t first_cluster = ((uint32_t)entries[e].first_cluster_hi << 16) | entries[e].first_cluster_lo;
+                            if (first_cluster >= 2) {
+                                bootlog_file_lba = data_start_lba + (first_cluster - 2) * spc;
+                                bootlog_dir_lba = cur_sec_lba;
+                                bootlog_dir_offset = e * sizeof(fat_dir_entry_t);
+                                bootlog_fat_resolved = true;
+                            }
+                            s = spc; // Stop
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    log_info("LOG", "Native USB Mass Storage registered for persistent logging (Port %u, File LBA %u)!",
+             msc_log_dev_storage.port_num, bootlog_file_lba);
+    // Flush all accumulated logs to disk immediately via native xHCI USB Mass Storage!
     disk_log_flush();
 }
 
@@ -259,20 +296,31 @@ void disk_log_flush(void) {
     flush_counter++;
     bool any_error = false;
 
-    // 1. Write Raw Log Header & Text to LBA 256..383
+    uint32_t actual_len = log_wrapped ? DISK_LOG_BUFFER_SIZE : log_pos;
+    static char linear_buf[DISK_LOG_BUFFER_SIZE];
+
+    // Linearize circular buffer so the file on disk is in chronological order
+    if (log_wrapped) {
+        uint32_t first_part = DISK_LOG_BUFFER_SIZE - log_start;
+        k_memcpy(linear_buf, log_buffer + log_start, first_part);
+        k_memcpy(linear_buf + first_part, log_buffer, log_start);
+    } else {
+        k_memcpy(linear_buf, log_buffer, log_pos);
+    }
+
+    // 1. Prepare Raw Log Header
     static uint8_t hdr_buf[512];
     k_memset(hdr_buf, 0, sizeof(hdr_buf));
     disk_log_header_t *hdr = (disk_log_header_t *)hdr_buf;
     hdr->magic1 = RAW_LOG_MAGIC_1;
     hdr->magic2 = RAW_LOG_MAGIC_2;
-    hdr->log_length = log_wrapped ? DISK_LOG_BUFFER_SIZE : log_pos;
+    hdr->log_length = actual_len;
     hdr->flush_count = flush_counter;
     hdr->boot_drive = disk_boot_drive;
     hdr->error_count = error_counter;
-    hdr->log_start = log_wrapped ? log_start : 0;
+    hdr->log_start = 0; // Linearized
     hdr->total_written = total_written;
 
-    uint32_t actual_len = log_wrapped ? DISK_LOG_BUFFER_SIZE : log_pos;
     uint16_t text_sectors = (actual_len + 511) / 512;
     if (text_sectors > (RAW_LOG_SECTORS - 1)) {
         text_sectors = RAW_LOG_SECTORS - 1;
@@ -283,58 +331,52 @@ void disk_log_flush(void) {
 
     bool msc_success = false;
     if (msc_log_registered) {
-        // --- Native USB Mass Storage Path (Real Hardware after xHCI Init) ---
-        int err = usb_msc_write_sectors(&msc_log_dev_storage, RAW_LOG_LBA, 1, hdr_buf);
-        if (err == 0) {
-            if (text_sectors > 0) {
-                int terr = usb_msc_write_sectors(&msc_log_dev_storage, RAW_LOG_LBA + 1, text_sectors, log_buffer);
-                if (terr != 0) any_error = true;
-            }
+        // --- Native USB Mass Storage Path (Direct xHCI Hardware) ---
+        // 1. Write Raw sectors (Header + Text)
+        int rerr = usb_msc_write_sectors(&msc_log_dev_storage, RAW_LOG_LBA, 1, hdr_buf);
+        if (rerr == 0 && text_sectors > 0) {
+            usb_msc_write_sectors(&msc_log_dev_storage, RAW_LOG_LBA + 1, text_sectors, linear_buf);
+        }
 
-            if (bootlog_fat_resolved && bootlog_file_lba > 0 && fat_sectors > 0) {
-                int ferr = usb_msc_write_sectors(&msc_log_dev_storage, bootlog_file_lba, fat_sectors, log_buffer);
-                if (ferr != 0) any_error = true;
-
-                // Update directory entry file_size
+        // 2. Write FAT32 BOOTLOG.TXT (INDEPENDENT of raw sector result)
+        if (bootlog_fat_resolved && bootlog_file_lba > 0 && fat_sectors > 0) {
+            int ferr = usb_msc_write_sectors(&msc_log_dev_storage, bootlog_file_lba, fat_sectors, linear_buf);
+            if (ferr == 0) {
                 if (bootlog_dir_lba > 0) {
                     static uint8_t dir_buf[512];
                     if (usb_msc_read_sectors(&msc_log_dev_storage, bootlog_dir_lba, 1, dir_buf) == 0) {
                         fat_dir_entry_t *ent = (fat_dir_entry_t *)&dir_buf[bootlog_dir_offset];
-                        ent->file_size = log_pos;
-                        int derr = usb_msc_write_sectors(&msc_log_dev_storage, bootlog_dir_lba, 1, dir_buf);
-                        if (derr != 0) any_error = true;
-                    } else {
-                        any_error = true;
+                        ent->file_size = actual_len;
+                        usb_msc_write_sectors(&msc_log_dev_storage, bootlog_dir_lba, 1, dir_buf);
                     }
                 }
+                msc_success = true;
+            } else {
+                any_error = true;
             }
-            msc_success = true;
-        } else {
-            any_error = true;
         }
     }
 
     if (!msc_success) {
-        // --- BIOS INT 13h Path (Internal SD Card, IDE/SATA/AHCI, or QEMU) ---
+        // --- BIOS INT 13h Path (Before xHCI handoff, or internal IDE/SATA/AHCI) ---
+        // 1. Write Raw sectors
         int herr = bios_disk_write(disk_boot_drive, RAW_LOG_LBA, 1, hdr_buf);
-        if (herr != 0) {
-            any_error = true;
-        } else {
-            if (text_sectors > 0) {
-                int terr = bios_disk_write(disk_boot_drive, RAW_LOG_LBA + 1, text_sectors, log_buffer);
-                if (terr != 0) any_error = true;
-            }
+        if (herr == 0 && text_sectors > 0) {
+            bios_disk_write(disk_boot_drive, RAW_LOG_LBA + 1, text_sectors, linear_buf);
+        }
 
-            if (bootlog_fat_resolved && bootlog_file_lba > 0 && fat_sectors > 0) {
-                int ferr = bios_disk_write(disk_boot_drive, bootlog_file_lba, fat_sectors, log_buffer);
-                if (ferr != 0) any_error = true;
-
+        // 2. Write FAT32 BOOTLOG.TXT (INDEPENDENT of raw sector write!)
+        if (bootlog_fat_resolved && bootlog_file_lba > 0 && fat_sectors > 0) {
+            int ferr = bios_disk_write(disk_boot_drive, bootlog_file_lba, fat_sectors, linear_buf);
+            if (ferr != 0) {
+                any_error = true;
+            } else {
                 // Update directory entry file_size
                 if (bootlog_dir_lba > 0) {
                     static uint8_t dir_buf[512];
                     if (bios_disk_read(disk_boot_drive, bootlog_dir_lba, 1, dir_buf) == 0) {
                         fat_dir_entry_t *ent = (fat_dir_entry_t *)&dir_buf[bootlog_dir_offset];
-                        ent->file_size = log_pos;
+                        ent->file_size = actual_len;
                         int derr = bios_disk_write(disk_boot_drive, bootlog_dir_lba, 1, dir_buf);
                         if (derr != 0) any_error = true;
                     } else {
@@ -351,7 +393,6 @@ void disk_log_flush(void) {
     last_flush_ok = !any_error;
     bytes_at_last_flush = total_written;
 
-    // Always clear is_flushing, even if errors occurred
     is_flushing = false;
 }
 

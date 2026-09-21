@@ -395,10 +395,14 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path) {
                  "U=$(cat /config/usb_gadget/g1/UDC 2>/dev/null); "
                  "[ -z \"$U\" ] && U=$(ls /sys/class/udc 2>/dev/null | head -1); "
                  "if [ -z \"$C\" ] || [ -z \"$U\" ]; then echo ERR_NO_UDC; exit 4; fi; "
-                 "echo OK_SWITCHING:\"$F\"; "
-                 "(sleep 2; echo \"\" > /config/usb_gadget/g1/UDC 2>/dev/null; rm -f \"$C\"/f* 2>/dev/null; ln -s /config/usb_gadget/g1/functions/%s \"$C/f1\" 2>/dev/null; echo \"$U\" > /config/usb_gadget/g1/UDC 2>/dev/null) &"
-                 "'",
-                 req_name, func_name, func_name);
+                  "echo OK_SWITCHING:\"$F\"; "
+                  "(sleep 2; echo \"\" > /config/usb_gadget/g1/UDC 2>/dev/null; rm -f \"$C\"/f* 2>/dev/null; "
+                  "ln -s /config/usb_gadget/g1/functions/%s \"$C/f1\" 2>/dev/null; "
+                  "[ -d /config/usb_gadget/g1/functions/ffs.adb ] && ln -s /config/usb_gadget/g1/functions/ffs.adb \"$C/f2\" 2>/dev/null; "
+                  "setprop sys.usb.state mass_storage,adb 2>/dev/null || setprop sys.usb.state mass_storage 2>/dev/null; "
+                  "echo \"$U\" > /config/usb_gadget/g1/UDC 2>/dev/null) &"
+                  "'",
+                  req_name, func_name, func_name);
     } else {
         snprintf(switch_cmd, sizeof(switch_cmd),
                  "su -c '"
@@ -414,7 +418,10 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path) {
                  "[ -f /sys/devices/virtual/android_usb/android0/f_mass_storage/lun0/file ] && L=\"/sys/devices/virtual/android_usb/android0/f_mass_storage/lun0\"; "
                  "if [ -z \"$L\" ]; then echo ERR_NO_SYSFS_LUN; exit 3; fi; "
                  "echo OK_SWITCHING:\"$F\"; "
-                 "(sleep 2; echo 0 > /sys/class/android_usb/android0/enable 2>/dev/null; echo \"$F\" > \"$L/file\" 2>/dev/null; echo 1 > \"$L/ro\" 2>/dev/null; echo 0 > \"$L/cdrom\" 2>/dev/null; echo mass_storage > /sys/class/android_usb/android0/functions 2>/dev/null; echo 1 > /sys/class/android_usb/android0/enable 2>/dev/null) &"
+                 "(sleep 2; echo 0 > /sys/class/android_usb/android0/enable 2>/dev/null; "
+                 "echo \"$F\" > \"$L/file\" 2>/dev/null; echo 1 > \"$L/ro\" 2>/dev/null; echo 0 > \"$L/cdrom\" 2>/dev/null; "
+                 "echo mass_storage,adb > /sys/class/android_usb/android0/functions 2>/dev/null || echo mass_storage > /sys/class/android_usb/android0/functions 2>/dev/null; "
+                 "echo 1 > /sys/class/android_usb/android0/enable 2>/dev/null) &"
                  "'",
                  req_name);
     }
@@ -464,6 +471,57 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path) {
     log_info("ADB", "Pre-flight confirmed UMS support; assuming switch is in progress.");
     session->is_connected = false;
     return 0;
+}
+
+int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path) {
+    if (!session || !session->is_connected) return -1;
+
+    char req_name[128] = {0};
+    if (iso_path) {
+        const char *p = iso_path;
+        for (const char *s = iso_path; *s; s++) {
+            if (*s == '/' || *s == '\\') p = s + 1;
+        }
+        for (int i = 0; p[i] && i < 127; i++) req_name[i] = p[i];
+    }
+
+    log_info("ADB", "Hot-swapping USB Mass Storage image to '%s' (no UDC reset)...",
+             req_name[0] ? req_name : "*.iso");
+
+    char update_cmd[512];
+    snprintf(update_cmd, sizeof(update_cmd),
+             "su -c '"
+             "ISO=\"%s\"; "
+             "F=$(find /sdcard /storage/emulated/0 /storage -name \"$ISO\" 2>/dev/null | head -1); "
+             "[ -z \"$F\" ] && [ -f \"/sdcard/Download/$ISO\" ] && F=\"/sdcard/Download/$ISO\"; "
+             "[ -z \"$F\" ] && [ -f \"/sdcard/$ISO\" ] && F=\"/sdcard/$ISO\"; "
+             "if [ -z \"$F\" ] || [ ! -f \"$F\" ]; then echo ERR_NO_FILE; exit 2; fi; "
+             "for L in /config/usb_gadget/g1/functions/mass_storage*/lun.0 "
+             "/sys/class/android_usb/android0/f_mass_storage/lun "
+             "/sys/class/android_usb/android0/f_mass_storage/lun0; do "
+             "  if [ -f \"$L/file\" ]; then "
+             "    echo \"\" > \"$L/file\" 2>/dev/null; "
+             "    echo \"$F\" > \"$L/file\" 2>/dev/null; "
+             "    echo OK_UPDATED:\"$F\"; "
+             "    exit 0; "
+             "  fi; "
+             "done; "
+             "echo ERR_NO_LUN; exit 3;'",
+             req_name);
+
+    char out[256] = {0};
+    int res = adb_execute_shell(session, update_cmd, out, sizeof(out));
+    log_info("ADB", "Hot-swap result: code=%d, resp='%s'", res, out[0] ? out : "(empty)");
+
+    if (adb_str_contains(out, "OK_UPDATED")) {
+        log_info("ADB", "USB Mass Storage backing file successfully updated: %s", out);
+        return 0;
+    }
+    if (adb_str_contains(out, "ERR_NO_FILE")) {
+        log_error("ADB", "Target ISO '%s' not found on phone storage!", req_name);
+        return -2;
+    }
+    return -1;
 }
 
 int adb_create_sparse_overlay(adb_session_t *session, const char *overlay_path, uint32_t size_gb) {
