@@ -448,6 +448,18 @@ void disk_log_enable_bios_fallback(void) {
     if (bios_disk_read(disk_boot_drive, 0, 1, test_buf) == 0) {
         log_state = LOG_STATE_BIOS;
         disk_log_flush();
+        return;
+    }
+
+    // Try alternate BIOS drives (0x80..0x83)
+    uint8_t candidates[4] = {0x80, 0x81, 0x82, 0x83};
+    for (int i = 0; i < 4; i++) {
+        if (candidates[i] != disk_boot_drive && bios_disk_read(candidates[i], 0, 1, test_buf) == 0) {
+            disk_boot_drive = candidates[i];
+            log_state = LOG_STATE_BIOS;
+            disk_log_flush();
+            return;
+        }
     }
 }
 

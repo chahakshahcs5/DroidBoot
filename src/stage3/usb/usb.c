@@ -240,11 +240,17 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
         return -5;
     }
 
-    if (out_dev->dev_desc.bMaxPacketSize0 > 0 && out_dev->dev_desc.bMaxPacketSize0 != max_packet) {
-        log_info("USB", "Updating EP0 MaxPacketSize to %u via Evaluate Context...", out_dev->dev_desc.bMaxPacketSize0);
+    uint16_t dev_ep0_max = out_dev->dev_desc.bMaxPacketSize0;
+    if (speed >= 4) {
+        // Per USB 3.0 Spec 9.6.1: bMaxPacketSize0 is exponent (2^9 = 512 bytes)
+        dev_ep0_max = (1U << out_dev->dev_desc.bMaxPacketSize0);
+    }
+
+    if (dev_ep0_max > 0 && dev_ep0_max != max_packet) {
+        log_info("USB", "Updating EP0 MaxPacketSize to %u via Evaluate Context...", dev_ep0_max);
         *(uint32_t *)(input_ctx + 0) = 0;
         *(uint32_t *)(input_ctx + 4) = (1U << 1); // Add EP0 Context
-        ep0_ctx[1] = (ep0_ctx[1] & ~0xFFFF0000U) | ((uint32_t)out_dev->dev_desc.bMaxPacketSize0 << 16);
+        ep0_ctx[1] = (ep0_ctx[1] & ~0xFFFF0000U) | ((uint32_t)dev_ep0_max << 16);
         xhci_trb_t eval_cmd;
         eval_cmd.parameter = (uintptr_t)input_ctx;
         eval_cmd.status = 0;

@@ -945,24 +945,38 @@ int adb_save_log_to_phone(adb_session_t *session) {
     }
 
     if (!write_failed) {
-        // Copy to internal storage: /sdcard/BootManager/boot.log & logs/<session_file>
-        // AND any removable MicroSD card mounted on phone (/storage/XXXX-XXXX)
-        char copy_cmd[640];
+        // Step 2a: Standard shell copy directly to /sdcard/BootManager and /sdcard/BootManager/logs/
+        char copy_cmd[512];
         snprintf(copy_cmd, sizeof(copy_cmd),
+                 "mkdir -p /sdcard/BootManager/logs /storage/emulated/0/BootManager/logs 2>/dev/null; "
                  "cp /data/local/tmp/boot.log /sdcard/BootManager/boot.log 2>/dev/null; "
                  "cp /data/local/tmp/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; "
+                 "chmod 666 /data/local/tmp/boot.log /sdcard/BootManager/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; sync",
+                 s_boot_session_file, s_boot_session_file);
+        adb_execute_shell(session, copy_cmd, NULL, 0);
+
+        // Step 2b: Root su copy fallback (in case shell user lacks permission to write to /sdcard)
+        char root_cmd[512];
+        snprintf(root_cmd, sizeof(root_cmd),
+                 "su -c \"mkdir -p /sdcard/BootManager/logs 2>/dev/null; "
+                 "cp /data/local/tmp/boot.log /sdcard/BootManager/boot.log 2>/dev/null; "
+                 "cp /data/local/tmp/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; "
+                 "chmod 666 /sdcard/BootManager/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; sync\"",
+                 s_boot_session_file, s_boot_session_file);
+        adb_execute_shell(session, root_cmd, NULL, 0);
+
+        // Step 2c: Mirror to any removable MicroSD card mounted on phone (/storage/XXXX-XXXX)
+        char ext_cmd[512];
+        snprintf(ext_cmd, sizeof(ext_cmd),
                  "for SD in /storage/*; do "
                  "  if [ -d \"$SD\" ] && [ \"$SD\" != \"/storage/emulated\" ] && [ \"$SD\" != \"/storage/self\" ]; then "
                  "    mkdir -p \"$SD/BootManager/logs\" 2>/dev/null; "
                  "    cp /data/local/tmp/boot.log \"$SD/BootManager/boot.log\" 2>/dev/null; "
                  "    cp /data/local/tmp/boot.log \"$SD/BootManager/logs/%s\" 2>/dev/null; "
                  "  fi; "
-                 "done; "
-                 "su -c 'cp /data/local/tmp/boot.log /sdcard/BootManager/boot.log 2>/dev/null; "
-                 "cp /data/local/tmp/boot.log /sdcard/BootManager/logs/%s 2>/dev/null' 2>/dev/null; "
-                 "chmod 666 /data/local/tmp/boot.log /sdcard/BootManager/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; sync",
-                 s_boot_session_file, s_boot_session_file, s_boot_session_file, s_boot_session_file);
-        adb_execute_shell(session, copy_cmd, NULL, 0);
+                 "done; sync",
+                 s_boot_session_file);
+        adb_execute_shell(session, ext_cmd, NULL, 0);
     }
 
     // 3. Post-write verification
