@@ -136,6 +136,30 @@ const char *disk_log_get_buffer(void) {
     return log_buffer;
 }
 
+void disk_log_copy_linear(char *dst, uint32_t max_len, uint32_t *actual_len) {
+    if (!dst || max_len == 0) {
+        if (actual_len) *actual_len = 0;
+        return;
+    }
+
+    uint32_t len = log_wrapped ? DISK_LOG_BUFFER_SIZE : log_pos;
+    if (len > max_len - 1) len = max_len - 1;
+
+    if (log_wrapped) {
+        uint32_t first_part = DISK_LOG_BUFFER_SIZE - log_start;
+        if (first_part > len) first_part = len;
+        k_memcpy(dst, log_buffer + log_start, first_part);
+        uint32_t second_part = len - first_part;
+        if (second_part > 0) {
+            k_memcpy(dst + first_part, log_buffer, second_part);
+        }
+    } else {
+        k_memcpy(dst, log_buffer, len);
+    }
+    dst[len] = '\0';
+    if (actual_len) *actual_len = len;
+}
+
 uint32_t disk_log_get_flush_count(void) {
     return flush_counter;
 }

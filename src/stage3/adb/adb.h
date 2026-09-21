@@ -50,5 +50,6 @@ int  adb_trigger_mass_storage(adb_session_t *session, const char *iso_path, cons
 int  adb_update_mass_storage_file(adb_session_t *session, const char *iso_path, const char *profile_path);
 int  adb_scan_persistence_profiles(adb_session_t *session, struct os_entry *entry);
 int  adb_create_sparse_overlay(adb_session_t *session, const char *overlay_path, uint32_t size_gb);
+int  adb_save_log_to_phone(adb_session_t *session);
 
 #endif // ADB_H

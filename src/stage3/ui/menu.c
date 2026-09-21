@@ -2,12 +2,31 @@
 #include "../core/printf.h"
 #include "../debug/vga.h"
 #include "../debug/serial.h"
+#include "../debug/disk_log.h"
 #include "../../include/io.h"
 #include "../memory/memory.h"
 #include "../pci/pci.h"
 #include "../core/rtc.h"
 
 extern uint16_t bios_int16_call(uint8_t cmd);
+
+static bool str_contains_nocase(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return false;
+    for (int i = 0; haystack[i]; i++) {
+        int j = 0;
+        while (needle[j]) {
+            char c1 = haystack[i + j];
+            char c2 = needle[j];
+            if (!c1) return false;
+            if (c1 >= 'A' && c1 <= 'Z') c1 += ('a' - 'A');
+            if (c2 >= 'A' && c2 <= 'Z') c2 += ('a' - 'A');
+            if (c1 != c2) break;
+            j++;
+        }
+        if (!needle[j]) return true;
+    }
+    return false;
+}
 
 static bool str_eq_nocase(const char *a, const char *b) {
     if (!a || !b) return false;
@@ -311,6 +330,7 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
         printk("|  [E] Edit Kernel Boot Parameters                 (or press 'E')          |\n");
     }
     printk("|  [R] Rescan USB Devices & Storage               (or press 'R')          |\n");
+    printk("|  [L] View Live System & Boot Diagnostics Log     (or press 'L')          |\n");
     printk("|  [%u] Hardware Diagnostics & System Inspection   (or press 'D')          |\n", diag_num);
     printk("|  [%u] Linux 32-bit Boot Protocol Simulation      (or press 'T')          |\n", test_num);
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
@@ -425,6 +445,10 @@ menu_selection_t menu_wait_selection(os_registry_t *registry) {
         if ((line[0] == 'r' || line[0] == 'R') && line[1] == '\0') {
             printk("[MENU] Rescanning USB and storage devices...\n");
             return (menu_selection_t){ .type = MENU_ACTION_RESCAN, .os_index = 0 };
+        }
+        if ((line[0] == 'l' || line[0] == 'L') && line[1] == '\0') {
+            printk("[MENU] User selected: View Live System Boot Log\n");
+            return (menu_selection_t){ .type = MENU_ACTION_VIEW_LOG, .os_index = 0 };
         }
         if ((line[0] == 'd' || line[0] == 'D') && line[1] == '\0') {
             printk("[MENU] User selected: Hardware Diagnostics\n");
@@ -803,9 +827,23 @@ int menu_select_persistence_profile(os_entry_t *entry, adb_session_t *adb) {
                 snprintf(full_phone_path, sizeof(full_phone_path), "/sdcard/BootManager/persistence/%s", prof_file);
                 vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
                 printk("[PROFILE] Allocating %u GB sparse persistence image on phone storage...\n", gb);
-                printk("[PROFILE] File: %s\n", prof_file);
+                printk("[PROFILE] Target: %s\n", full_phone_path);
                 vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-                adb_create_sparse_overlay(adb, full_phone_path, gb > 0 ? gb : 2);
+                int c_res = adb_create_sparse_overlay(adb, full_phone_path, gb > 0 ? gb : 2);
+                if (c_res == 0) {
+                    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                    printk("[PROFILE] SUCCESS: Persistence overlay created on phone storage!\n");
+                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                } else {
+                    vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+                    printk("[PROFILE] WARNING: Could not allocate file on phone storage!\n");
+                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                }
+            } else {
+                vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
+                printk("[PROFILE] Notice: Phone ADB not active. Overlay configured in In-RAM cache.\n");
+                printk("          (Enable USB Debugging on phone to write directly to phone storage)\n");
+                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
             }
 
             int new_idx = os_add_custom_profile(entry, prof_title, prof_file, chosen_size);
@@ -819,5 +857,75 @@ int menu_select_persistence_profile(os_entry_t *entry, adb_session_t *adb) {
         printk("[PROFILE] Invalid choice '%s'. Please select [1-%u].\n", line, create_opt);
         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     }
+}
+
+void menu_view_system_log(void) {
+    vga_clear();
+    vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+    printk("======================================================================\n");
+    printk("  LIVE SYSTEM & BOOT DIAGNOSTICS LOG (RAM BUFFER)\n");
+    printk("======================================================================\n");
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+    uint32_t total_len = 0;
+    static char log_view_buf[DISK_LOG_BUFFER_SIZE];
+    disk_log_copy_linear(log_view_buf, sizeof(log_view_buf), &total_len);
+
+    if (total_len == 0) {
+        printk("No log records in memory buffer.\n\n");
+        printk("Press any key to return to main menu...");
+        menu_get_char();
+        return;
+    }
+
+    uint32_t pos = 0;
+    uint32_t line_count = 0;
+    while (pos < total_len) {
+        char line_buf[128];
+        uint32_t line_pos = 0;
+        while (pos < total_len && line_pos < sizeof(line_buf) - 1) {
+            char c = log_view_buf[pos++];
+            if (c == '\r') continue;
+            if (c == '\n') break;
+            line_buf[line_pos++] = c;
+        }
+        line_buf[line_pos] = '\0';
+
+        // Highlight errors, warnings, and successes
+        if (str_contains_nocase(line_buf, "ERROR") || str_contains_nocase(line_buf, "FAIL")) {
+            vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        } else if (str_contains_nocase(line_buf, "WARN")) {
+            vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
+        } else if (str_contains_nocase(line_buf, "SUCCESS") || str_contains_nocase(line_buf, "VERIFIED") || str_contains_nocase(line_buf, "PASS")) {
+            vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        } else {
+            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+        }
+        printk("%s\n", line_buf);
+        line_count++;
+
+        if (line_count >= 21 && pos < total_len) {
+            uint32_t pct = (pos * 100) / total_len;
+            vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLUE);
+            printk(" -- [SPACE/ENTER]: Next Page | [Q]: Return to Menu (%u%%) -- ", pct);
+            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+            int ch = menu_get_char();
+            if (ch == 'q' || ch == 'Q' || ch == KEY_ESC) {
+                return;
+            }
+            vga_clear();
+            vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+            printk("=== LIVE SYSTEM BOOT LOG (%u%%) ===\n", pct);
+            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+            line_count = 0;
+        }
+    }
+
+    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    printk("\n--- End of System Log (%u bytes) ---\n", total_len);
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    printk("Press any key to return to main menu...");
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    menu_get_char();
 }
 

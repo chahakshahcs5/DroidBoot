@@ -66,6 +66,7 @@ const char *disk_log_get_session_filename(void);
 // Get current log buffer stats
 uint32_t disk_log_get_length(void);
 const char *disk_log_get_buffer(void);
+void     disk_log_copy_linear(char *dst, uint32_t max_len, uint32_t *actual_len);
 
 // Diagnostic stats
 uint32_t disk_log_get_flush_count(void);

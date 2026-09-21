@@ -15,7 +15,8 @@ typedef enum {
     MENU_ACTION_DIAGNOSTICS, // Hardware Diagnostics
     MENU_ACTION_SELF_TEST,   // Linux 32-bit Boot Protocol Self-Test
     MENU_ACTION_RESCAN,      // Rescan USB and storage devices
-    MENU_ACTION_SWITCH_UMS   // Switch Rooted Android phone to USB Mass Storage (UMS)
+    MENU_ACTION_SWITCH_UMS,  // Switch Rooted Android phone to USB Mass Storage (UMS)
+    MENU_ACTION_VIEW_LOG     // View on-screen interactive live system log
 } menu_action_type_t;
 
 typedef struct {
@@ -43,6 +44,7 @@ uint64_t menu_prompt_profile_size(void);
 
 void menu_show_diagnostics(boot_info_t *boot_info, xhci_controller_t *xhci,
                            usb_device_t *usb_dev, mtp_session_t *mtp_session);
+void menu_view_system_log(void);
 
 int menu_get_char(void);
 

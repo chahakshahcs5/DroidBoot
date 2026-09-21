@@ -26,6 +26,8 @@ static int usb_msc_send_cbw_lun(usb_device_t *dev, uint8_t lun, uint32_t tag, ui
     uint32_t sent = 0;
     int res = usb_bulk_transfer(dev, dev->msc_bulk_out_ep, &cbw, sizeof(cbw), &sent);
     if (res != 0) {
+        usb_clear_endpoint_halt(dev, dev->msc_bulk_out_ep);
+        usb_clear_endpoint_halt(dev, dev->msc_bulk_in_ep);
         log_error("MSC", "Failed to send CBW (error %d, LUN %u)", res, lun);
     }
     return res;
@@ -38,6 +40,7 @@ static int usb_msc_recv_csw(usb_device_t *dev, uint32_t expected_tag) {
     uint32_t recv = 0;
     int res = usb_bulk_transfer(dev, dev->msc_bulk_in_ep, &csw, sizeof(csw), &recv);
     if (res != 0) {
+        usb_clear_endpoint_halt(dev, dev->msc_bulk_in_ep);
         log_error("MSC", "Failed to receive CSW (error %d)", res);
         return res;
     }
@@ -62,6 +65,9 @@ static int usb_msc_recv_csw(usb_device_t *dev, uint32_t expected_tag) {
 
 int usb_msc_init_lun(usb_device_t *dev, uint8_t lun) {
     if (!dev || !dev->has_msc) return -1;
+
+    usb_clear_endpoint_halt(dev, dev->msc_bulk_out_ep);
+    usb_clear_endpoint_halt(dev, dev->msc_bulk_in_ep);
 
     int res = -1;
     for (int retry = 0; retry < 5; retry++) {

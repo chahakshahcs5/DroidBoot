@@ -848,6 +848,7 @@ void c_main(boot_info_t *boot_info) {
                         log_info("STAGE3", "Port %u: Android ADB interface detected! Initializing ADB Root Bridge...", p);
                         if (adb_init_session(&external_usb_dev, &active_adb_session) == 0) {
                             log_info("STAGE3", "ADB Root Bridge connected! Phone can switch to USB Mass Storage (0 MB in RAM).");
+                            adb_save_log_to_phone(&active_adb_session);
                         }
                     }
 
@@ -945,6 +946,7 @@ void c_main(boot_info_t *boot_info) {
                             log_info("STAGE3", "Port %u: Android ADB interface detected! Initializing ADB Root Bridge...", p);
                             if (adb_init_session(&external_usb_dev, &active_adb_session) == 0) {
                                 log_info("STAGE3", "ADB Root Bridge connected! Phone can switch to USB Mass Storage (0 MB in RAM).");
+                                adb_save_log_to_phone(&active_adb_session);
                             }
                         }
 
@@ -1184,6 +1186,7 @@ void c_main(boot_info_t *boot_info) {
                     }
                     if (active_adb_session.is_connected) {
                         adb_scan_persistence_profiles(&active_adb_session, selected);
+                        adb_save_log_to_phone(&active_adb_session);
                     }
 
                     selected->selected_profile = menu_select_persistence_profile(selected, active_adb_session.is_connected ? &active_adb_session : NULL);
@@ -1337,6 +1340,10 @@ void c_main(boot_info_t *boot_info) {
                 test_linux_boot_simulation(boot_info);
                 disk_log_flush();
                 continue; // Return to menu after self-test
+
+            case MENU_ACTION_VIEW_LOG:
+                menu_view_system_log();
+                continue; // Return to menu after viewing log
 
             default:
                 continue;

@@ -1,6 +1,7 @@
 #include "adb.h"
 #include "../core/printf.h"
 #include "../debug/vga.h"
+#include "../debug/disk_log.h"
 #include "../../include/io.h"
 #include "../image/os_scanner.h"
 
@@ -764,19 +765,98 @@ int adb_create_sparse_overlay(adb_session_t *session, const char *overlay_path, 
 
     log_info("ADB", "Allocating %u GB sparse overlay at '%s'...", size_gb, overlay_path);
 
+    uint32_t mb = size_gb * 1024;
     char cmd[512];
+    // Universal Android sparse allocation:
+    // 1. mkdir & touch .nomedia (unprivileged works on /sdcard/)
+    // 2. dd with seek (standard on 100% Android toybox/toolbox builds) or fallback to truncate
+    // 3. optional ext4 format if mkfs tool exists
+    // 4. verify file exists on phone storage
     snprintf(cmd, sizeof(cmd),
-             "su -c 'mkdir -p /sdcard/BootManager/persistence && touch /sdcard/BootManager/persistence/.nomedia && "
-             "truncate -s %uG \"%s\" && "
-             "(mkfs.ext4 -F \"%s\" 2>/dev/null || mke2fs -F \"%s\" 2>/dev/null || make_ext4fs -l %uM \"%s\" 2>/dev/null || mkfs.vfat \"%s\" 2>/dev/null || true)'",
-             size_gb, overlay_path, overlay_path, overlay_path, size_gb * 1024, overlay_path, overlay_path);
+             "mkdir -p /sdcard/BootManager/persistence 2>/dev/null; "
+             "touch /sdcard/BootManager/persistence/.nomedia 2>/dev/null; "
+             "(dd if=/dev/zero of=\"%s\" bs=1M count=0 seek=%u 2>/dev/null || truncate -s %uG \"%s\" 2>/dev/null); "
+             "(mkfs.ext4 -F \"%s\" 2>/dev/null || mke2fs -F \"%s\" 2>/dev/null || make_ext4fs -l %uM \"%s\" 2>/dev/null || true); "
+             "if [ -f \"%s\" ]; then echo OK_CREATED; else echo ERR_NOT_CREATED; fi",
+             overlay_path, mb, size_gb, overlay_path,
+             overlay_path, overlay_path, mb, overlay_path,
+             overlay_path);
 
     char out[256] = {0};
     int res = adb_execute_shell(session, cmd, out, sizeof(out));
-    if (res == 0) {
-        log_info("ADB", "Sparse %u GB persistence overlay created successfully on phone storage!", size_gb);
-    } else {
-        log_error("ADB", "Failed to create sparse overlay over ADB!");
+    if (res == 0 && adb_str_contains(out, "OK_CREATED")) {
+        log_info("ADB", "Sparse %u GB persistence overlay created and verified on phone storage!", size_gb);
+        return 0;
     }
-    return res;
+
+    log_error("ADB", "Failed to create sparse overlay over ADB! (resp: '%s')", out[0] ? out : "none");
+    return -1;
+}
+
+int adb_save_log_to_phone(adb_session_t *session) {
+    if (!session || !session->is_connected) return -1;
+
+    static char log_buf[DISK_LOG_BUFFER_SIZE];
+    uint32_t total_len = 0;
+    disk_log_copy_linear(log_buf, sizeof(log_buf), &total_len);
+    if (total_len == 0) return 0;
+
+    log_info("ADB", "Syncing %u bytes of boot log to phone (/sdcard/BootManager/boot.log)...", total_len);
+
+    char out[128] = {0};
+    adb_execute_shell(session, "mkdir -p /sdcard/BootManager", out, sizeof(out));
+
+    // Open shell:cat > /sdcard/BootManager/boot.log
+    uint32_t my_id = session->local_id++;
+    const char *open_dest = "shell:cat > /sdcard/BootManager/boot.log";
+    uint32_t dest_len = 0;
+    while (open_dest[dest_len]) dest_len++;
+    dest_len++; // null terminator
+
+    int res = adb_send_msg(session, A_OPEN, my_id, 0, open_dest, dest_len);
+    if (res != 0) {
+        log_error("ADB", "Failed to open cat stream on phone (%d)", res);
+        return res;
+    }
+
+    adb_message_t resp;
+    static char ack_buf[512];
+    uint32_t ack_len = 0;
+
+    // Wait for A_OKAY
+    res = adb_recv_msg_wait(session, &resp, ack_buf, sizeof(ack_buf) - 1, &ack_len, 4);
+    if (res != 0 || resp.command != A_OKAY) {
+        log_error("ADB", "Did not receive A_OKAY for cat stream (cmd=0x%08X)", resp.command);
+        return -2;
+    }
+    session->remote_id = resp.arg0;
+
+    // Write log data in chunks of up to 2048 bytes
+    uint32_t offset = 0;
+    while (offset < total_len) {
+        uint32_t chunk = total_len - offset;
+        if (chunk > 2048) chunk = 2048;
+
+        res = adb_send_msg(session, A_WRTE, my_id, session->remote_id, log_buf + offset, chunk);
+        if (res != 0) break;
+
+        // Acknowledge WRTE
+        res = adb_recv_msg_wait(session, &resp, ack_buf, sizeof(ack_buf) - 1, &ack_len, 4);
+        if (res != 0 || resp.command != A_OKAY) break;
+
+        offset += chunk;
+    }
+
+    // Close stream (EOF)
+    adb_send_msg(session, A_CLSE, my_id, session->remote_id, NULL, 0);
+
+    if (offset >= total_len) {
+        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        log_info("ADB", "SUCCESS: Boot log saved to phone storage: /sdcard/BootManager/boot.log (%u bytes)!", total_len);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+        return 0;
+    }
+
+    log_error("ADB", "Incomplete log sync (%u/%u bytes sent)", offset, total_len);
+    return -3;
 }
