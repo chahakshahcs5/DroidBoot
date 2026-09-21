@@ -813,7 +813,8 @@ void c_main(boot_info_t *boot_info) {
 
     while (1) {
         // Phase 10: Scan Connected Storage & Display Dynamic Interactive Boot Menu
-        os_registry_t os_reg;
+        static os_registry_t os_reg;
+        k_memset(&os_reg, 0, sizeof(os_reg));
         os_scan_all_storages(boot_info, &xhci_ctrl,
                              msc_found ? &detected_msc_dev : NULL,
                              active_mtp_session.session_active ? &active_mtp_session : NULL,
@@ -880,7 +881,7 @@ void c_main(boot_info_t *boot_info) {
                 sel_img->selected_profile = menu_select_persistence_profile(sel_img, active_adb_session.is_connected ? &active_adb_session : NULL);
                 const persistence_profile_t *prof = (sel_img->profile_count > 0 && sel_img->selected_profile < sel_img->profile_count) ?
                     &sel_img->profiles[sel_img->selected_profile] : NULL;
-                char prof_path[128] = {0};
+                char prof_path[256] = {0};
                 if (prof && !prof->is_clean_session && prof->filename[0]) {
                     snprintf(prof_path, sizeof(prof_path), "/sdcard/BootManager/persistence/%s", prof->filename);
                 }
@@ -996,7 +997,7 @@ void c_main(boot_info_t *boot_info) {
                     selected->selected_profile = menu_select_persistence_profile(selected, active_adb_session.is_connected ? &active_adb_session : NULL);
                     const persistence_profile_t *prof = (selected->profile_count > 0 && selected->selected_profile < selected->profile_count) ?
                         &selected->profiles[selected->selected_profile] : NULL;
-                    char prof_path[128] = {0};
+                    char prof_path[256] = {0};
                     if (prof && !prof->is_clean_session && prof->filename[0]) {
                         snprintf(prof_path, sizeof(prof_path), "/sdcard/BootManager/persistence/%s", prof->filename);
                     }

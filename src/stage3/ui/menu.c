@@ -5,8 +5,22 @@
 #include "../../include/io.h"
 #include "../memory/memory.h"
 #include "../pci/pci.h"
+#include "../core/rtc.h"
 
 extern uint16_t bios_int16_call(uint8_t cmd);
+
+static bool str_eq_nocase(const char *a, const char *b) {
+    if (!a || !b) return false;
+    int i = 0;
+    while (a[i] && b[i]) {
+        char c1 = a[i], c2 = b[i];
+        if (c1 >= 'A' && c1 <= 'Z') c1 += ('a' - 'A');
+        if (c2 >= 'A' && c2 <= 'Z') c2 += ('a' - 'A');
+        if (c1 != c2) return false;
+        i++;
+    }
+    return (a[i] == '\0' && b[i] == '\0');
+}
 
 static int poll_input_char(void) {
     // 1. Poll BIOS INT 16h Keyboard Service (universal for laptop built-in and USB keyboards)
@@ -544,26 +558,88 @@ int menu_select_persistence_profile(os_entry_t *entry, adb_session_t *adb) {
             uint64_t chosen_size = menu_prompt_profile_size();
             uint32_t mb = (uint32_t)(chosen_size / 1024 / 1024);
             uint32_t gb = (uint32_t)(chosen_size / 1024 / 1024 / 1024);
-            char prof_name[32];
-            snprintf(prof_name, sizeof(prof_name), "Custom Profile (%u MB)", mb);
-            char prof_file[64];
-            if (entry->iso_files.is_casper) {
-                snprintf(prof_file, sizeof(prof_file), "custom_%uMB.casper-rw", mb);
-            } else {
-                snprintf(prof_file, sizeof(prof_file), "custom_%uMB.img", mb);
+            char ts[32];
+            rtc_get_timestamp_str(ts, sizeof(ts));
+
+            vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+            printk("\n[PROFILE] Enter custom profile name/label (e.g. 'work', 'testing', 'dev')\n");
+            printk("          [Press Enter to use timestamp '%s']: ", ts);
+            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+            char label[32];
+            menu_read_line(label, sizeof(label), 0, ts);
+
+            // Sanitize label
+            for (int i = 0; label[i]; i++) {
+                char c = label[i];
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+                    label[i] = '_';
+                }
             }
+            if (label[0] == '\0') {
+                snprintf(label, sizeof(label), "%s", ts);
+            }
+
+            // Extract ISO stem from entry->filename
+            char iso_stem[48] = {0};
+            const char *p_iso = entry->filename;
+            for (const char *s = entry->filename; *s; s++) {
+                if (*s == '/' || *s == '\\') p_iso = s + 1;
+            }
+            int slen = 0;
+            while (p_iso[slen] && slen < 40) {
+                iso_stem[slen] = p_iso[slen];
+                slen++;
+            }
+            iso_stem[slen] = '\0';
+            for (int i = slen - 1; i > 0; i--) {
+                if (iso_stem[i] == '.') {
+                    iso_stem[i] = '\0';
+                    break;
+                }
+            }
+            if (iso_stem[0] == '\0') {
+                snprintf(iso_stem, sizeof(iso_stem), "profile");
+            }
+
+            char prof_file[96];
+            if (entry->iso_files.is_casper) {
+                snprintf(prof_file, sizeof(prof_file), "%s_%s_%uMB.casper-rw", iso_stem, label, mb);
+            } else {
+                snprintf(prof_file, sizeof(prof_file), "%s_%s_%uMB.img", iso_stem, label, mb);
+            }
+
+            // Avoid collision if a profile with this exact filename already exists
+            bool collision = false;
+            for (uint32_t i = 0; i < entry->profile_count; i++) {
+                if (str_eq_nocase(entry->profiles[i].filename, prof_file)) {
+                    collision = true;
+                    break;
+                }
+            }
+            if (collision) {
+                if (entry->iso_files.is_casper) {
+                    snprintf(prof_file, sizeof(prof_file), "%s_%s_%s_%uMB.casper-rw", iso_stem, label, ts, mb);
+                } else {
+                    snprintf(prof_file, sizeof(prof_file), "%s_%s_%s_%uMB.img", iso_stem, label, ts, mb);
+                }
+            }
+
+            char prof_title[64];
+            snprintf(prof_title, sizeof(prof_title), "Profile: %s (%u MB)", label, mb);
 
             // Create sparse file on phone via ADB if active
             if (adb && adb->is_connected) {
-                char full_phone_path[128];
+                char full_phone_path[160];
                 snprintf(full_phone_path, sizeof(full_phone_path), "/sdcard/BootManager/persistence/%s", prof_file);
                 vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
                 printk("[PROFILE] Allocating %u GB sparse persistence image on phone storage...\n", gb);
+                printk("[PROFILE] File: %s\n", prof_file);
                 vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                 adb_create_sparse_overlay(adb, full_phone_path, gb > 0 ? gb : 2);
             }
 
-            int new_idx = os_add_custom_profile(entry, prof_name, prof_file, chosen_size);
+            int new_idx = os_add_custom_profile(entry, prof_title, prof_file, chosen_size);
             if (new_idx >= 0) {
                 return new_idx;
             }

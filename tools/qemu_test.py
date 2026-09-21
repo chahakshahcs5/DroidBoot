@@ -234,6 +234,12 @@ def test_custom_capacity_selection(port=4446):
             conn.sendall(b"3\n")
             state["sent_size"] = True
 
+        if not state.get("sent_name") and "[PROFILE] Enter custom profile name/label" in current_log:
+            print("[*] Profile Label prompt detected! Sending label 'devwork'...")
+            time.sleep(0.1)
+            conn.sendall(b"devwork\n")
+            state["sent_name"] = True
+
         if "HANDING OFF EXECUTION TO LINUX" in current_log:
             time.sleep(0.3)
             return True
@@ -248,8 +254,8 @@ def test_custom_capacity_selection(port=4446):
         ("8 GB  (Developer", "8 GB option listed"),
         ("16 GB (Heavy Workstation", "16 GB option listed"),
         ("Allocated 8 GB developer overlay capacity", "8 GB capacity registered"),
-        ("Custom Profile (8192 MB)", "Custom profile attached"),
-        ("custom_8192MB.casper-rw", "Sparse overlay filename generated"),
+        ("Profile: devwork (8192 MB)", "Custom profile attached"),
+        ("devwork_8192MB.casper-rw", "ISO-scoped sparse overlay filename generated"),
         ("HANDING OFF EXECUTION TO LINUX", "Kernel handoff reached with 8 GB overlay")
     ]
 
@@ -296,6 +302,12 @@ def test_in_ram_iso_boot(port=4447):
             time.sleep(0.1)
             conn.sendall(b"1\n")
             state["sent_size"] = True
+
+        if not state.get("sent_name") and "[PROFILE] Enter custom profile name/label" in current_log:
+            print("[*] Profile Label prompt detected! Sending Enter for default timestamp...")
+            time.sleep(0.1)
+            conn.sendall(b"\n")
+            state["sent_name"] = True
 
         if "HANDING OFF TO IN-RAM LINUX WITH SD PERSISTENCE" in current_log:
             time.sleep(0.3)

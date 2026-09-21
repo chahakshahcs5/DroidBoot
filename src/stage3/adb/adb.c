@@ -330,6 +330,18 @@ static bool adb_str_eq_nocase(const char *s1, const char *s2) {
     return (s1[i] == '\0' && s2[i] == '\0');
 }
 
+static bool adb_str_starts_with_nocase(const char *str, const char *prefix) {
+    if (!str || !prefix) return false;
+    for (int i = 0; prefix[i]; i++) {
+        if (!str[i]) return false;
+        char c1 = str[i], c2 = prefix[i];
+        if (c1 >= 'A' && c1 <= 'Z') c1 += ('a' - 'A');
+        if (c2 >= 'A' && c2 <= 'Z') c2 += ('a' - 'A');
+        if (c1 != c2) return false;
+    }
+    return true;
+}
+
 int adb_probe_kernel_gadgets(adb_session_t *session, char *out_buf, uint32_t max_len) {
     if (!session || !session->is_connected) return -1;
 
@@ -622,6 +634,26 @@ int adb_scan_persistence_profiles(adb_session_t *session, struct os_entry *entry
         return 0;
     }
 
+    // Extract ISO stem to match only profiles belonging to this ISO
+    char iso_stem[48] = {0};
+    const char *p_iso = entry->filename;
+    for (const char *s = entry->filename; *s; s++) {
+        if (*s == '/' || *s == '\\') p_iso = s + 1;
+    }
+    int stem_len = 0;
+    while (p_iso[stem_len] && stem_len < 40) {
+        iso_stem[stem_len] = p_iso[stem_len];
+        stem_len++;
+    }
+    iso_stem[stem_len] = '\0';
+    for (int i = stem_len - 1; i > 0; i--) {
+        if (iso_stem[i] == '.') {
+            iso_stem[i] = '\0';
+            stem_len = i;
+            break;
+        }
+    }
+
     char *p = out_buf;
     while (*p) {
         while (*p == '\r' || *p == '\n' || *p == ' ') p++;
@@ -639,6 +671,21 @@ int adb_scan_persistence_profiles(adb_session_t *session, struct os_entry *entry
         }
 
         if (base[0] && base[0] != '*') {
+            // Only match profiles belonging to the current ISO
+            bool matches = false;
+            const char *label_part = base;
+            if (iso_stem[0] && adb_str_starts_with_nocase(base, iso_stem)) {
+                matches = true;
+                label_part = base + stem_len;
+                if (*label_part == '_') label_part++;
+            } else if (entry->iso_files.is_casper && (adb_str_eq_nocase(base, "casper-rw") || adb_str_starts_with_nocase(base, "casper-rw_"))) {
+                matches = true;
+            }
+
+            if (!matches) {
+                continue; // Ignore profiles belonging to other ISOs
+            }
+
             bool exists = false;
             for (uint32_t i = 0; i < entry->profile_count; i++) {
                 if (adb_str_eq_nocase(entry->profiles[i].filename, base)) {
@@ -647,10 +694,23 @@ int adb_scan_persistence_profiles(adb_session_t *session, struct os_entry *entry
                 }
             }
             if (!exists && entry->profile_count < MAX_PERSISTENCE_PROFILES) {
-                char prof_title[32];
-                snprintf(prof_title, sizeof(prof_title), "Profile: %s", base);
+                char clean_label[64];
+                int l = 0;
+                while (label_part[l] && l < 63) {
+                    clean_label[l] = label_part[l];
+                    l++;
+                }
+                clean_label[l] = '\0';
+                for (int k = l - 1; k > 0; k--) {
+                    if (clean_label[k] == '.') {
+                        clean_label[k] = '\0';
+                        break;
+                    }
+                }
+                char prof_title[64];
+                snprintf(prof_title, sizeof(prof_title), "Profile: %s", clean_label[0] ? clean_label : base);
                 os_add_custom_profile(entry, prof_title, base, (uint64_t)2 * 1024 * 1024 * 1024);
-                log_info("ADB", "[+] Discovered profile on phone: '%s'", base);
+                log_info("ADB", "[+] Matched profile for '%s': '%s'", iso_stem, base);
             }
         }
     }
