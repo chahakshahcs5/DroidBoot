@@ -698,6 +698,11 @@ int usb_bulk_transfer_wait(usb_device_t *dev, uint8_t ep_addr, void *data, uint3
 
     // Poll Event Ring for Transfer Event across max_seconds
     for (int sec = max_seconds; sec > 0; sec--) {
+        if (max_seconds >= 5 && sec % 5 == 0) {
+            log_info("USB", "Awaiting USB response... %d sec remaining", sec);
+            disk_log_flush();
+        }
+
         // 100 slices of 10,000 io_waits = ~1 second total per second iteration
         for (int slice = 0; slice < 100; slice++) {
             xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
@@ -739,7 +744,7 @@ int usb_bulk_transfer_wait(usb_device_t *dev, uint8_t ep_addr, void *data, uint3
         }
     }
 
-    log_error("USB", "Bulk transfer authorization timed out on EP 0x%02X!", ep_addr);
+    log_error("USB", "Bulk transfer timed out on EP 0x%02X after %d sec!", ep_addr, max_seconds);
     return -100;
 }
 

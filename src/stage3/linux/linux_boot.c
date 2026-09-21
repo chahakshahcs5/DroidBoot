@@ -2,6 +2,7 @@
 #include "../core/printf.h"
 #include "../memory/memory.h"
 #include "../../include/io.h"
+#include "../debug/vga.h"
 
 // 60-byte self-contained relocation trampoline for 32-bit Linux handoff
 static const uint8_t trampoline_template[] = {
@@ -309,6 +310,9 @@ void linux_boot_jump(uint32_t kernel_source_addr, uint32_t kernel_target_addr,
     typedef void (*trampoline_fn_t)(uint32_t src, uint32_t dst, uint32_t len,
                                     uint32_t params, uint32_t entry);
     trampoline_fn_t jump_to_kernel = (trampoline_fn_t)LINUX_TRAMPOLINE_PHYS;
+
+    // Clear VGA screen so Linux console starts with a clean display
+    vga_clear();
 
     // Call trampoline in low memory
     jump_to_kernel(kernel_source_addr, kernel_target_addr, kernel_size,

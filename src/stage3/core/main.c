@@ -245,10 +245,10 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
         // Alpine Linux / Generic Live System
         if (prof && prof->is_clean_session) {
             snprintf(cmdline, sizeof(cmdline),
-                     "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage quiet");
+                     "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 modloop=/boot/modloop-lts quiet");
         } else {
             snprintf(cmdline, sizeof(cmdline),
-                     "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage apkovl=LABEL=BOOTLOADER:apkovl.tgz quiet");
+                     "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 modloop=/boot/modloop-lts apkovl=LABEL=BOOTLOADER:apkovl.tgz quiet");
         }
     }
 

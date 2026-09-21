@@ -199,14 +199,7 @@ int adb_init_session(usb_device_t *dev, adb_session_t *session) {
         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
         resp_len = 0;
-        res = -1;
-        for (int sec = 25; sec > 0; sec--) {
-            if (sec % 5 == 0 || sec == 25) {
-                log_info("ADB", "Awaiting authorization... %u sec remaining", sec);
-            }
-            res = adb_recv_msg_wait(session, &resp, resp_buf, sizeof(resp_buf) - 1, &resp_len, 1);
-            if (res == 0) break;
-        }
+        res = adb_recv_msg_wait(session, &resp, resp_buf, sizeof(resp_buf) - 1, &resp_len, 35);
 
         if (res == 0 && resp.command == A_CNXN) {
             if (resp_len < sizeof(resp_buf)) resp_buf[resp_len] = '\0';
@@ -219,14 +212,7 @@ int adb_init_session(usb_device_t *dev, adb_session_t *session) {
             log_info("ADB", "Secondary auth requested by phone. Re-sending RSA public key...");
             adb_send_msg(session, A_AUTH, ADB_AUTH_RSAPUBLICKEY, 0, key_to_send, key_len);
             resp_len = 0;
-            res = -1;
-            for (int sec = 10; sec > 0; sec--) {
-                if (sec % 5 == 0 || sec == 10) {
-                    log_info("ADB", "Awaiting authorization... %u sec remaining", sec);
-                }
-                res = adb_recv_msg_wait(session, &resp, resp_buf, sizeof(resp_buf) - 1, &resp_len, 1);
-                if (res == 0) break;
-            }
+            res = adb_recv_msg_wait(session, &resp, resp_buf, sizeof(resp_buf) - 1, &resp_len, 15);
             if (res == 0 && resp.command == A_CNXN) {
                 if (resp_len < sizeof(resp_buf)) resp_buf[resp_len] = '\0';
                 session->is_connected = true;
@@ -237,7 +223,7 @@ int adb_init_session(usb_device_t *dev, adb_session_t *session) {
             }
         }
 
-        log_error("ADB", "ADB authorization timed out after 25 seconds.");
+        log_error("ADB", "ADB authorization timed out after 35 seconds.");
         return 1;
     }
 
