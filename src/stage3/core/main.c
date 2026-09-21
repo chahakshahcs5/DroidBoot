@@ -248,7 +248,7 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
                      "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage quiet");
         } else {
             snprintf(cmdline, sizeof(cmdline),
-                     "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage apkovl=sda1:apkovl.tgz quiet");
+                     "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage apkovl=LABEL=BOOTLOADER:apkovl.tgz quiet");
         }
     }
 
@@ -333,7 +333,7 @@ static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_fil
                  LINUX_RAM_ISO_PHYS, total_iso_bytes);
     } else {
         snprintf(alpine_cmdline, sizeof(alpine_cmdline),
-                 "console=tty0 console=tty1 modprobe.blacklist=floppy noapic modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes apkovl=sda1: debug_init quiet",
+                 "console=tty0 console=tty1 modprobe.blacklist=floppy noapic modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes apkovl=LABEL=BOOTLOADER:apkovl.tgz debug_init quiet",
                  LINUX_RAM_ISO_PHYS, total_iso_bytes);
     }
 
@@ -356,7 +356,7 @@ static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_fil
     if (prof && prof->is_clean_session) {
         log_info("BOOT", "  * Persistence    : Clean Session (100%% In-RAM, no saved changes)");
     } else {
-        log_info("BOOT", "  * Persistence    : %s (apkovl=sda1: / /BootManager/persistence/)",
+        log_info("BOOT", "  * Persistence    : %s (apkovl=LABEL=BOOTLOADER:apkovl.tgz)",
                  prof ? prof->profile_name : "Default");
     }
     log_info("BOOT", "==========================================================");
@@ -874,20 +874,26 @@ void c_main(boot_info_t *boot_info) {
                 }
                 os_entry_t *sel_img = &os_reg.entries[img_idx];
 
-                if (sel_img->profile_count > 1) {
-                    sel_img->selected_profile = menu_select_persistence_profile(sel_img);
+                if (active_adb_session.is_connected) {
+                    adb_scan_persistence_profiles(&active_adb_session, sel_img);
                 }
-                const persistence_profile_t *prof = (sel_img->profile_count > 0) ?
+                sel_img->selected_profile = menu_select_persistence_profile(sel_img, active_adb_session.is_connected ? &active_adb_session : NULL);
+                const persistence_profile_t *prof = (sel_img->profile_count > 0 && sel_img->selected_profile < sel_img->profile_count) ?
                     &sel_img->profiles[sel_img->selected_profile] : NULL;
+                char prof_path[128] = {0};
+                if (prof && !prof->is_clean_session && prof->filename[0]) {
+                    snprintf(prof_path, sizeof(prof_path), "/sdcard/BootManager/persistence/%s", prof->filename);
+                }
 
                 // If phone is ALREADY operating as USB Mass Storage, hot-swap image without dropping bus!
                 if (msc_found && detected_msc_dev.has_msc) {
                     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
-                    log_info("STAGE3", "Phone already in UMS mode. Hot-swapping backing image to '%s'...", sel_img->filename);
+                    log_info("STAGE3", "Phone already in UMS mode. Hot-swapping image to '%s' (Profile: '%s')...",
+                             sel_img->filename, prof_path[0] ? prof->filename : "Clean Session");
                     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                     disk_log_flush();
 
-                    int upd_res = adb_update_mass_storage_file(&active_adb_session, sel_img->filename);
+                    int upd_res = adb_update_mass_storage_file(&active_adb_session, sel_img->filename, prof_path[0] ? prof_path : NULL);
                     if (upd_res == 0) {
                         for (int w = 0; w < 200000; w++) io_wait();
                         uint32_t last_lba = 0, block_sz = 0;
@@ -907,10 +913,11 @@ void c_main(boot_info_t *boot_info) {
                 }
 
                 vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
-                log_info("STAGE3", "Attaching '%s' as USB Mass Storage...", sel_img->filename);
+                log_info("STAGE3", "Attaching '%s' as USB Mass Storage (Profile: '%s')...",
+                         sel_img->filename, prof_path[0] ? prof->filename : "Clean Session");
                 vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                 disk_log_flush();
-                int trg_res = adb_trigger_mass_storage(&active_adb_session, sel_img->filename);
+                int trg_res = adb_trigger_mass_storage(&active_adb_session, sel_img->filename, prof_path[0] ? prof_path : NULL);
                 disk_log_flush();
 
                 // Try to reprobe as MSC regardless of trigger result code.
@@ -978,27 +985,34 @@ void c_main(boot_info_t *boot_info) {
                     log_info("BOOT", "Booting selected OS #%u: '%s'...", choice.os_index + 1, selected->title);
                     disk_log_flush();
 
-                    if (selected->profile_count > 1) {
-                        selected->selected_profile = menu_select_persistence_profile(selected);
+                    active_adb_session.usb_dev = &detected_usb_dev;
+                    if (!active_adb_session.is_connected && detected_usb_dev.has_adb) {
+                        adb_init_session(&detected_usb_dev, &active_adb_session);
                     }
-                    const persistence_profile_t *prof = (selected->profile_count > 0) ?
+                    if (active_adb_session.is_connected) {
+                        adb_scan_persistence_profiles(&active_adb_session, selected);
+                    }
+
+                    selected->selected_profile = menu_select_persistence_profile(selected, active_adb_session.is_connected ? &active_adb_session : NULL);
+                    const persistence_profile_t *prof = (selected->profile_count > 0 && selected->selected_profile < selected->profile_count) ?
                         &selected->profiles[selected->selected_profile] : NULL;
+                    char prof_path[128] = {0};
+                    if (prof && !prof->is_clean_session && prof->filename[0]) {
+                        snprintf(prof_path, sizeof(prof_path), "/sdcard/BootManager/persistence/%s", prof->filename);
+                    }
 
                     bool ums_booted = false;
 
                     // If phone is ALREADY operating as USB Mass Storage and ADB is connected, hot-swap immediately!
                     if (msc_found && detected_msc_dev.has_msc) {
-                        active_adb_session.usb_dev = &detected_usb_dev;
-                        if (!active_adb_session.is_connected && detected_usb_dev.has_adb) {
-                            adb_init_session(&detected_usb_dev, &active_adb_session);
-                        }
                         if (active_adb_session.is_connected) {
                             vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
-                            log_info("BOOT", "Phone already in UMS mode. Hot-swapping to '%s' (0 MB in RAM)...", selected->filename);
+                            log_info("BOOT", "Phone already in UMS mode. Hot-swapping to '%s' (Profile: '%s')...",
+                                     selected->filename, prof_path[0] ? prof->filename : "Clean Session");
                             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                             disk_log_flush();
 
-                            int upd = adb_update_mass_storage_file(&active_adb_session, selected->filename);
+                            int upd = adb_update_mass_storage_file(&active_adb_session, selected->filename, prof_path[0] ? prof_path : NULL);
                             if (upd == 0) {
                                 for (int w = 0; w < 200000; w++) io_wait();
                                 uint32_t last_lba = 0, block_sz = 0;
@@ -1017,19 +1031,15 @@ void c_main(boot_info_t *boot_info) {
                     }
 
                     // If image is on Android MTP and ADB is available, try Root USB Mass Storage switch first!
-                    if (!ums_booted && selected->approach == BOOT_APPROACH_MTP_IN_RAM) {
-                        active_adb_session.usb_dev = &detected_usb_dev;
-                        if (!active_adb_session.is_connected && detected_usb_dev.has_adb) {
-                            adb_init_session(&detected_usb_dev, &active_adb_session);
-                        }
+                    if (!ums_booted && selected->approach == BOOT_APPROACH_MTP_IN_RAM && selected->mtp_handle != 0) {
                         if (active_adb_session.is_connected) {
                             vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
-                            log_info("BOOT", "Root ADB active! Attaching '%s' to USB Mass Storage (0 MB RAM)...", selected->filename);
+                            log_info("BOOT", "Root ADB active! Attaching '%s' to USB Mass Storage (Profile: '%s')...",
+                                     selected->filename, prof_path[0] ? prof->filename : "Clean Session");
                             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                             disk_log_flush();
-                            int trg = adb_trigger_mass_storage(&active_adb_session, selected->filename);
+                            int trg = adb_trigger_mass_storage(&active_adb_session, selected->filename, prof_path[0] ? prof_path : NULL);
                             disk_log_flush();
-
 
                             // Try to reprobe as MSC regardless of trigger result.
                             // The phone's background job runs independently — even if the ADB
@@ -1062,7 +1072,7 @@ void c_main(boot_info_t *boot_info) {
                             }
                         }
 
-                        if (!ums_booted) {
+                        if (!ums_booted && selected->mtp_handle != 0) {
                             vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
                             log_info("BOOT", "UMS direct block access not active for '%s'.", selected->filename);
                             log_info("BOOT", "Stream full image into RAM via MTP? (Press 'Y' to stream, any other key to cancel): ");

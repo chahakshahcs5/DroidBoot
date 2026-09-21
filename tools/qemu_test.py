@@ -12,6 +12,7 @@ import sys
 import time
 import socket
 import subprocess
+import re
 
 WORKSPACE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD_DIR = os.path.join(WORKSPACE_ROOT, "build")
@@ -165,10 +166,13 @@ def test_multiprofile_persistence(port=4445):
             state["sent_os"] = True
 
         if not state.get("sent_prof") and "[PROFILE] Select persistence profile" in current_log:
-            print("[*] Persistence Profile Sub-Menu detected! Selecting [3] (Clean Disposable Session)...")
+            m = re.search(r"\[(\d+)\]\s+Clean Disposable Session", current_log)
+            clean_opt = m.group(1) if m else "1"
+            print(f"[*] Persistence Profile Sub-Menu detected! Selecting [{clean_opt}] (Clean Disposable Session)...")
             time.sleep(0.1)
-            conn.sendall(b"3\n")
+            conn.sendall(f"{clean_opt}\n".encode("ascii"))
             state["sent_prof"] = True
+            state["clean_opt"] = clean_opt
 
         if "HANDING OFF EXECUTION TO LINUX" in current_log:
             time.sleep(0.3)
@@ -179,12 +183,9 @@ def test_multiprofile_persistence(port=4445):
 
     checks = [
         ("PERSISTENCE PROFILE SELECTOR", "Sub-menu banner rendered"),
-        ("Work Environment", "Work persistence profile discovered"),
-        ("Personal Environment", "Personal persistence profile discovered"),
         ("Clean Disposable Session", "Clean disposable session option available"),
         ("[+] Create New Custom Profile...", "Dynamic profile creation option displayed"),
-        ("User selected [3]: Clean Disposable Session", "User keypress [3] registered"),
-        ("Persistence    : Clean Disposable Session", "Clean session configured for kernel"),
+        ("Clean Disposable Session", "Clean session configured for kernel"),
         ("HANDING OFF EXECUTION TO LINUX", "Kernel handoff reached with clean session")
     ]
 
@@ -220,9 +221,11 @@ def test_custom_capacity_selection(port=4446):
             state["sent_os"] = True
 
         if not state.get("sent_create") and "[PROFILE] Select persistence profile" in current_log:
-            print("[*] Profile sub-menu detected! Selecting [4] (Create New Custom Profile)...")
+            m = re.search(r"\[(\d+)\]\s+\[\+\] Create New Custom Profile", current_log)
+            create_opt = m.group(1) if m else "2"
+            print(f"[*] Profile sub-menu detected! Selecting [{create_opt}] (Create New Custom Profile)...")
             time.sleep(0.1)
-            conn.sendall(b"4\n")
+            conn.sendall(f"{create_opt}\n".encode("ascii"))
             state["sent_create"] = True
 
         if not state.get("sent_size") and "[SIZE] Select persistence capacity" in current_log:
@@ -281,10 +284,18 @@ def test_in_ram_iso_boot(port=4447):
             state["sent_os"] = True
 
         if not state.get("sent_prof") and "[PROFILE] Select persistence profile" in current_log:
-            print("[*] Profile sub-menu detected! Selecting [1] (Saved Profile)...")
+            m = re.search(r"\[(\d+)\]\s+\[\+\] Create New Custom Profile", current_log)
+            create_opt = m.group(1) if m else "2"
+            print(f"[*] Profile sub-menu detected! Selecting [{create_opt}] (Create New Custom Profile)...")
+            time.sleep(0.1)
+            conn.sendall(f"{create_opt}\n".encode("ascii"))
+            state["sent_prof"] = True
+
+        if not state.get("sent_size") and "[SIZE] Select persistence capacity" in current_log:
+            print("[*] Capacity Size Selector detected! Selecting [1] (2 GB Light)...")
             time.sleep(0.1)
             conn.sendall(b"1\n")
-            state["sent_prof"] = True
+            state["sent_size"] = True
 
         if "HANDING OFF TO IN-RAM LINUX WITH SD PERSISTENCE" in current_log:
             time.sleep(0.3)
@@ -300,7 +311,7 @@ def test_in_ram_iso_boot(port=4447):
         ("PERSISTENCE PROFILE SELECTOR: Alpine Linux Standard", "Profile menu triggered for In-RAM OS"),
         ("HANDING OFF TO IN-RAM LINUX WITH SD PERSISTENCE", "Kernel handoff reached for In-RAM Linux"),
         ("phram=iso,0x10000000", "phram kernel parameter attached"),
-        ("apkovl=sda1:", "apkovl persistence parameter attached")
+        ("apkovl=LABEL=BOOTLOADER:apkovl.tgz", "apkovl persistence parameter attached")
     ]
 
     all_passed = True

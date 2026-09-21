@@ -2,6 +2,7 @@
 #include "../core/printf.h"
 #include "../debug/vga.h"
 #include "../../include/io.h"
+#include "../image/os_scanner.h"
 
 static void adb_k_memset(void *dst, uint8_t val, size_t n) {
     uint8_t *d = (uint8_t *)dst;
@@ -307,6 +308,35 @@ static bool adb_str_contains(const char *haystack, const char *needle) {
     return false;
 }
 
+static bool adb_str_ends_with_nocase(const char *str, const char *suffix) {
+    if (!str || !suffix) return false;
+    int str_len = 0, suf_len = 0;
+    while (str[str_len]) str_len++;
+    while (suffix[suf_len]) suf_len++;
+    if (str_len < suf_len) return false;
+    for (int i = 0; i < suf_len; i++) {
+        char c1 = str[str_len - suf_len + i];
+        char c2 = suffix[i];
+        if (c1 >= 'A' && c1 <= 'Z') c1 += ('a' - 'A');
+        if (c2 >= 'A' && c2 <= 'Z') c2 += ('a' - 'A');
+        if (c1 != c2) return false;
+    }
+    return true;
+}
+
+static bool adb_str_eq_nocase(const char *s1, const char *s2) {
+    if (!s1 || !s2) return false;
+    int i = 0;
+    while (s1[i] && s2[i]) {
+        char c1 = s1[i], c2 = s2[i];
+        if (c1 >= 'A' && c1 <= 'Z') c1 += ('a' - 'A');
+        if (c2 >= 'A' && c2 <= 'Z') c2 += ('a' - 'A');
+        if (c1 != c2) return false;
+        i++;
+    }
+    return (s1[i] == '\0' && s2[i] == '\0');
+}
+
 int adb_probe_kernel_gadgets(adb_session_t *session, char *out_buf, uint32_t max_len) {
     if (!session || !session->is_connected) return -1;
 
@@ -314,7 +344,7 @@ int adb_probe_kernel_gadgets(adb_session_t *session, char *out_buf, uint32_t max
     return adb_execute_shell(session, cmd, out_buf, max_len);
 }
 
-int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path) {
+int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path, const char *profile_path) {
     if (!session || !session->is_connected) return -1;
 
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
@@ -366,47 +396,56 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path) {
         return -2; // Unsupported, but harmless! Phone stays connected!
     }
 
-    log_info("ADB", "Kernel UMS support verified via %s! Locating target ISO...",
+    log_info("ADB", "Kernel UMS support verified via %s! Locating target image...",
              is_sysfs ? "sysfs" : func_name);
 
     // Delay between pre-flight and switch to let ADB stream fully close
-    // This prevents the pre-flight response from leaking into the switch response
     for (int w = 0; w < 500000; w++) io_wait();
 
-    // Stage 2: Configure LUN and initiate atomic switch
+    // Stage 2: Configure LUNs (LUN 0 = Boot OS, LUN 1 = Persistent Data Profile) and initiate atomic switch
     static char switch_cmd[4096];
     const char *req_name = (iso_path && iso_path[0]) ? iso_path : "";
+    const char *prof_name = (profile_path && profile_path[0]) ? profile_path : "";
+    bool is_raw_img = (req_name[0] && adb_str_ends_with_nocase(req_name, ".img"));
+    int ro_val = is_raw_img ? 0 : 1;
 
     if (!is_sysfs) {
         snprintf(switch_cmd, sizeof(switch_cmd),
                  "su -c '"
-                 "ISO=\"%s\"; "
+                 "ISO=\"%s\"; PROF=\"%s\"; "
                  "F=$(find /sdcard /storage/emulated/0 /storage -name \"$ISO\" 2>/dev/null | head -1); "
                  "[ -z \"$F\" ] && [ -f \"/sdcard/Download/$ISO\" ] && F=\"/sdcard/Download/$ISO\"; "
                  "[ -z \"$F\" ] && [ -f \"/sdcard/$ISO\" ] && F=\"/sdcard/$ISO\"; "
                  "if [ -z \"$F\" ] || [ ! -f \"$F\" ]; then echo ERR_NO_FILE; exit 2; fi; "
-                 "L=\"/config/usb_gadget/g1/functions/%s/lun.0\"; "
-                 "mkdir -p \"$L\" 2>/dev/null; "
-                 "echo \"$F\" > \"$L/file\" 2>/dev/null; "
-                 "echo 1 > \"$L/ro\" 2>/dev/null; "
-                 "echo 0 > \"$L/cdrom\" 2>/dev/null; "
-                 "if [ ! -s \"$L/file\" ]; then echo ERR_LUN_FAIL; exit 3; fi; "
+                 "L0=\"/config/usb_gadget/g1/functions/%s/lun.0\"; "
+                 "mkdir -p \"$L0\" 2>/dev/null; "
+                 "echo \"$F\" > \"$L0/file\" 2>/dev/null; "
+                 "echo %d > \"$L0/ro\" 2>/dev/null; "
+                 "echo 0 > \"$L0/cdrom\" 2>/dev/null; "
+                 "if [ ! -s \"$L0/file\" ]; then echo ERR_LUN_FAIL; exit 3; fi; "
+                 "L1=\"/config/usb_gadget/g1/functions/%s/lun.1\"; "
+                 "if [ -n \"$PROF\" ] && [ -f \"$PROF\" ]; then "
+                 "  mkdir -p \"$L1\" 2>/dev/null; "
+                 "  echo \"$PROF\" > \"$L1/file\" 2>/dev/null; "
+                 "  echo 0 > \"$L1/ro\" 2>/dev/null; "
+                 "  echo 0 > \"$L1/cdrom\" 2>/dev/null; "
+                 "fi; "
                  "C=$(ls -d /config/usb_gadget/g1/configs/*.* 2>/dev/null | head -1); "
                  "U=$(cat /config/usb_gadget/g1/UDC 2>/dev/null); "
                  "[ -z \"$U\" ] && U=$(ls /sys/class/udc 2>/dev/null | head -1); "
                  "if [ -z \"$C\" ] || [ -z \"$U\" ]; then echo ERR_NO_UDC; exit 4; fi; "
-                  "echo OK_SWITCHING:\"$F\"; "
-                  "(sleep 2; echo \"\" > /config/usb_gadget/g1/UDC 2>/dev/null; rm -f \"$C\"/f* 2>/dev/null; "
-                  "ln -s /config/usb_gadget/g1/functions/%s \"$C/f1\" 2>/dev/null; "
-                  "[ -d /config/usb_gadget/g1/functions/ffs.adb ] && ln -s /config/usb_gadget/g1/functions/ffs.adb \"$C/f2\" 2>/dev/null; "
-                  "setprop sys.usb.state mass_storage,adb 2>/dev/null || setprop sys.usb.state mass_storage 2>/dev/null; "
-                  "echo \"$U\" > /config/usb_gadget/g1/UDC 2>/dev/null) &"
-                  "'",
-                  req_name, func_name, func_name);
+                 "echo OK_SWITCHING:\"$F\"; "
+                 "(sleep 2; echo \"\" > /config/usb_gadget/g1/UDC 2>/dev/null; rm -f \"$C\"/f* 2>/dev/null; "
+                 "ln -s /config/usb_gadget/g1/functions/%s \"$C/f1\" 2>/dev/null; "
+                 "[ -d /config/usb_gadget/g1/functions/ffs.adb ] && ln -s /config/usb_gadget/g1/functions/ffs.adb \"$C/f2\" 2>/dev/null; "
+                 "setprop sys.usb.state mass_storage,adb 2>/dev/null || setprop sys.usb.state mass_storage 2>/dev/null; "
+                 "echo \"$U\" > /config/usb_gadget/g1/UDC 2>/dev/null) &"
+                 "'",
+                 req_name, prof_name, func_name, ro_val, func_name, func_name);
     } else {
         snprintf(switch_cmd, sizeof(switch_cmd),
                  "su -c '"
-                 "ISO=\"%s\"; "
+                 "ISO=\"%s\"; PROF=\"%s\"; "
                  "F=$(find /sdcard /storage/emulated/0 /storage -name \"$ISO\" 2>/dev/null | head -1); "
                  "[ -z \"$F\" ] && [ -f \"/sdcard/Download/$ISO\" ] && F=\"/sdcard/Download/$ISO\"; "
                  "[ -z \"$F\" ] && [ -f \"/sdcard/$ISO\" ] && F=\"/sdcard/$ISO\"; "
@@ -419,11 +458,15 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path) {
                  "if [ -z \"$L\" ]; then echo ERR_NO_SYSFS_LUN; exit 3; fi; "
                  "echo OK_SWITCHING:\"$F\"; "
                  "(sleep 2; echo 0 > /sys/class/android_usb/android0/enable 2>/dev/null; "
-                 "echo \"$F\" > \"$L/file\" 2>/dev/null; echo 1 > \"$L/ro\" 2>/dev/null; echo 0 > \"$L/cdrom\" 2>/dev/null; "
+                 "echo \"$F\" > \"$L/file\" 2>/dev/null; echo %d > \"$L/ro\" 2>/dev/null; echo 0 > \"$L/cdrom\" 2>/dev/null; "
+                 "if [ -n \"$PROF\" ] && [ -f \"$PROF\" ]; then "
+                 "  echo \"$PROF\" > \"$L/../lun1/file\" 2>/dev/null; "
+                 "  echo 0 > \"$L/../lun1/ro\" 2>/dev/null; "
+                 "fi; "
                  "echo mass_storage,adb > /sys/class/android_usb/android0/functions 2>/dev/null || echo mass_storage > /sys/class/android_usb/android0/functions 2>/dev/null; "
                  "echo 1 > /sys/class/android_usb/android0/enable 2>/dev/null) &"
                  "'",
-                 req_name);
+                 req_name, prof_name, ro_val);
     }
 
     char switch_out[256] = {0};
@@ -433,7 +476,7 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path) {
 
     // Check for explicit file-not-found error (this comes before any USB disruption)
     if (adb_str_contains(switch_out, "ERR_NO_FILE")) {
-        log_error("ADB", "Target ISO file '%s' not found on phone storage!", req_name[0] ? req_name : "*.iso");
+        log_error("ADB", "Target image '%s' not found on phone storage!", req_name[0] ? req_name : "*.iso");
         return -3;
     }
     if (adb_str_contains(switch_out, "ERR_LUN_FAIL")) {
@@ -451,10 +494,6 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path) {
         return 0; // Success!
     }
 
-    // After a successful pre-flight check, any USB error (timeout, bus drop, transfer error)
-    // during the switch command means the phone is actively unbinding/rebinding the UDC.
-    // The background job (sleep 2; UDC unbind/rebind) runs independently of the ADB shell
-    // response, so USB bus disruption is EXPECTED and indicates the switch is in progress.
     if (adb_str_contains(switch_out, "OK_SWITCHING") || res < 0 || res == 4) {
         log_info("ADB", "Gadget switch in progress (USB bus disruption expected during UDC rebind).");
         log_info("ADB", "Phone background job will complete UDC switch in ~2 seconds.");
@@ -462,18 +501,12 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path) {
         return 0; // Treat as success — phone is switching!
     }
 
-    // Only reach here if the switch command returned successfully but with an unexpected response
-    // (no USB error, no OK_SWITCHING, no ERR_ prefix). This is genuinely unexpected.
-    log_error("ADB", "Unexpected gadget switch response (resp: '%s', code %d).",
-              switch_out[0] ? switch_out : "none", res);
-    // Still mark disconnected and return success if the pre-flight passed —
-    // the phone likely accepted the command even if the response was garbled
     log_info("ADB", "Pre-flight confirmed UMS support; assuming switch is in progress.");
     session->is_connected = false;
     return 0;
 }
 
-int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path) {
+int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path, const char *profile_path) {
     if (!session || !session->is_connected) return -1;
 
     char req_name[128] = {0};
@@ -485,20 +518,40 @@ int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path) {
         for (int i = 0; p[i] && i < 127; i++) req_name[i] = p[i];
     }
 
-    log_info("ADB", "Hot-swapping USB Mass Storage image to '%s' (no UDC reset)...",
-             req_name[0] ? req_name : "*.iso");
+    const char *prof_name = (profile_path && profile_path[0]) ? profile_path : "";
+    bool is_raw_img = (req_name[0] && adb_str_ends_with_nocase(req_name, ".img"));
+    int ro_val = is_raw_img ? 0 : 1;
 
-    char update_cmd[512];
+    log_info("ADB", "Hot-swapping USB Mass Storage: LUN0='%s' (ro=%d), LUN1='%s'...",
+             req_name[0] ? req_name : "*.iso", ro_val, prof_name[0] ? prof_name : "(none)");
+
+    char update_cmd[1024];
     snprintf(update_cmd, sizeof(update_cmd),
              "su -c '"
-             "ISO=\"%s\"; "
+             "ISO=\"%s\"; PROF=\"%s\"; "
              "F=$(find /sdcard /storage/emulated/0 /storage -name \"$ISO\" 2>/dev/null | head -1); "
              "[ -z \"$F\" ] && [ -f \"/sdcard/Download/$ISO\" ] && F=\"/sdcard/Download/$ISO\"; "
              "[ -z \"$F\" ] && [ -f \"/sdcard/$ISO\" ] && F=\"/sdcard/$ISO\"; "
              "if [ -z \"$F\" ] || [ ! -f \"$F\" ]; then echo ERR_NO_FILE; exit 2; fi; "
-             "for L in /config/usb_gadget/g1/functions/mass_storage*/lun.0 "
-             "/sys/class/android_usb/android0/f_mass_storage/lun "
-             "/sys/class/android_usb/android0/f_mass_storage/lun0; do "
+             "for M in /config/usb_gadget/g1/functions/mass_storage*; do "
+             "  if [ -d \"$M\" ]; then "
+             "    echo \"\" > \"$M/lun.0/file\" 2>/dev/null; "
+             "    echo \"$F\" > \"$M/lun.0/file\" 2>/dev/null; "
+             "    echo %d > \"$M/lun.0/ro\" 2>/dev/null; "
+             "    if [ -n \"$PROF\" ] && [ -f \"$PROF\" ]; then "
+             "      mkdir -p \"$M/lun.1\" 2>/dev/null; "
+             "      echo \"\" > \"$M/lun.1/file\" 2>/dev/null; "
+             "      echo \"$PROF\" > \"$M/lun.1/file\" 2>/dev/null; "
+             "      echo 0 > \"$M/lun.1/ro\" 2>/dev/null; "
+             "      echo 0 > \"$M/lun.1/cdrom\" 2>/dev/null; "
+             "    else "
+             "      echo \"\" > \"$M/lun.1/file\" 2>/dev/null; "
+             "    fi; "
+             "    echo OK_UPDATED:\"$F\"; "
+             "    exit 0; "
+             "  fi; "
+             "done; "
+             "for L in /sys/class/android_usb/android0/f_mass_storage/lun /sys/class/android_usb/android0/f_mass_storage/lun0; do "
              "  if [ -f \"$L/file\" ]; then "
              "    echo \"\" > \"$L/file\" 2>/dev/null; "
              "    echo \"$F\" > \"$L/file\" 2>/dev/null; "
@@ -507,7 +560,7 @@ int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path) {
              "  fi; "
              "done; "
              "echo ERR_NO_LUN; exit 3;'",
-             req_name);
+             req_name, prof_name, ro_val);
 
     char out[256] = {0};
     int res = adb_execute_shell(session, update_cmd, out, sizeof(out));
@@ -518,10 +571,58 @@ int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path) {
         return 0;
     }
     if (adb_str_contains(out, "ERR_NO_FILE")) {
-        log_error("ADB", "Target ISO '%s' not found on phone storage!", req_name);
+        log_error("ADB", "Target image '%s' not found on phone storage!", req_name);
         return -2;
     }
     return -1;
+}
+
+int adb_scan_persistence_profiles(adb_session_t *session, struct os_entry *entry) {
+    if (!session || !session->is_connected || !entry) return -1;
+
+    static char scan_cmd[] =
+        "su -c 'mkdir -p /sdcard/BootManager/persistence && touch /sdcard/BootManager/persistence/.nomedia && "
+        "ls -1 /sdcard/BootManager/persistence/*.img /sdcard/BootManager/persistence/*.casper-rw /sdcard/BootManager/persistence/*.apkovl.tar.gz 2>/dev/null'";
+
+    char out_buf[1024] = {0};
+    int res = adb_execute_shell(session, scan_cmd, out_buf, sizeof(out_buf));
+    if (res != 0 || out_buf[0] == '\0') {
+        return 0;
+    }
+
+    char *p = out_buf;
+    while (*p) {
+        while (*p == '\r' || *p == '\n' || *p == ' ') p++;
+        if (!*p) break;
+        char *line_start = p;
+        while (*p && *p != '\r' && *p != '\n') p++;
+        if (*p) {
+            *p = '\0';
+            p++;
+        }
+
+        char *base = line_start;
+        for (char *s = line_start; *s; s++) {
+            if (*s == '/' || *s == '\\') base = s + 1;
+        }
+
+        if (base[0] && base[0] != '*') {
+            bool exists = false;
+            for (uint32_t i = 0; i < entry->profile_count; i++) {
+                if (adb_str_eq_nocase(entry->profiles[i].filename, base)) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists && entry->profile_count < MAX_PERSISTENCE_PROFILES) {
+                char prof_title[32];
+                snprintf(prof_title, sizeof(prof_title), "Profile: %s", base);
+                os_add_custom_profile(entry, prof_title, base, (uint64_t)2 * 1024 * 1024 * 1024);
+                log_info("ADB", "[+] Discovered profile on phone: '%s'", base);
+            }
+        }
+    }
+    return (int)entry->profile_count;
 }
 
 int adb_create_sparse_overlay(adb_session_t *session, const char *overlay_path, uint32_t size_gb) {
@@ -531,8 +632,10 @@ int adb_create_sparse_overlay(adb_session_t *session, const char *overlay_path, 
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "su -c \"mkdir -p /sdcard/BootManager/persistence && touch /sdcard/BootManager/persistence/.nomedia && truncate -s %uG %s && mkfs.ext4 -F -O ^has_journal %s\"",
-             size_gb, overlay_path, overlay_path);
+             "su -c \"mkdir -p /sdcard/BootManager/persistence && touch /sdcard/BootManager/persistence/.nomedia && "
+             "truncate -s %uG %s && "
+             "(mkfs.ext4 -F -O ^has_journal %s 2>/dev/null || mke2fs -t ext4 -F %s 2>/dev/null || make_ext4fs -l %uM %s 2>/dev/null || /data/adb/magisk/busybox mkfs.ext4 %s 2>/dev/null || mkfs.vfat %s 2>/dev/null || true)\"",
+             size_gb, overlay_path, overlay_path, overlay_path, size_gb * 1024, overlay_path, overlay_path, overlay_path);
 
     char out[256] = {0};
     int res = adb_execute_shell(session, cmd, out, sizeof(out));

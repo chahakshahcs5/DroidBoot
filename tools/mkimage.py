@@ -41,20 +41,27 @@ import tarfile
 import io
 
 def generate_alpine_apkovl() -> bytes:
-    """Creates a minimal Alpine apkovl.tar.gz containing pre-configured /etc/lbu/lbu.conf."""
+    """Creates a minimal Alpine apkovl.tar.gz containing pre-configured /etc/lbu/lbu.conf and /etc/lbu/include."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         conf_content = (
             b"# Alpine Local Backup (LBU) Configuration\n"
             b"# Pre-configured by BootManager for SD Card / USB Persistence\n"
-            b'LBU_MEDIA="sda1"\n'
-            b'LBU_BACKUP_DIR="/media/sda1"\n'
+            b'LBU_MEDIA="usb"\n'
+            b'LBU_BACKUPDIR="/media/BOOTLOADER"\n'
         )
         ti = tarfile.TarInfo(name="etc/lbu/lbu.conf")
         ti.size = len(conf_content)
         ti.mode = 0o644
         ti.mtime = 1700000000
         tar.addfile(ti, io.BytesIO(conf_content))
+
+        include_content = b"/root\n"
+        ti2 = tarfile.TarInfo(name="etc/lbu/include")
+        ti2.size = len(include_content)
+        ti2.mode = 0o644
+        ti2.mtime = 1700000000
+        tar.addfile(ti2, io.BytesIO(include_content))
     return buf.getvalue()
 
 def create_fat32_partition(total_sectors: int, hidden_lba: int, adb_key_data: bytes = None) -> bytes:

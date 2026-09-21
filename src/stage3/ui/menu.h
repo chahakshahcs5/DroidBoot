@@ -30,7 +30,7 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
 menu_selection_t menu_wait_selection(const os_registry_t *registry);
 
 int      menu_select_phone_image(const os_registry_t *registry);
-int      menu_select_persistence_profile(os_entry_t *entry);
+int      menu_select_persistence_profile(os_entry_t *entry, adb_session_t *adb);
 uint64_t menu_prompt_profile_size(void);
 
 void menu_show_diagnostics(boot_info_t *boot_info, xhci_controller_t *xhci,

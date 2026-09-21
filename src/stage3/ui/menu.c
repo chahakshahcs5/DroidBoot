@@ -467,7 +467,7 @@ int menu_select_phone_image(const os_registry_t *registry) {
     }
 }
 
-int menu_select_persistence_profile(os_entry_t *entry) {
+int menu_select_persistence_profile(os_entry_t *entry, adb_session_t *adb) {
     if (!entry) return 0;
 
     // Drain any leftover input characters from previous menu selection (bounded to avoid hangs)
@@ -476,12 +476,24 @@ int menu_select_persistence_profile(os_entry_t *entry) {
         for (int w = 0; w < 100; w++) io_wait();
     }
 
+    // Ensure there is always at least one option: Clean Disposable Session
+    if (entry->profile_count == 0) {
+        persistence_profile_t *clean = &entry->profiles[entry->profile_count++];
+        uint8_t *b = (uint8_t *)clean;
+        for (uint32_t i = 0; i < sizeof(persistence_profile_t); i++) b[i] = 0;
+        const char *title = "Clean Disposable Session";
+        for (int i = 0; title[i] && i < 31; i++) clean->profile_name[i] = title[i];
+        clean->filename[0] = '\0';
+        clean->file_size = 0;
+        clean->is_clean_session = true;
+    }
+
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
     printk("\n======================================================================\n");
     printk("  PERSISTENCE PROFILE SELECTOR: %s\n", entry->title);
     printk("======================================================================\n");
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-    printk("Discovered profiles in /BootManager/persistence/:\n");
+    printk("Available Persistence Profiles on Phone (/sdcard/BootManager/persistence/):\n");
 
     for (uint32_t i = 0; i < entry->profile_count; i++) {
         persistence_profile_t *p = &entry->profiles[i];
@@ -492,7 +504,7 @@ int menu_select_persistence_profile(os_entry_t *entry) {
             printk("      * Mode: 100%% In-RAM (Clean Session - No changes saved to phone)\n");
         } else {
             printk("      * File: %s (%u MB)\n", p->filename, (uint32_t)(p->file_size / 1024 / 1024));
-            printk("      * Mode: Persistent Read/Write Overlay\n");
+            printk("      * Mode: Multi-LUN Persistent Read/Write Drive (LUN 1)\n");
         }
     }
 
@@ -531,10 +543,26 @@ int menu_select_persistence_profile(os_entry_t *entry) {
             printk("[PROFILE] User selected [%u]: Create New Custom Profile\n", create_opt);
             uint64_t chosen_size = menu_prompt_profile_size();
             uint32_t mb = (uint32_t)(chosen_size / 1024 / 1024);
+            uint32_t gb = (uint32_t)(chosen_size / 1024 / 1024 / 1024);
             char prof_name[32];
             snprintf(prof_name, sizeof(prof_name), "Custom Profile (%u MB)", mb);
             char prof_file[64];
-            snprintf(prof_file, sizeof(prof_file), "custom_%uMB.casper-rw", mb);
+            if (entry->iso_files.is_casper) {
+                snprintf(prof_file, sizeof(prof_file), "custom_%uMB.casper-rw", mb);
+            } else {
+                snprintf(prof_file, sizeof(prof_file), "custom_%uMB.img", mb);
+            }
+
+            // Create sparse file on phone via ADB if active
+            if (adb && adb->is_connected) {
+                char full_phone_path[128];
+                snprintf(full_phone_path, sizeof(full_phone_path), "/sdcard/BootManager/persistence/%s", prof_file);
+                vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+                printk("[PROFILE] Allocating %u GB sparse persistence image on phone storage...\n", gb);
+                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                adb_create_sparse_overlay(adb, full_phone_path, gb > 0 ? gb : 2);
+            }
+
             int new_idx = os_add_custom_profile(entry, prof_name, prof_file, chosen_size);
             if (new_idx >= 0) {
                 return new_idx;
