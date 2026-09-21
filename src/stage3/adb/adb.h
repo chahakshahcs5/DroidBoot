@@ -15,6 +15,10 @@
 #define A_VERSION 0x01000000
 #define A_MAXDATA 4096
 
+#define ADB_AUTH_TOKEN        1
+#define ADB_AUTH_SIGNATURE    2
+#define ADB_AUTH_RSAPUBLICKEY 3
+
 #pragma pack(push, 1)
 typedef struct adb_message {
     uint32_t command;     // e.g. A_CNXN, A_OPEN, etc.
@@ -28,6 +32,8 @@ typedef struct adb_message {
 
 typedef struct adb_session {
     usb_device_t *usb_dev;
+    uint8_t      adb_bulk_in_ep;
+    uint8_t      adb_bulk_out_ep;
     uint32_t     local_id;
     uint32_t     remote_id;
     uint32_t     max_data;
@@ -35,7 +41,9 @@ typedef struct adb_session {
 } adb_session_t;
 
 int  adb_init_session(usb_device_t *dev, adb_session_t *session);
+void adb_set_public_key(const char *key_str, uint32_t len);
 int  adb_execute_shell(adb_session_t *session, const char *cmd, char *out_buf, uint32_t max_len);
+int  adb_probe_kernel_gadgets(adb_session_t *session, char *out_buf, uint32_t max_len);
 int  adb_trigger_mass_storage(adb_session_t *session, const char *iso_path);
 int  adb_create_sparse_overlay(adb_session_t *session, const char *overlay_path, uint32_t size_gb);
 

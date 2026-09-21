@@ -2,6 +2,7 @@
 .section .text
 .globl bios_int13_call
 .globl bios_int10_call
+.globl bios_int16_call
 
 # ==============================================================================
 # int bios_int13_call(uint8_t drive, uint32_t dap_phys, uint8_t cmd)
@@ -30,7 +31,7 @@ bios_int13_call:
     # 0x7100: drive (1 byte)
     # 0x7102: dap offset (2 bytes, EDX & 0xFFFF)
     # 0x7104: cmd (1 byte)
-    # 0x7105: op_type (0 = INT 13h, 1 = INT 10h)
+    # 0x7105: op_type (0 = INT 13h, 1 = INT 10h, 2 = INT 16h)
     # 0x7106: return code (2 bytes)
     # 0x7108: saved 32-bit ESP (4 bytes)
     movb %al, (0x7100)
@@ -114,6 +115,46 @@ bios_int10_call:
     # Far jump to 16-bit protected mode code selector (0x18) at 0x7000
     ljmp $0x18, $0x7000
 
+# ==============================================================================
+# uint16_t bios_int16_call(uint8_t cmd)
+#
+# Arguments:
+#   8(%ebp)  = uint8_t cmd (0x01 = check keystroke, 0x00 = read keystroke)
+#
+# Returns:
+#   0 if no key available, or (AH << 8) | AL with scancode & ascii
+# ==============================================================================
+bios_int16_call:
+    pushl %ebp
+    movl %esp, %ebp
+    pushl %ebx
+    pushl %esi
+    pushl %edi
+
+    movb 8(%ebp), %al       # cmd
+
+    # Mailbox for INT 16h:
+    # 0x7105: op_type = 2 (INT 16h)
+    # 0x7108: saved 32-bit ESP
+    # 0x7120: cmd (1 byte)
+    # 0x7122: ret_AX (2 bytes)
+    movb $2, (0x7105)
+    movl %esp, (0x7108)
+    movb %al, (0x7120)
+
+    # Copy thunk code and data table to 0x7000
+    movl $thunk_blob_start, %esi
+    movl $0x7000, %edi
+    movl $(thunk_blob_end - thunk_blob_start), %ecx
+    cld
+    rep movsb
+
+    # Load 16-bit GDT from low-memory copy
+    lgdt (0x7000 + (thunk_gdt_desc - thunk_blob_start))
+
+    # Far jump to 16-bit protected mode code selector (0x18) at 0x7000
+    ljmp $0x18, $0x7000
+
 # ------------------------------------------------------------------------------
 # 32-bit entry point after returning from real mode
 # ------------------------------------------------------------------------------
@@ -133,6 +174,8 @@ pmode_return:
     # Check op_type
     cmpb $1, (0x7105)
     je .pmode_ret_int10
+    cmpb $2, (0x7105)
+    je .pmode_ret_int16
 
     # Read INT 13h return code from mailbox
     movzwl (0x7106), %eax
@@ -145,6 +188,15 @@ pmode_return:
 .pmode_ret_int10:
     # Read INT 10h return code (AX) from mailbox
     movzwl (0x711C), %eax
+    popl %edi
+    popl %esi
+    popl %ebx
+    popl %ebp
+    ret
+
+.pmode_ret_int16:
+    # Read INT 16h return code (AX) from mailbox
+    movzwl (0x7122), %eax
     popl %edi
     popl %esi
     popl %ebx
@@ -186,9 +238,11 @@ thunk_rm_entry:
     # Load Real Mode IVT (Limit 0x3FF, Base 0)
     lidt (0x7000 + (thunk_rm_idt - thunk_blob_start))
 
-    # Check op_type (0 = INT 13h, 1 = INT 10h)
+    # Check op_type (0 = INT 13h, 1 = INT 10h, 2 = INT 16h)
     cmpb $1, (0x7105)
     je .rm_int10
+    cmpb $2, (0x7105)
+    je .rm_int16
 
     # --- INT 13h Disk Service ---
     movb (0x7100), %dl      # drive
@@ -228,6 +282,29 @@ thunk_rm_entry:
     int $0x10
     cli
     movw %ax, (0x711C)      # Save return AX
+    jmp .switch_back
+
+.rm_int16:
+    # --- INT 16h Keyboard Service ---
+    movb (0x7120), %ah      # cmd (0x01 = check, 0x00 = read)
+    clc
+    sti
+    int $0x16
+    cli
+    jz .no_key_int16
+    # Key found! If cmd was 0x01 (check), read it out with 0x00 to remove from BIOS buffer
+    cmpb $0x01, (0x7120)
+    jne .int16_done
+    movb $0x00, %ah
+    sti
+    int $0x16
+    cli
+.int16_done:
+    movw %ax, (0x7122)
+    jmp .switch_back
+
+.no_key_int16:
+    movw $0x0000, (0x7122)
     jmp .switch_back
 
 .switch_back:

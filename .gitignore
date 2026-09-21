@@ -5,3 +5,6 @@ build/
 *.img
 *.log
 __pycache__/
+scratch_*
+alpine_init.sh
+

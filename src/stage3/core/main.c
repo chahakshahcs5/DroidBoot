@@ -27,6 +27,7 @@ static usb_device_t      detected_usb_dev;
 static usb_device_t      detected_msc_dev;
 static bool              msc_found = false;
 static mtp_session_t     active_mtp_session;
+static adb_session_t     active_adb_session;
 
 static void k_memset(void *dst, uint8_t val, size_t n) {
     uint8_t *d = (uint8_t *)dst;
@@ -204,18 +205,19 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
     if (iso_files.is_casper) {
         if (prof && prof->is_clean_session) {
             snprintf(cmdline, sizeof(cmdline),
-                     "boot=casper noapic nosplash console=tty0 console=ttyS0,115200");
+                     "boot=casper modprobe.blacklist=floppy nosplash console=tty1");
         } else {
             snprintf(cmdline, sizeof(cmdline),
-                     "boot=casper persistent persistent-path=/BootManager/persistence/ noapic nosplash console=tty0 console=ttyS0,115200");
+                     "boot=casper persistent persistent-path=/BootManager/persistence/ modprobe.blacklist=floppy nosplash console=tty1");
         }
     } else {
+        // Alpine Linux / Generic Live System
         if (prof && prof->is_clean_session) {
             snprintf(cmdline, sizeof(cmdline),
-                     "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 noapic modules=loop,squashfs,sd-mod,usb-storage");
+                     "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage quiet");
         } else {
             snprintf(cmdline, sizeof(cmdline),
-                     "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 noapic modules=loop,squashfs,sd-mod,usb-storage apkovl=sda1:");
+                     "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage apkovl=sda1:apkovl.tgz quiet");
         }
     }
 
@@ -296,12 +298,12 @@ static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_fil
     char alpine_cmdline[512];
     if (prof && prof->is_clean_session) {
         snprintf(alpine_cmdline, sizeof(alpine_cmdline),
-                 "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 noapic modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes loglevel=7",
-                 LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
+                 "console=tty0 console=tty1 modprobe.blacklist=floppy noapic modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes debug_init quiet",
+                 LINUX_RAM_ISO_PHYS, total_iso_bytes);
     } else {
         snprintf(alpine_cmdline, sizeof(alpine_cmdline),
-                 "earlyprintk=serial,0x3f8,115200 console=tty0 console=ttyS0,115200 noapic modules=loop,squashfs,sd-mod,usb-storage,phram,mtdblock phram=iso,0x%08X,0x%08X memmap=0x%08X$0x%08X memdisk=yes loglevel=7 apkovl=sda1:",
-                 LINUX_RAM_ISO_PHYS, total_iso_bytes, total_iso_bytes, LINUX_RAM_ISO_PHYS);
+                 "console=tty0 console=tty1 modprobe.blacklist=floppy noapic modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes apkovl=sda1: debug_init quiet",
+                 LINUX_RAM_ISO_PHYS, total_iso_bytes);
     }
 
     // Standard 80x25 VGA text mode for maximum compatibility with Alpine Linux & Linux distributions
@@ -352,8 +354,9 @@ static void boot_from_in_ram_iso(os_entry_t *entry, boot_info_t *boot_info, cons
     boot_in_ram_iso_handoff((uint32_t)entry->file_size, &entry->iso_files, boot_info, prof);
 }
 
-static void boot_from_android_mtp(mtp_session_t *session, boot_info_t *boot_info, const persistence_profile_t *prof) {
+static void boot_from_android_mtp(os_entry_t *selected, boot_info_t *boot_info, const persistence_profile_t *prof) {
     log_info("BOOT", "Attempting boot from Android Phone (MTP)...");
+    mtp_session_t *session = (selected && selected->mtp_session) ? selected->mtp_session : &active_mtp_session;
     if (!session || !session->session_active) {
         log_error("BOOT", "Android MTP session not active!");
         sound_error_tone();
@@ -367,23 +370,30 @@ static void boot_from_android_mtp(mtp_session_t *session, boot_info_t *boot_info
         return;
     }
 
-    char target_file[64] = {0};
-    if (mtp_find_boot_file(mtp_src, target_file, sizeof(target_file)) != 0) {
-        log_error("BOOT", "No bootable kernel or ISO found in Android /Download/!");
-        sound_error_tone();
-        return;
-    }
+    if (selected && selected->mtp_handle != 0 && selected->file_size > 0) {
+        mtp_source_set_target(mtp_src, selected->mtp_handle, selected->file_size);
+        log_info("BOOT", "Selected MTP image: '%s' (Handle 0x%08X, %u MB)",
+                 selected->filename, selected->mtp_handle, (uint32_t)(selected->file_size / 1024 / 1024));
+    } else {
+        char target_file[64] = {0};
+        if (mtp_find_boot_file(mtp_src, target_file, sizeof(target_file)) != 0) {
+            log_error("BOOT", "No bootable kernel or ISO found on Android phone!");
+            sound_error_tone();
+            return;
+        }
 
-    log_info("BOOT", "Boot image found on Android phone: '%s'", target_file);
-    if (mtp_src->open(mtp_src, target_file) != 0) {
-        log_error("BOOT", "Failed to open '%s' on Android phone!", target_file);
-        sound_error_tone();
-        return;
+        log_info("BOOT", "Boot image found on Android phone: '%s'", target_file);
+        if (mtp_src->open(mtp_src, target_file) != 0) {
+            log_error("BOOT", "Failed to open '%s' on Android phone!", target_file);
+            sound_error_tone();
+            return;
+        }
     }
 
     uint64_t fsize = mtp_src->size(mtp_src);
-    log_info("BOOT", "Opened '%s' (%u MB). Inspecting...",
-             target_file, (uint32_t)(fsize / 1024 / 1024));
+    log_info("BOOT", "Opened '%s' (%u MB). Inspecting ISO boot files...",
+             (selected && selected->filename[0]) ? selected->filename : "image",
+             (uint32_t)(fsize / 1024 / 1024));
 
     iso_boot_files_t iso_files;
     if (iso_find_boot_files(mtp_src, &iso_files) == 0 && iso_files.found_kernel) {
@@ -419,7 +429,7 @@ static void boot_from_android_mtp(mtp_session_t *session, boot_info_t *boot_info
             uint32_t mb_streamed = streamed >> 20;
             uint32_t mb_total = total_iso_bytes >> 20;
             uint32_t pct = mb_total ? ((mb_streamed * 100) / mb_total) : 0;
-            if (pct >= last_pct + 10 || streamed == total_iso_bytes) {
+            if (pct >= last_pct + 5 || streamed == total_iso_bytes) {
                 log_info("BOOT", "  Streaming ISO: %u%% (%u MB / %u MB)...",
                          pct, mb_streamed, mb_total);
                 last_pct = pct;
@@ -517,6 +527,33 @@ static void boot_from_sd_fat(os_entry_t *entry, boot_info_t *boot_info) {
     }
 }
 
+static void load_dynamic_adb_key(uint8_t boot_drive) {
+    static uint8_t sector_buf[512];
+    if (bios_disk_read(boot_drive, 0, 1, sector_buf) != 0) return;
+
+    uint32_t part1_lba = *(uint32_t *)(&sector_buf[446 + 8]);
+    if (part1_lba == 0) part1_lba = 2048;
+
+    boot_source_t *fat_src = boot_source_fat_create(sd_read_sectors, (void *)(uintptr_t)boot_drive, part1_lba);
+    if (!fat_src) return;
+
+    if (fat_src->open(fat_src, "ADBKEY.PUB") == 0) {
+        uint32_t fsize = (uint32_t)fat_src->size(fat_src);
+        if (fsize > 0 && fsize < 1024) {
+            static char key_buf[1024];
+            uint32_t nread = fat_src->read(fat_src, key_buf, fsize);
+            if (nread > 0) {
+                while (nread > 0 && (key_buf[nread - 1] == '\r' || key_buf[nread - 1] == '\n' || key_buf[nread - 1] == ' ')) {
+                    nread--;
+                }
+                key_buf[nread] = '\0';
+                adb_set_public_key(key_buf, nread);
+            }
+        }
+    }
+    fat_src->close(fat_src);
+}
+
 void c_main(boot_info_t *boot_info) {
     // 1. Initialize Serial Port & VGA Console
     serial_init();
@@ -544,6 +581,15 @@ void c_main(boot_info_t *boot_info) {
     log_info("STAGE3", "Phase 2 Memory Management Successfully Verified!");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
+    // Dynamic ADB Authentication Key (Loaded from FAT32 boot drive if present)
+    load_dynamic_adb_key((uint8_t)boot_info->boot_drive);
+
+    bool phone_prompted = false;
+    bool mtp_found = false;
+    uint32_t probed_ports = 0;
+    uint8_t probe_fail_count[32] = {0};
+    usb_device_t current_dev;
+
     // 6. PCI Bus Enumeration (xHCI Host Controller Discovery)
     pci_init();
 
@@ -566,16 +612,13 @@ void c_main(boot_info_t *boot_info) {
             log_info("STAGE3", "Phase 3 xHCI Controller Initialization Successfully Verified!");
             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-            bool phone_prompted = false;
-            bool mtp_found = false;
-            uint32_t probed_ports = 0;
-            uint8_t probe_fail_count[32] = {0};
-
             // Initial scan of connected USB devices
-            usb_device_t current_dev;
             for (uint8_t p = 1; p <= xhci_ctrl.max_ports && p < 32; p++) {
                 uintptr_t port_reg = xhci_ctrl.op_regs + XHCI_OP_PORTS_BASE + (p - 1) * 0x10;
                 uint32_t portsc = *(volatile uint32_t *)port_reg;
+                if (portsc != 0 && portsc != 0x000002A0) {
+                    log_info("XHCI", "Port %u: PORTSC = 0x%08X", p, portsc);
+                }
 
                 if (!(portsc & XHCI_PORT_CCS)) continue;
 
@@ -588,11 +631,14 @@ void c_main(boot_info_t *boot_info) {
                     log_info("STAGE3", "Phase 4 USB Enumeration Successfully Verified!");
                     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-                    if (current_dev.has_adb) {
-                        log_info("STAGE3", "Port %u: Android ADB interface detected! Initializing Strategy A root handshake...", p);
-                        adb_session_t adb_sess;
-                        if (adb_init_session(&current_dev, &adb_sess) == 0) {
-                            adb_trigger_mass_storage(&adb_sess, NULL);
+                    if (current_dev.has_adb || current_dev.has_mtp) {
+                        detected_usb_dev = current_dev;
+                    }
+
+                    if (detected_usb_dev.has_adb && !active_adb_session.is_connected) {
+                        log_info("STAGE3", "Port %u: Android ADB interface detected! Initializing ADB Root Bridge...", p);
+                        if (adb_init_session(&detected_usb_dev, &active_adb_session) == 0) {
+                            log_info("STAGE3", "ADB Root Bridge connected! Phone can switch to USB Mass Storage (0 MB in RAM).");
                         }
                     }
 
@@ -603,8 +649,7 @@ void c_main(boot_info_t *boot_info) {
                         if (detected_usb_dev.slot_id == 0) {
                             detected_usb_dev = current_dev;
                         }
-                    } else if (current_dev.has_mtp) {
-                        detected_usb_dev = current_dev;
+                    } else if (detected_usb_dev.has_mtp && !active_mtp_session.session_active) {
                         log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
                         int mtp_res = mtp_init_session(&detected_usb_dev, &active_mtp_session);
                         if (mtp_res == 0) {
@@ -627,6 +672,7 @@ void c_main(boot_info_t *boot_info) {
                             sound_prompt_tone();
                             phone_prompted = true;
                         }
+                        probed_ports &= ~(1U << p);
                     }
                 }
             }
@@ -668,7 +714,26 @@ void c_main(boot_info_t *boot_info) {
                         log_info("STAGE3", "Phase 4 USB Enumeration Successfully Verified!");
                         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-                        if (current_dev.has_mtp) {
+                        if (current_dev.has_adb || current_dev.has_mtp) {
+                            detected_usb_dev = current_dev;
+                        }
+
+                        if (detected_usb_dev.has_adb && !active_adb_session.is_connected) {
+                            log_info("STAGE3", "Port %u: Android ADB interface detected! Initializing ADB Root Bridge...", p);
+                            if (adb_init_session(&detected_usb_dev, &active_adb_session) == 0) {
+                                log_info("STAGE3", "ADB Root Bridge connected! Phone can switch to USB Mass Storage (0 MB in RAM).");
+                            }
+                        }
+
+                        if (current_dev.has_msc) {
+                            log_info("STAGE3", "Port %u: USB Mass Storage Block Storage registered.", p);
+                            detected_msc_dev = current_dev;
+                            msc_found = true;
+                            if (detected_usb_dev.slot_id == 0) {
+                                detected_usb_dev = current_dev;
+                            }
+                            break;
+                        } else if (current_dev.has_mtp) {
                             detected_usb_dev = current_dev;
                             log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
                             int mtp_res = mtp_init_session(&detected_usb_dev, &active_mtp_session);
@@ -684,14 +749,8 @@ void c_main(boot_info_t *boot_info) {
                                 mtp_found = true;
                                 break;
                             }
-                        } else if (current_dev.has_msc) {
-                            log_info("STAGE3", "Port %u: USB Mass Storage Block Storage registered.", p);
-                            detected_msc_dev = current_dev;
-                            msc_found = true;
-                            if (detected_usb_dev.slot_id == 0) {
-                                detected_usb_dev = current_dev;
-                            }
-                            break;
+                        } else {
+                            probed_ports &= ~(1U << p);
                         }
                     } else {
                         probe_fail_count[p]++;
@@ -711,56 +770,244 @@ void c_main(boot_info_t *boot_info) {
     log_info("STAGE3", "Phase 1 Legacy BIOS Bootstrap Successfully Verified!");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-    // Phase 10: Scan Connected Storage & Display Dynamic Interactive Boot Menu
-    os_registry_t os_reg;
-    os_scan_all_storages(boot_info, &xhci_ctrl,
-                         msc_found ? &detected_msc_dev : NULL,
-                         active_mtp_session.session_active ? &active_mtp_session : NULL,
-                         &os_reg);
+    while (1) {
+        // Phase 10: Scan Connected Storage & Display Dynamic Interactive Boot Menu
+        os_registry_t os_reg;
+        os_scan_all_storages(boot_info, &xhci_ctrl,
+                             msc_found ? &detected_msc_dev : NULL,
+                             active_mtp_session.session_active ? &active_mtp_session : NULL,
+                             active_adb_session.is_connected ? &active_adb_session : NULL,
+                             &os_reg);
 
-    menu_render(boot_info, &xhci_ctrl, &detected_usb_dev, &active_mtp_session, &os_reg);
+        menu_render(boot_info, &xhci_ctrl, &detected_usb_dev, &active_mtp_session, &os_reg);
 
-    // Wait for explicit user selection (no auto-boot countdown)
-    menu_selection_t choice = menu_wait_selection(&os_reg);
+        // Wait for explicit user selection
+        menu_selection_t choice = menu_wait_selection(&os_reg);
 
-    switch (choice.type) {
-        case MENU_ACTION_BOOT_OS: {
-            if (choice.os_index < os_reg.count) {
-                os_entry_t *selected = &os_reg.entries[choice.os_index];
-                log_info("BOOT", "Booting selected OS #%u: '%s'...", choice.os_index + 1, selected->title);
-
-                if (selected->profile_count > 1) {
-                    selected->selected_profile = menu_select_persistence_profile(selected);
-                }
-                const persistence_profile_t *prof = (selected->profile_count > 0) ?
-                    &selected->profiles[selected->selected_profile] : NULL;
-
-                if (selected->approach == BOOT_APPROACH_BLOCK_ON_DEMAND) {
-                    if (selected->storage_type == OS_STORAGE_BLOCK_USB) {
-                        boot_from_usb_msc(selected->usb_dev, boot_info, prof);
-                    } else if (selected->storage_type == OS_STORAGE_BLOCK_SD) {
-                        boot_from_sd_fat(selected, boot_info);
-                    }
-                } else if (selected->approach == BOOT_APPROACH_MTP_IN_RAM) {
-                    if (active_mtp_session.session_active) {
-                        boot_from_android_mtp(&active_mtp_session, boot_info, prof);
-                    } else {
-                        boot_from_in_ram_iso(selected, boot_info, prof);
+        if (choice.type == MENU_ACTION_RESCAN) {
+            log_info("STAGE3", "Rescanning USB ports for Android phone / USB storage...");
+            probed_ports = 0;
+            k_memset(probe_fail_count, 0, sizeof(probe_fail_count));
+            for (uint8_t p = 1; p <= xhci_ctrl.max_ports && p < 32; p++) {
+                uintptr_t port_reg = xhci_ctrl.op_regs + XHCI_OP_PORTS_BASE + (p - 1) * 0x10;
+                uint32_t portsc = *(volatile uint32_t *)port_reg;
+                if (portsc & XHCI_PORT_CCS) {
+                    k_memset(&current_dev, 0, sizeof(current_dev));
+                    if (usb_probe_port(&xhci_ctrl, p, &current_dev) == 0) {
+                        probed_ports |= (1U << p);
+                        if (current_dev.has_adb || current_dev.has_mtp) {
+                            detected_usb_dev = current_dev;
+                        }
+                        if (detected_usb_dev.has_adb && !active_adb_session.is_connected) {
+                            adb_init_session(&detected_usb_dev, &active_adb_session);
+                        }
+                        if (current_dev.has_msc) {
+                            detected_msc_dev = current_dev;
+                            msc_found = true;
+                            if (detected_usb_dev.slot_id == 0) detected_usb_dev = current_dev;
+                        } else if (detected_usb_dev.has_mtp && !active_mtp_session.session_active) {
+                            if (mtp_init_session(&detected_usb_dev, &active_mtp_session) == 0) {
+                                mtp_found = true;
+                            }
+                        }
                     }
                 }
             }
-            break;
+            continue;
         }
 
-        case MENU_ACTION_DIAGNOSTICS:
-            menu_show_diagnostics(boot_info, &xhci_ctrl, &detected_usb_dev, &active_mtp_session);
-            test_linux_boot_simulation(boot_info);
-            break;
+        if (choice.type == MENU_ACTION_SWITCH_UMS) {
+            active_adb_session.usb_dev = &detected_usb_dev;
+            if (!active_adb_session.is_connected && detected_usb_dev.has_adb) {
+                adb_init_session(&detected_usb_dev, &active_adb_session);
+            }
+            if (active_adb_session.is_connected) {
+                int img_idx = menu_select_phone_image(&os_reg);
+                if (img_idx < 0 || img_idx >= (int)os_reg.count) {
+                    continue;
+                }
+                os_entry_t *sel_img = &os_reg.entries[img_idx];
 
-        case MENU_ACTION_SELF_TEST:
-        default:
-            test_linux_boot_simulation(boot_info);
-            break;
+                if (sel_img->profile_count > 1) {
+                    sel_img->selected_profile = menu_select_persistence_profile(sel_img);
+                }
+                const persistence_profile_t *prof = (sel_img->profile_count > 0) ?
+                    &sel_img->profiles[sel_img->selected_profile] : NULL;
+
+                vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+                log_info("STAGE3", "Attaching '%s' as USB Mass Storage...", sel_img->filename);
+                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                disk_log_flush();
+                int trg_res = adb_trigger_mass_storage(&active_adb_session, sel_img->filename);
+                disk_log_flush();
+
+                // Try to reprobe as MSC regardless of trigger result code.
+                // The phone's background job runs independently — even if the ADB
+                // shell response was lost due to USB bus disruption, the UDC switch
+                // may still complete successfully.
+                usb_device_t msc_dev;
+                k_memset(&msc_dev, 0, sizeof(msc_dev));
+                msc_dev.slot_id = detected_usb_dev.slot_id;
+
+                if (trg_res != 0 && trg_res != -2) {
+                    // Trigger reported an error, but the phone may still be switching.
+                    // Wait a moment and try reprobe anyway.
+                    log_info("STAGE3", "Trigger returned %d, but phone may still be switching. Waiting 4 sec...", trg_res);
+                    for (int w = 0; w < 4000000; w++) io_wait();
+                    disk_log_flush();
+                }
+
+                if (trg_res == -2) {
+                    // Phone kernel doesn't support UMS at all — no point reprobing
+                    vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+                    log_error("STAGE3", "Phone kernel does not have USB Mass Storage support.");
+                    vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
+                    log_info("STAGE3", "Press any key to return to menu...");
+                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                    menu_get_char();
+                } else if (usb_reprobe_as_msc(&xhci_ctrl, detected_usb_dev.port_num, &msc_dev, 15) == 0) {
+                    detected_msc_dev = msc_dev;
+                    detected_usb_dev = msc_dev;
+                    msc_found = true;
+                    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                    log_info("STAGE3", "SUCCESS: Phone is now operating as a Hardware USB Mass Storage Drive!");
+                    log_info("BOOT", "Booting '%s' with Direct Block Access (0 MB in RAM)...", sel_img->title);
+                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                    disk_log_flush();
+                    boot_from_usb_msc(&msc_dev, boot_info, prof);
+                    break;
+                } else {
+                    vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+                    log_error("STAGE3", "Phone did not re-enumerate as USB Mass Storage device within timeout.");
+                    vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
+                    log_info("STAGE3", "Press any key to return to menu...");
+                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                    disk_log_flush();
+                    menu_get_char();
+                }
+            } else {
+                vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+                log_error("STAGE3", "No authorized ADB session active!");
+                vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
+                log_info("STAGE3", "1. Enable 'USB Debugging' in Phone Settings -> Developer Options.");
+                log_info("STAGE3", "2. Ensure Shell has Root access in Magisk app.");
+                log_info("STAGE3", "3. Press 'R' to rescan, then press 'U' to switch to USB Mass Storage.");
+                log_info("STAGE3", "Press any key to return to menu...");
+                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                menu_get_char();
+            }
+            continue;
+        }
+
+        switch (choice.type) {
+            case MENU_ACTION_BOOT_OS: {
+                if (choice.os_index < os_reg.count) {
+                    os_entry_t *selected = &os_reg.entries[choice.os_index];
+                    log_info("BOOT", "Booting selected OS #%u: '%s'...", choice.os_index + 1, selected->title);
+                    disk_log_flush();
+
+                    if (selected->profile_count > 1) {
+                        selected->selected_profile = menu_select_persistence_profile(selected);
+                    }
+                    const persistence_profile_t *prof = (selected->profile_count > 0) ?
+                        &selected->profiles[selected->selected_profile] : NULL;
+
+                    bool ums_booted = false;
+                    // If image is on Android MTP and ADB is available, try Root USB Mass Storage switch first!
+                    if (selected->approach == BOOT_APPROACH_MTP_IN_RAM) {
+                        active_adb_session.usb_dev = &detected_usb_dev;
+                        if (!active_adb_session.is_connected && detected_usb_dev.has_adb) {
+                            adb_init_session(&detected_usb_dev, &active_adb_session);
+                        }
+                        if (active_adb_session.is_connected) {
+                            vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+                            log_info("BOOT", "Root ADB active! Attaching '%s' to USB Mass Storage (0 MB RAM)...", selected->filename);
+                            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                            disk_log_flush();
+                            int trg = adb_trigger_mass_storage(&active_adb_session, selected->filename);
+                            disk_log_flush();
+
+                            // Try to reprobe as MSC regardless of trigger result.
+                            // The phone's background job runs independently — even if the ADB
+                            // response was garbled by USB bus disruption, the switch may succeed.
+                            if (trg != -2) { // -2 = kernel doesn't have UMS support at all
+                                if (trg != 0) {
+                                    log_info("BOOT", "Trigger returned %d, but phone may still switch. Waiting 4 sec...", trg);
+                                    for (int w = 0; w < 4000000; w++) io_wait();
+                                    disk_log_flush();
+                                }
+
+                                usb_device_t msc_dev;
+                                k_memset(&msc_dev, 0, sizeof(msc_dev));
+                                msc_dev.slot_id = detected_usb_dev.slot_id;
+                                if (usb_reprobe_as_msc(&xhci_ctrl, detected_usb_dev.port_num, &msc_dev, 15) == 0) {
+                                    detected_msc_dev = msc_dev;
+                                    detected_usb_dev = msc_dev;
+                                    msc_found = true;
+                                    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                                    log_info("BOOT", "Phone switched to USB Mass Storage! Booting with Direct Block Access (0 MB in RAM)...");
+                                    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                                    disk_log_flush();
+                                    boot_from_usb_msc(&msc_dev, boot_info, prof);
+                                    ums_booted = true;
+                                    break;
+                                } else {
+                                    log_info("BOOT", "MSC re-enumeration timed out. Phone did not switch to block device.");
+                                    disk_log_flush();
+                                }
+                            }
+                        }
+
+                        if (!ums_booted) {
+                            vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
+                            log_info("BOOT", "UMS direct block access not active for '%s'.", selected->filename);
+                            log_info("BOOT", "Stream full image into RAM via MTP? (Press 'Y' to stream, any other key to cancel): ");
+                            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                            disk_log_flush();
+                            char ans = (char)menu_get_char();
+                            if (ans != 'y' && ans != 'Y') {
+                                log_info("BOOT", "MTP RAM boot cancelled by user. Returning to menu...");
+                                disk_log_flush();
+                                for (int w = 0; w < 1000000; w++) io_wait();
+                                continue;
+                            }
+                        }
+                    }
+
+                    if (!ums_booted) {
+                        if (selected->approach == BOOT_APPROACH_BLOCK_ON_DEMAND) {
+                            if (selected->storage_type == OS_STORAGE_BLOCK_USB) {
+                                boot_from_usb_msc(selected->usb_dev, boot_info, prof);
+                            } else if (selected->storage_type == OS_STORAGE_BLOCK_SD) {
+                                boot_from_sd_fat(selected, boot_info);
+                            }
+                        } else if (selected->approach == BOOT_APPROACH_MTP_IN_RAM) {
+                            if (active_mtp_session.session_active) {
+                                boot_from_android_mtp(selected, boot_info, prof);
+                            } else {
+                                boot_from_in_ram_iso(selected, boot_info, prof);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+
+            case MENU_ACTION_DIAGNOSTICS:
+                menu_show_diagnostics(boot_info, &xhci_ctrl, &detected_usb_dev, &active_mtp_session);
+                test_linux_boot_simulation(boot_info);
+                disk_log_flush();
+                continue; // Return to menu after diagnostics
+
+            case MENU_ACTION_SELF_TEST:
+                test_linux_boot_simulation(boot_info);
+                disk_log_flush();
+                continue; // Return to menu after self-test
+
+            default:
+                continue;
+        }
+        break;
     }
 
     // Boot-end summary: log flush statistics for diagnostics

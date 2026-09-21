@@ -62,14 +62,24 @@ def build_qemu_command(mode, iso_path, memory, headless, usb_host):
 
     if usb_host:
         # Pass-through physical USB device (e.g. your physical Android phone)
-        # Format: vid:pid (e.g. 18d1:4ee7 or 2717:ff40)
-        parts = usb_host.split(":")
-        if len(parts) == 2:
-            vid, pid = parts[0], parts[1]
-            cmd.extend(["-device", f"usb-host,bus=xhci.0,vendorid=0x{vid},productid=0x{pid}"])
-            print(f"[+] Attached physical USB device ({vid}:{pid}) to xHCI via usb-host pass-through.")
+        # Supports:
+        #   1. VID only (e.g. 2717 or 18d1) - preserves connection across dynamic PID changes!
+        #   2. VID:PID (e.g. 18d1:4ee2)
+        #   3. hostbus:hostport (e.g. 1:2)
+        if ":" in usb_host:
+            parts = usb_host.split(":")
+            if len(parts) == 2:
+                vid, pid = parts[0], parts[1]
+                cmd.extend(["-device", f"usb-host,bus=xhci.0,vendorid=0x{vid},productid=0x{pid}"])
+                print(f"[+] Attached physical USB device (VID:0x{vid} PID:0x{pid}) to xHCI pass-through.")
+        elif "." in usb_host:
+            parts = usb_host.split(".")
+            cmd.extend(["-device", f"usb-host,bus=xhci.0,hostbus={parts[0]},hostport={parts[1]}"])
+            print(f"[+] Attached physical USB port (Bus {parts[0]} Port {parts[1]}) to xHCI pass-through.")
         else:
-            print(f"[-] Invalid --usb-host format: {usb_host} (expected VID:PID, e.g. 2717:ff40)")
+            # Vendor ID only: vital for dynamic gadget switching where PID changes!
+            cmd.extend(["-device", f"usb-host,bus=xhci.0,vendorid=0x{usb_host}"])
+            print(f"[+] Attached physical USB vendor (VID:0x{usb_host}) to xHCI pass-through (survives dynamic PID switch).")
 
     elif mode in ["block", "ubuntu"]:
         # Pathway 2: Rooted Phone / USB Mass Storage emulation (Ubuntu 6GB)

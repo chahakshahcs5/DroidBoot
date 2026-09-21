@@ -3,10 +3,20 @@
 #include "../debug/vga.h"
 #include "../debug/disk_log.h"
 
+static uint32_t newline_counter = 0;
+
 static void putc_both(char c) {
     serial_putchar(c);
     vga_putchar(c);
     disk_log_putc(c);
+    if (c == '\n') {
+        newline_counter++;
+        // Every 20 newlines, auto-flush log to disk so printk output is captured
+        if (newline_counter >= 20) {
+            newline_counter = 0;
+            disk_log_auto_flush_if_needed();
+        }
+    }
 }
 
 static void puts_both(const char *s) {

@@ -15,11 +15,13 @@
 typedef struct disk_log_header {
     uint32_t magic1;        // "BOOT" (0x544F4F42)
     uint32_t magic2;        // "LOG!" (0x21474F4C)
-    uint32_t log_length;    // Bytes in log buffer
+    uint32_t log_length;    // Bytes in log buffer (up to DISK_LOG_BUFFER_SIZE)
     uint32_t flush_count;   // Monotonic flush counter
     uint32_t boot_drive;    // BIOS boot drive
     uint32_t error_count;   // Total flush errors encountered
-    uint8_t  reserved[488]; // Pad to 512-byte sector
+    uint32_t log_start;     // Start offset in circular buffer (0 if not wrapped)
+    uint32_t total_written; // Total bytes ever written (monotonic, for reader tools)
+    uint8_t  reserved[480]; // Pad to 512-byte sector
 } __attribute__((packed)) disk_log_header_t;
 
 // Initialize disk logging subsystem and resolve FAT32 BOOTLOG.TXT
@@ -34,6 +36,10 @@ void disk_log_flush(void);
 // Flush with PC speaker audio feedback (beep on success, buzz on failure)
 // Use this for critical checkpoints when screen is broken
 void disk_log_flush_with_feedback(void);
+
+// Auto-flush if enough new data has accumulated since last flush (≥4KB)
+// Call this periodically from printk to ensure output is captured
+void disk_log_auto_flush_if_needed(void);
 
 // Register native USB Mass Storage device for persistent logging after xHCI takeover
 void disk_log_register_usb_msc(void *usb_dev);

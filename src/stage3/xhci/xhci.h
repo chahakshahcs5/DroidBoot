@@ -44,6 +44,7 @@ void xhci_poll_ports(xhci_controller_t *ctrl);
 int  xhci_reset_port(xhci_controller_t *ctrl, uint8_t port_id);
 int  xhci_send_command(xhci_controller_t *ctrl, xhci_trb_t *cmd, xhci_trb_t *event_out);
 int  xhci_enable_slot(xhci_controller_t *ctrl, uint8_t *slot_id_out);
+int  xhci_disable_slot(xhci_controller_t *ctrl, uint8_t slot_id);
 void xhci_stop(xhci_controller_t *ctrl);
 
 #endif // XHCI_H

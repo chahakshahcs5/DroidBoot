@@ -412,6 +412,20 @@ int xhci_enable_slot(xhci_controller_t *ctrl, uint8_t *slot_id_out) {
     return res;
 }
 
+int xhci_disable_slot(xhci_controller_t *ctrl, uint8_t slot_id) {
+    if (!ctrl || slot_id == 0) return -1;
+    xhci_trb_t cmd;
+    cmd.parameter = 0;
+    cmd.status = 0;
+    cmd.control = TRB_TYPE(TRB_DISABLE_SLOT_CMD) | ((uint32_t)slot_id << 24);
+    xhci_trb_t evt;
+    int res = xhci_send_command(ctrl, &cmd, &evt);
+    if (res == 0) {
+        log_info("XHCI", "Slot %u disabled cleanly.", slot_id);
+    }
+    return res;
+}
+
 void xhci_stop(xhci_controller_t *ctrl) {
     if (!ctrl || !ctrl->op_regs) return;
 

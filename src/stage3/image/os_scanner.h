@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include "../usb/usb.h"
 #include "../mtp/mtp.h"
+#include "../adb/adb.h"
 #include "../filesystem/iso_reader.h"
 #include "../../include/boot.h"
 #include "../xhci/xhci.h"
@@ -67,6 +68,7 @@ int  os_scan_all_storages(boot_info_t *boot_info,
                           xhci_controller_t *xhci,
                           usb_device_t *msc_dev,
                           mtp_session_t *mtp_session,
+                          adb_session_t *adb_session,
                           os_registry_t *out_registry);
 
 #endif // OS_SCANNER_H

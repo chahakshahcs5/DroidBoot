@@ -142,6 +142,13 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
     out_dev->ctrl = ctrl;
     out_dev->port_num = port_num;
     out_dev->speed = speed;
+    for (int i = 0; i < 32; i++) {
+        out_dev->ep_rings[i] = NULL;
+        out_dev->ep_enqueue_idx[i] = 0;
+        out_dev->ep_cycle_state[i] = 0;
+    }
+    out_dev->bulk_in_ring = NULL;
+    out_dev->bulk_out_ring = NULL;
 
     // 2. Enable Slot
     uint8_t slot_id = 0;
@@ -470,6 +477,12 @@ int usb_configure_bulk_endpoints(usb_device_t *dev, uint8_t in_ep, uint16_t in_m
     *(uint64_t *)(&ep_in_ctx[2]) = (uintptr_t)dev->bulk_in_ring | 1U;
     ep_in_ctx[4] = in_max_packet;
 
+    if (in_ep_ctx_idx < 32) {
+        dev->ep_rings[in_ep_ctx_idx] = dev->bulk_in_ring;
+        dev->ep_enqueue_idx[in_ep_ctx_idx] = 0;
+        dev->ep_cycle_state[in_ep_ctx_idx] = 1;
+    }
+
     // Bulk OUT Endpoint Context
     uint32_t *ep_out_ctx = (uint32_t *)(input_ctx + (out_ep_ctx_idx + 1) * ctx_sz);
     ep_out_ctx[0] = 0;
@@ -488,6 +501,12 @@ int usb_configure_bulk_endpoints(usb_device_t *dev, uint8_t in_ep, uint16_t in_m
     dev->bulk_out_cycle_state = 1;
     *(uint64_t *)(&ep_out_ctx[2]) = (uintptr_t)dev->bulk_out_ring | 1U;
     ep_out_ctx[4] = out_max_packet;
+
+    if (out_ep_ctx_idx < 32) {
+        dev->ep_rings[out_ep_ctx_idx] = dev->bulk_out_ring;
+        dev->ep_enqueue_idx[out_ep_ctx_idx] = 0;
+        dev->ep_cycle_state[out_ep_ctx_idx] = 1;
+    }
 
     // Send Configure Endpoint Command
     xhci_trb_t cfg_cmd;
@@ -529,11 +548,22 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
 
     uint8_t ep_num = ep_addr & 0x0F;
     bool is_in = (ep_addr & 0x80) != 0;
-    uint32_t doorbell_target = (ep_num * 2) + (is_in ? 1 : 0);
+    uint8_t ep_ctx_idx = (ep_num * 2) + (is_in ? 1 : 0);
+    uint32_t doorbell_target = ep_ctx_idx;
 
-    xhci_trb_t *ring = is_in ? dev->bulk_in_ring : dev->bulk_out_ring;
-    uint32_t *enqueue_idx_ptr = is_in ? &dev->bulk_in_enqueue_idx : &dev->bulk_out_enqueue_idx;
-    uint8_t *cycle_ptr = is_in ? &dev->bulk_in_cycle_state : &dev->bulk_out_cycle_state;
+    xhci_trb_t *ring = NULL;
+    uint32_t *enqueue_idx_ptr = NULL;
+    uint8_t *cycle_ptr = NULL;
+
+    if (ep_ctx_idx < 32 && dev->ep_rings[ep_ctx_idx]) {
+        ring = dev->ep_rings[ep_ctx_idx];
+        enqueue_idx_ptr = &dev->ep_enqueue_idx[ep_ctx_idx];
+        cycle_ptr = &dev->ep_cycle_state[ep_ctx_idx];
+    } else {
+        ring = is_in ? dev->bulk_in_ring : dev->bulk_out_ring;
+        enqueue_idx_ptr = is_in ? &dev->bulk_in_enqueue_idx : &dev->bulk_out_enqueue_idx;
+        cycle_ptr = is_in ? &dev->bulk_in_cycle_state : &dev->bulk_out_cycle_state;
+    }
 
     if (!ring) {
         log_error("USB", "Bulk endpoint 0x%02X ring not initialized!", ep_addr);
@@ -607,6 +637,106 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
     return -100;
 }
 
+int usb_bulk_transfer_wait(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t len, uint32_t *transferred_out, int max_seconds) {
+    if (!dev || !data || len == 0) return -1;
+
+    xhci_controller_t *ctrl = dev->ctrl;
+    uint8_t slot_id = dev->slot_id;
+
+    uint8_t ep_num = ep_addr & 0x0F;
+    bool is_in = (ep_addr & 0x80) != 0;
+    uint8_t ep_ctx_idx = (ep_num * 2) + (is_in ? 1 : 0);
+    uint32_t doorbell_target = ep_ctx_idx;
+
+    xhci_trb_t *ring = NULL;
+    uint32_t *enqueue_idx_ptr = NULL;
+    uint8_t *cycle_ptr = NULL;
+
+    if (ep_ctx_idx < 32 && dev->ep_rings[ep_ctx_idx]) {
+        ring = dev->ep_rings[ep_ctx_idx];
+        enqueue_idx_ptr = &dev->ep_enqueue_idx[ep_ctx_idx];
+        cycle_ptr = &dev->ep_cycle_state[ep_ctx_idx];
+    } else {
+        ring = is_in ? dev->bulk_in_ring : dev->bulk_out_ring;
+        enqueue_idx_ptr = is_in ? &dev->bulk_in_enqueue_idx : &dev->bulk_out_enqueue_idx;
+        cycle_ptr = is_in ? &dev->bulk_in_cycle_state : &dev->bulk_out_cycle_state;
+    }
+
+    if (!ring) {
+        log_error("USB", "Bulk endpoint 0x%02X ring not initialized!", ep_addr);
+        return -2;
+    }
+
+    uint32_t idx = *enqueue_idx_ptr;
+    uint8_t cur_cycle = *cycle_ptr;
+    xhci_trb_t *trb = &ring[idx];
+
+    trb->parameter = (uintptr_t)data;
+    trb->status = len;
+    trb->control = TRB_TYPE(TRB_NORMAL) | TRB_IOC | (is_in ? TRB_ISP : 0U) | (cur_cycle ? 1U : 0U);
+
+    idx++;
+    if (idx >= 64 - 1) {
+        ring[63].parameter = (uintptr_t)ring;
+        ring[63].control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE_CYCLE | (cur_cycle ? 1U : 0U);
+        idx = 0;
+        *cycle_ptr ^= 1;
+    }
+    *enqueue_idx_ptr = idx;
+
+    uintptr_t trb_phys = (uintptr_t)trb;
+
+    // Ring endpoint doorbell ONCE
+    uintptr_t db_reg = ctrl->db_regs + slot_id * 4;
+    xhci_write32(db_reg, doorbell_target);
+
+    // Poll Event Ring for Transfer Event across max_seconds
+    for (int sec = max_seconds; sec > 0; sec--) {
+        // 100 slices of 10,000 io_waits = ~1 second total per second iteration
+        for (int slice = 0; slice < 100; slice++) {
+            xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
+            uint32_t cycle = evt->control & 1U;
+
+            if (cycle == ctrl->event_cycle_state) {
+                uint32_t type = (evt->control >> TRB_TYPE_SHIFT) & 0x3F;
+                if (type == TRB_TRANSFER_EVENT) {
+                    if (evt->parameter == trb_phys) {
+                        ctrl->event_dequeue_idx++;
+                        if (ctrl->event_dequeue_idx == XHCI_EVENT_RING_TRBS) {
+                            ctrl->event_dequeue_idx = 0;
+                            ctrl->event_cycle_state ^= 1;
+                        }
+                        uintptr_t intr0 = ctrl->rt_regs + 0x20;
+                        uintptr_t erdp = (uintptr_t)&ctrl->event_ring[ctrl->event_dequeue_idx];
+                        xhci_write64(intr0 + XHCI_INTR_ERDP, erdp | XHCI_ERDP_EHB);
+
+                        uint8_t cc = (uint8_t)((evt->status >> 24) & 0xFF);
+                        uint32_t rem = evt->status & 0xFFFFFF;
+                        if (transferred_out) {
+                            *transferred_out = len - rem;
+                        }
+                        return (cc == TRB_COMPL_SUCCESS || cc == TRB_COMPL_SHORT_TX) ? 0 : (int)cc;
+                    }
+                }
+
+                ctrl->event_dequeue_idx++;
+                if (ctrl->event_dequeue_idx == XHCI_EVENT_RING_TRBS) {
+                    ctrl->event_dequeue_idx = 0;
+                    ctrl->event_cycle_state ^= 1;
+                }
+                uintptr_t intr0 = ctrl->rt_regs + 0x20;
+                uintptr_t erdp = (uintptr_t)&ctrl->event_ring[ctrl->event_dequeue_idx];
+                xhci_write64(intr0 + XHCI_INTR_ERDP, erdp | XHCI_ERDP_EHB);
+            }
+
+            for (int w = 0; w < 10000; w++) io_wait();
+        }
+    }
+
+    log_error("USB", "Bulk transfer authorization timed out on EP 0x%02X!", ep_addr);
+    return -100;
+}
+
 int usb_get_string_descriptor(usb_device_t *dev, uint8_t index, char *out_str, uint16_t max_len) {
     if (!dev || index == 0 || !out_str || max_len == 0) return -1;
     out_str[0] = '\0';
@@ -638,3 +768,58 @@ int usb_get_string_descriptor(usb_device_t *dev, uint8_t index, char *out_str, u
     out_str[out_idx] = '\0';
     return 0;
 }
+
+int usb_reprobe_as_msc(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_msc_dev, int max_wait_sec) {
+    if (!ctrl || !out_msc_dev || port_num == 0) return -1;
+
+    uintptr_t port_reg = ctrl->op_regs + XHCI_OP_PORTS_BASE + (port_num - 1) * 0x10;
+    if (max_wait_sec < 15) max_wait_sec = 15;
+
+    log_info("USB", "Awaiting USB Mass Storage re-enumeration on Port %u (timeout %d sec)...",
+             port_num, max_wait_sec);
+
+    // Disable previous slot if active
+    if (out_msc_dev->slot_id > 0) {
+        xhci_disable_slot(ctrl, out_msc_dev->slot_id);
+        out_msc_dev->slot_id = 0;
+    }
+
+    // Wait 2.5 seconds for phone UDC unbind & ConfigFS rebind to execute
+    for (int w = 0; w < 2500000; w++) io_wait();
+
+    int iterations = max_wait_sec * 10; // 100ms per iteration
+    for (int iter = 0; iter < iterations; iter++) {
+        uint32_t portsc = xhci_read32(port_reg);
+
+        if (portsc & XHCI_PORT_CCS) {
+            // Stabilize connection
+            for (int w = 0; w < 250000; w++) io_wait();
+
+            uint8_t *dev_bytes = (uint8_t *)out_msc_dev;
+            for (size_t b = 0; b < sizeof(usb_device_t); b++) dev_bytes[b] = 0;
+
+            int res = usb_probe_port(ctrl, port_num, out_msc_dev);
+            if (res == 0) {
+                if (out_msc_dev->has_msc) {
+                    log_info("USB", "Port %u successfully enumerated with USB Mass Storage interface!", port_num);
+                    if (usb_msc_init_device(out_msc_dev) == 0) {
+                        return 0; // Ready for SCSI I/O!
+                    }
+                } else {
+                    log_info("USB", "Port %u enumerated (VID 0x%04X, PID 0x%04X), awaiting MSC function...",
+                             port_num, out_msc_dev->dev_desc.idVendor, out_msc_dev->dev_desc.idProduct);
+                    if (out_msc_dev->slot_id > 0) {
+                        xhci_disable_slot(ctrl, out_msc_dev->slot_id);
+                        out_msc_dev->slot_id = 0;
+                    }
+                }
+            }
+        }
+
+        for (int w = 0; w < 100000; w++) io_wait();
+    }
+
+    log_error("USB", "Timed out waiting for USB Mass Storage re-enumeration on Port %u!", port_num);
+    return -1;
+}
+

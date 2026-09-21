@@ -470,3 +470,14 @@ boot_source_t *boot_source_mtp_create(mtp_session_t *session) {
     log_info("MTP", "BootSource 'Android MTP' registered.");
     return src;
 }
+
+int mtp_source_set_target(boot_source_t *src, uint32_t handle, uint64_t file_size) {
+    if (!src || !src->priv || handle == 0) return -1;
+    mtp_fs_t *fs = (mtp_fs_t *)src->priv;
+    fs->handle = handle;
+    fs->file_size = file_size;
+    fs->file_open = true;
+    fs->file_pos = 0;
+    return 0;
+}
+

@@ -56,6 +56,9 @@ typedef struct fat_dir_entry {
 
 static char     log_buffer[DISK_LOG_BUFFER_SIZE];
 static uint32_t log_pos = 0;
+static uint32_t log_start = 0;           // Start of valid data in circular buffer
+static uint32_t total_written = 0;       // Monotonic total bytes ever written
+static bool     log_wrapped = false;     // True if buffer has wrapped around
 static bool     log_initialized = false;
 static bool     is_flushing = false;
 static uint8_t  disk_boot_drive = 0x80;
@@ -67,7 +70,7 @@ static uint32_t bootlog_dir_offset = 0;
 static uint32_t flush_counter = 0;
 static uint32_t error_counter = 0;
 static bool     last_flush_ok = false;
-static bool     buffer_full_warned = false;
+static uint32_t bytes_at_last_flush = 0; // total_written at time of last flush
 
 static int k_memcmp(const void *s1, const void *s2, size_t n) {
     const uint8_t *p1 = (const uint8_t *)s1;
@@ -89,30 +92,30 @@ static void k_memcpy(void *dst, const void *src, size_t n) {
     for (size_t i = 0; i < n; i++) d[i] = s[i];
 }
 
+static void disk_log_putc_raw(char c) {
+    log_buffer[log_pos] = c;
+    log_pos = (log_pos + 1) % DISK_LOG_BUFFER_SIZE;
+    total_written++;
+    if (log_wrapped || log_pos == 0) {
+        log_wrapped = true;
+        log_start = (log_pos + 1) % DISK_LOG_BUFFER_SIZE;
+    }
+}
+
 void disk_log_putc(char c) {
     if (c == '\r') return; // Handled with \n
 
     if (c == '\n') {
-        if (log_pos + 2 <= DISK_LOG_BUFFER_SIZE) {
-            log_buffer[log_pos++] = '\r';
-            log_buffer[log_pos++] = '\n';
-        }
+        disk_log_putc_raw('\r');
+        disk_log_putc_raw('\n');
         return;
     }
 
-    if (log_pos + 1 <= DISK_LOG_BUFFER_SIZE) {
-        log_buffer[log_pos++] = c;
-    }
-
-    // Warn once when buffer is 90% full
-    if (!buffer_full_warned && log_pos >= (DISK_LOG_BUFFER_SIZE * 9 / 10)) {
-        buffer_full_warned = true;
-        // Can't call log_info here (re-entrant), just mark it
-    }
+    disk_log_putc_raw(c);
 }
 
 uint32_t disk_log_get_length(void) {
-    return log_pos;
+    return log_wrapped ? DISK_LOG_BUFFER_SIZE : log_pos;
 }
 
 const char *disk_log_get_buffer(void) {
@@ -262,17 +265,20 @@ void disk_log_flush(void) {
     disk_log_header_t *hdr = (disk_log_header_t *)hdr_buf;
     hdr->magic1 = RAW_LOG_MAGIC_1;
     hdr->magic2 = RAW_LOG_MAGIC_2;
-    hdr->log_length = log_pos;
+    hdr->log_length = log_wrapped ? DISK_LOG_BUFFER_SIZE : log_pos;
     hdr->flush_count = flush_counter;
     hdr->boot_drive = disk_boot_drive;
     hdr->error_count = error_counter;
+    hdr->log_start = log_wrapped ? log_start : 0;
+    hdr->total_written = total_written;
 
-    uint16_t text_sectors = (log_pos + 511) / 512;
+    uint32_t actual_len = log_wrapped ? DISK_LOG_BUFFER_SIZE : log_pos;
+    uint16_t text_sectors = (actual_len + 511) / 512;
     if (text_sectors > (RAW_LOG_SECTORS - 1)) {
         text_sectors = RAW_LOG_SECTORS - 1;
     }
 
-    uint16_t fat_sectors = (log_pos + 511) / 512;
+    uint16_t fat_sectors = (actual_len + 511) / 512;
     if (fat_sectors > 128) fat_sectors = 128; // Max 64KB
 
     bool msc_success = false;
@@ -343,9 +349,18 @@ void disk_log_flush(void) {
         error_counter++;
     }
     last_flush_ok = !any_error;
+    bytes_at_last_flush = total_written;
 
     // Always clear is_flushing, even if errors occurred
     is_flushing = false;
+}
+
+void disk_log_auto_flush_if_needed(void) {
+    if (!log_initialized || is_flushing) return;
+    // Flush if >= 4KB has been written since last flush
+    if (total_written - bytes_at_last_flush >= 4096) {
+        disk_log_flush();
+    }
 }
 
 void disk_log_flush_with_feedback(void) {

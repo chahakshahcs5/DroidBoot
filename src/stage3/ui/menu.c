@@ -6,79 +6,134 @@
 #include "../memory/memory.h"
 #include "../pci/pci.h"
 
+extern uint16_t bios_int16_call(uint8_t cmd);
+
 static int poll_input_char(void) {
-    // 1. Poll COM1 Serial UART (LSR bit 0 = Data Ready)
-    if (inb(0x3F8 + 5) & 0x01) {
+    // 1. Poll BIOS INT 16h Keyboard Service (universal for laptop built-in and USB keyboards)
+    uint16_t k = bios_int16_call(0x01);
+    if (k != 0) {
+        uint8_t ascii = (uint8_t)(k & 0xFF);
+        uint8_t sc = (uint8_t)(k >> 8);
+        if (ascii != 0) return (int)ascii;
+        // Extended keys without ASCII
+        if (sc == 0x4F) return '1';
+        if (sc == 0x50) return '2';
+        if (sc == 0x51) return '3';
+        if (sc == 0x1C) return '\n';
+    }
+
+    // 2. Poll COM1 Serial UART (only if physical UART is actually present)
+    if (serial_is_present() && (inb(0x3F8 + 5) & 0x01)) {
         return inb(0x3F8);
     }
 
-    // 2. Poll PS/2 Keyboard Controller (Status Port 0x64 bit 0 = Output Buffer Full)
+    // 3. Fallback: Poll PS/2 Keyboard Controller (Status Port 0x64 bit 0 = Output Buffer Full)
     if (inb(0x64) & 0x01) {
         uint8_t sc = inb(0x60);
         // Ignore break codes (key release has bit 7 set)
-        if (sc & 0x80) return -1;
-
-        // Translate Scancode Set 1: top row numbers or numeric keypad
-        if (sc == 0x02 || sc == 0x4F) return '1';
-        if (sc == 0x03 || sc == 0x50) return '2';
-        if (sc == 0x04 || sc == 0x51) return '3';
-        if (sc == 0x05 || sc == 0x4B) return '4';
-        if (sc == 0x06 || sc == 0x4C) return '5';
-        if (sc == 0x07 || sc == 0x4D) return '6';
-        if (sc == 0x08 || sc == 0x47) return '7';
-        if (sc == 0x09 || sc == 0x48) return '8';
-        if (sc == 0x0A || sc == 0x49) return '9';
-        if (sc == 0x0B || sc == 0x52) return '0';
-        if (sc == 0x0E) return 0x08; // Backspace
-        if (sc == 0x20) return 'd'; // 'D'
-        if (sc == 0x14) return 't'; // 'T'
-        if (sc == 0x1C) return '\n'; // Enter
-        if (sc == 0x39) return ' ';
+        if (!(sc & 0x80)) {
+            if (sc == 0x02 || sc == 0x4F) return '1';
+            if (sc == 0x03 || sc == 0x50) return '2';
+            if (sc == 0x04 || sc == 0x51) return '3';
+            if (sc == 0x05 || sc == 0x4B) return '4';
+            if (sc == 0x06 || sc == 0x4C) return '5';
+            if (sc == 0x07 || sc == 0x4D) return '6';
+            if (sc == 0x08 || sc == 0x47) return '7';
+            if (sc == 0x09 || sc == 0x48) return '8';
+            if (sc == 0x0A || sc == 0x49) return '9';
+            if (sc == 0x0B || sc == 0x52) return '0';
+            if (sc == 0x0E) return 0x08; // Backspace
+            if (sc == 0x20) return 'd'; // 'D'
+            if (sc == 0x14) return 't'; // 'T'
+            if (sc == 0x1C) return '\n'; // Enter
+            if (sc == 0x39) return ' ';
+        }
     }
 
     return -1;
 }
 
-static int menu_read_line(char *buf, uint32_t max_len) {
+int menu_get_char(void) {
+    while (1) {
+        int ch = poll_input_char();
+        if (ch != -1) return ch;
+        for (int w = 0; w < 10000; w++) io_wait();
+    }
+}
+
+static int menu_read_line(char *buf, uint32_t max_len, uint32_t timeout_sec, const char *default_val) {
     uint32_t pos = 0;
     buf[0] = '\0';
 
+    uint32_t remaining = timeout_sec;
+    uint32_t slice_count = 0;
+
     while (1) {
         int ch = poll_input_char();
-        if (ch == -1) {
-            for (int w = 0; w < 1000; w++) io_wait();
-            continue;
-        }
+        if (ch != -1) {
+            remaining = 0; // Disable countdown immediately on user keystroke
 
-        // Enter key: carriage return (\r) or line feed (\n)
-        if (ch == '\r' || ch == '\n') {
-            if (pos == 0) {
-                // Ignore leading newlines (e.g. from previous \r\n)
+            // Enter key: carriage return (\r) or line feed (\n)
+            if (ch == '\r' || ch == '\n') {
+                if (pos == 0) {
+                    if (default_val && default_val[0]) {
+                        for (int i = 0; default_val[i] && pos + 1 < max_len; i++) {
+                            buf[pos++] = default_val[i];
+                        }
+                        buf[pos] = '\0';
+                        printk("%s\n", default_val);
+                        return (int)pos;
+                    }
+                    continue;
+                }
+                printk("\n");
+                buf[pos] = '\0';
+                return (int)pos;
+            }
+
+            // Backspace: 0x08 (BS) or 0x7F (DEL) or '\b'
+            if (ch == 0x08 || ch == 0x7F || ch == '\b') {
+                if (pos > 0) {
+                    pos--;
+                    buf[pos] = '\0';
+                    printk("\b \b");
+                }
                 continue;
             }
-            printk("\n");
-            buf[pos] = '\0';
-            return (int)pos;
-        }
 
-        // Backspace: 0x08 (BS) or 0x7F (DEL) or '\b'
-        if (ch == 0x08 || ch == 0x7F || ch == '\b') {
-            if (pos > 0) {
-                pos--;
-                buf[pos] = '\0';
-                printk("\b \b");
+            // Printable characters
+            if (ch >= 32 && ch <= 126) {
+                if (pos + 1 < max_len) {
+                    buf[pos++] = (char)ch;
+                    buf[pos] = '\0';
+                    printk("%c", ch);
+                }
             }
             continue;
         }
 
-        // Printable characters
-        if (ch >= 32 && ch <= 126) {
-            if (pos + 1 < max_len) {
-                buf[pos++] = (char)ch;
-                buf[pos] = '\0';
-                printk("%c", ch);
+        // Countdown timer tick if active
+        if (remaining > 0) {
+            slice_count++;
+            if (slice_count >= 100) {
+                slice_count = 0;
+                remaining--;
+                if (remaining > 0) {
+                    printk("\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b[Auto-boot in %u sec...] ", remaining);
+                } else {
+                    printk("\n[MENU] Auto-boot timer expired. Booting default [%s]...\n", default_val ? default_val : "1");
+                    if (default_val) {
+                        for (int i = 0; default_val[i] && pos + 1 < max_len; i++) {
+                            buf[pos++] = default_val[i];
+                        }
+                    }
+                    buf[pos] = '\0';
+                    return (int)pos;
+                }
             }
         }
+
+        for (int w = 0; w < 10000; w++) io_wait();
     }
 }
 
@@ -157,6 +212,12 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
 
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     printk("|------------------------------------------------------------------------|\n");
+    if (usb_dev && (usb_dev->has_adb || usb_dev->has_mtp)) {
+        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        printk("|  [U] Switch Phone to Root USB Mass Storage (UMS) (or press 'U')          |\n");
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    }
+    printk("|  [R] Rescan USB Devices & Storage               (or press 'R')          |\n");
     printk("|  [%u] Hardware Diagnostics & System Inspection   (or press 'D')          |\n", diag_num);
     printk("|  [%u] Linux 32-bit Boot Protocol Simulation      (or press 'T')          |\n", test_num);
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
@@ -171,13 +232,29 @@ menu_selection_t menu_wait_selection(const os_registry_t *registry) {
 
     while (1) {
         vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-        printk("\n[MENU] Select option [1-%u]: ", test_num);
+        if (os_count > 0) {
+            printk("\n[MENU] Select option [1-%u], 'U' (Root UMS), or 'R' (Rescan): ", test_num);
+        } else {
+            printk("\n[MENU] Select option: No OS found! Press 'U' (Root UMS), 'R' (Rescan), or 'T' (Test): ");
+        }
         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
         char line[16];
-        menu_read_line(line, sizeof(line));
+        if (os_count > 0) {
+            menu_read_line(line, sizeof(line), 0, "1");
+        } else {
+            menu_read_line(line, sizeof(line), 0, "R");
+        }
 
         // Direct letter shortcuts (case-insensitive)
+        if ((line[0] == 'u' || line[0] == 'U' || line[0] == 'm' || line[0] == 'M') && line[1] == '\0') {
+            printk("[MENU] Switching rooted Android phone to USB Mass Storage (UMS)...\n");
+            return (menu_selection_t){ .type = MENU_ACTION_SWITCH_UMS, .os_index = 0 };
+        }
+        if ((line[0] == 'r' || line[0] == 'R') && line[1] == '\0') {
+            printk("[MENU] Rescanning USB and storage devices...\n");
+            return (menu_selection_t){ .type = MENU_ACTION_RESCAN, .os_index = 0 };
+        }
         if ((line[0] == 'd' || line[0] == 'D') && line[1] == '\0') {
             printk("[MENU] User selected: Hardware Diagnostics\n");
             return (menu_selection_t){ .type = MENU_ACTION_DIAGNOSTICS, .os_index = 0 };
@@ -294,7 +371,7 @@ uint64_t menu_prompt_profile_size(void) {
         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
         char line[16];
-        menu_read_line(line, sizeof(line));
+        menu_read_line(line, sizeof(line), 0, "2");
 
         if (line[0] == '1' && line[1] == '\0') {
             printk("[SIZE] Allocated 2 GB sparse overlay capacity.\n\n");
@@ -316,11 +393,86 @@ uint64_t menu_prompt_profile_size(void) {
     }
 }
 
+int menu_select_phone_image(const os_registry_t *registry) {
+    if (!registry || registry->count == 0) {
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        printk("\n[UMS] No images detected on phone storage!\n");
+        printk("      Place .iso or .img files in /sdcard/Download/ or /sdcard/ISO/.\n\n");
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+        return -1;
+    }
+
+    // Drain input
+    while (poll_input_char() != -1) {
+        for (int w = 0; w < 100; w++) io_wait();
+    }
+
+    vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+    printk("\n======================================================================\n");
+    printk("  SELECT IMAGE TO ATTACH AS USB MASS STORAGE (0 MB IN RAM)\n");
+    printk("======================================================================\n");
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    printk("Choose which OS image on your phone to expose as a physical USB drive:\n\n");
+
+    for (uint32_t i = 0; i < registry->count; i++) {
+        const os_entry_t *entry = &registry->entries[i];
+        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        printk("  [%u] %s\n", i + 1, entry->title);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+        if (entry->file_size > 0) {
+            printk("      * File: %s (%u MB) | %s\n",
+                   entry->filename, (uint32_t)(entry->file_size / 1024 / 1024), entry->storage_desc);
+        } else {
+            printk("      * File: %s | %s\n", entry->filename, entry->storage_desc);
+        }
+    }
+
+    vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+    printk("  [0] Cancel / Back to Main Menu\n");
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+    while (1) {
+        vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+        printk("\n[UMS] Select image to convert [1-%u, or 0 to cancel]: ", registry->count);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+        char line[16];
+        menu_read_line(line, sizeof(line), 0, "1");
+
+        if ((line[0] == '0' && line[1] == '\0') || line[0] == 27) {
+            printk("[UMS] Cancelled.\n\n");
+            return -1;
+        }
+
+        bool is_num = true;
+        uint32_t val = 0;
+        for (int i = 0; line[i]; i++) {
+            if (line[i] < '0' || line[i] > '9') {
+                is_num = false;
+                break;
+            }
+            val = val * 10 + (uint32_t)(line[i] - '0');
+        }
+
+        if (is_num && val >= 1 && val <= registry->count) {
+            int selected = (int)val - 1;
+            printk("[UMS] Selected: '%s' (%s)\n\n",
+                   registry->entries[selected].title, registry->entries[selected].filename);
+            return selected;
+        }
+
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        printk("[UMS] Invalid choice '%s'. Please select [1-%u] or 0.\n", line, registry->count);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    }
+}
+
 int menu_select_persistence_profile(os_entry_t *entry) {
     if (!entry) return 0;
 
-    // Drain any leftover input characters from previous menu selection
-    while (poll_input_char() != -1) {
+    // Drain any leftover input characters from previous menu selection (bounded to avoid hangs)
+    for (int d = 0; d < 16; d++) {
+        if (poll_input_char() == -1) break;
         for (int w = 0; w < 100; w++) io_wait();
     }
 
@@ -357,7 +509,7 @@ int menu_select_persistence_profile(os_entry_t *entry) {
         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
         char line[16];
-        menu_read_line(line, sizeof(line));
+        menu_read_line(line, sizeof(line), 0, "1");
 
         bool is_num = true;
         uint32_t val = 0;

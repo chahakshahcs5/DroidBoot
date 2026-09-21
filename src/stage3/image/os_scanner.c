@@ -121,53 +121,9 @@ static void populate_os_persistence_profiles(os_entry_t *entry) {
     if (!entry) return;
     entry->profile_count = 0;
     entry->selected_profile = 0;
-
-    if (entry->approach == BOOT_APPROACH_BLOCK_ON_DEMAND) {
-        // Pathway 1: Rooted Phone / USB Block Storage with Casper Overlay
-        // Profile 0: Work Profile (4GB overlay in /BootManager/persistence/)
-        persistence_profile_t *p0 = &entry->profiles[entry->profile_count++];
-        copy_str(p0->profile_name, "Work Environment", sizeof(p0->profile_name));
-        copy_str(p0->filename, "ubuntu_work.casper-rw", sizeof(p0->filename));
-        p0->file_size = (uint64_t)4096 * 1024 * 1024;
-        p0->is_clean_session = false;
-
-        // Profile 1: Personal Profile (8GB overlay in /BootManager/persistence/)
-        persistence_profile_t *p1 = &entry->profiles[entry->profile_count++];
-        copy_str(p1->profile_name, "Personal Environment", sizeof(p1->profile_name));
-        copy_str(p1->filename, "ubuntu_personal.casper-rw", sizeof(p1->filename));
-        p1->file_size = (uint64_t)8192 * 1024 * 1024;
-        p1->is_clean_session = false;
-
-        // Profile 2: Clean Disposable Session (100% In-RAM, no saved changes to phone)
-        persistence_profile_t *p2 = &entry->profiles[entry->profile_count++];
-        copy_str(p2->profile_name, "Clean Disposable Session", sizeof(p2->profile_name));
-        copy_str(p2->filename, "None (In-RAM Only)", sizeof(p2->filename));
-        p2->file_size = 0;
-        p2->is_clean_session = true;
-
-    } else if (entry->approach == BOOT_APPROACH_MTP_IN_RAM) {
-        // Pathway 2: Non-Root Phone / MTP In-RAM + Overlay Archive Sync
-        // Profile 0: Default Persistent Profile
-        persistence_profile_t *p0 = &entry->profiles[entry->profile_count++];
-        copy_str(p0->profile_name, "Saved Profile", sizeof(p0->profile_name));
-        copy_str(p0->filename, "alpine.apkovl.tar.gz", sizeof(p0->filename));
-        p0->file_size = (uint64_t)10 * 1024 * 1024;
-        p0->is_clean_session = false;
-
-        // Profile 1: Developer Profile
-        persistence_profile_t *p1 = &entry->profiles[entry->profile_count++];
-        copy_str(p1->profile_name, "Developer Profile", sizeof(p1->profile_name));
-        copy_str(p1->filename, "alpine_dev.apkovl.tar.gz", sizeof(p1->filename));
-        p1->file_size = (uint64_t)25 * 1024 * 1024;
-        p1->is_clean_session = false;
-
-        // Profile 2: Clean Disposable Session (100% in RAM)
-        persistence_profile_t *p2 = &entry->profiles[entry->profile_count++];
-        copy_str(p2->profile_name, "Clean Disposable Session", sizeof(p2->profile_name));
-        copy_str(p2->filename, "None (In-RAM Only)", sizeof(p2->filename));
-        p2->file_size = 0;
-        p2->is_clean_session = true;
-    }
+    // Real profiles are loaded dynamically if present on disk.
+    // By keeping profile_count = 0 when no custom profiles exist,
+    // the bootloader avoids showing unwanted dummy persistence menus.
 }
 
 int os_add_custom_profile(os_entry_t *entry, const char *name, const char *filename, uint64_t size_bytes) {
@@ -239,102 +195,126 @@ static void scan_usb_msc_device(usb_device_t *msc_dev, os_registry_t *reg) {
 // -----------------------------------------------------------------------------
 // 2. Scan Android Phone over MTP - Approach 2: In-RAM Boot + SD Persistence
 // -----------------------------------------------------------------------------
+static bool is_system_folder(const char *name) {
+    if (!name || !name[0]) return true;
+    if (name[0] == '.') return true;
+    if (str_eq_nocase(name, "Android")) return true;
+    if (str_eq_nocase(name, "LOST.DIR")) return true;
+    if (str_eq_nocase(name, "DCIM")) return true;
+    if (str_eq_nocase(name, "Pictures")) return true;
+    if (str_eq_nocase(name, "Music")) return true;
+    if (str_eq_nocase(name, "Movies")) return true;
+    if (str_eq_nocase(name, "Alarms")) return true;
+    if (str_eq_nocase(name, "Ringtones")) return true;
+    if (str_eq_nocase(name, "Notifications")) return true;
+    if (str_eq_nocase(name, "Podcasts")) return true;
+    return false;
+}
+
 static void scan_mtp_storage(mtp_session_t *session, os_registry_t *reg) {
     if (!session || !session->session_active || reg->count >= MAX_OS_ENTRIES) return;
 
     log_info("SCAN", "Inspecting Android Phone via MTP interface...");
 
-    if (session->active_storage_id == 0) {
-        uint32_t storage_ids[8];
-        uint32_t scount = 0;
-        if (mtp_get_storage_ids(session, storage_ids, 8, &scount) != 0 || scount == 0) {
+    uint32_t storage_ids[8];
+    uint32_t scount = 0;
+    if (mtp_get_storage_ids(session, storage_ids, 8, &scount) != 0 || scount == 0) {
+        if (session->active_storage_id != 0) {
+            storage_ids[0] = session->active_storage_id;
+            scount = 1;
+        } else {
             log_info("SCAN", "No active MTP storage IDs detected.");
             return;
         }
     }
 
-    uint32_t storage_id = session->active_storage_id;
+    log_info("SCAN", "Android Phone: %u storage volume(s) detected", scount);
 
-    // Automatically verify / create /BootManager/persistence/ and .nomedia on phone
-    mtp_ensure_bootmanager_dirs(session, storage_id);
+    for (uint32_t s_idx = 0; s_idx < scount && reg->count < MAX_OS_ENTRIES; s_idx++) {
+        uint32_t storage_id = storage_ids[s_idx];
+        const char *vol_type = (s_idx == 0) ? "Internal Storage" : "SD Card";
+        log_info("SCAN", "Scanning Volume %u (ID 0x%08X: %s)...", s_idx + 1, storage_id, vol_type);
 
-    // Enumerate root items
-    uint32_t root_handles[128];
-    uint32_t root_count = 0;
-    if (mtp_get_object_handles(session, storage_id, PTP_OBJECT_HANDLE_ROOT, root_handles, 128, &root_count) != 0) {
-        log_info("SCAN", "Failed to query MTP root handles.");
-        return;
-    }
+        // Automatically verify / create /BootManager/persistence/ and .nomedia on phone
+        mtp_ensure_bootmanager_dirs(session, storage_id);
 
-    log_info("SCAN", "Android MTP Root: %u objects discovered", root_count);
+        // Enumerate root items (up to 256)
+        uint32_t root_handles[256];
+        uint32_t root_count = 0;
+        if (mtp_get_object_handles(session, storage_id, PTP_OBJECT_HANDLE_ROOT, root_handles, 256, &root_count) != 0) {
+            log_info("SCAN", "Failed to query MTP root handles for volume 0x%08X.", storage_id);
+            continue;
+        }
 
-    uint32_t sub_folders[4];
-    uint32_t sub_folder_count = 0;
+        log_info("SCAN", "Volume 0x%08X Root: %u objects discovered", storage_id, root_count);
 
-    // Check root files first
-    for (uint32_t i = 0; i < root_count && reg->count < MAX_OS_ENTRIES; i++) {
-        char name[64];
-        uint64_t size = 0;
-        if (mtp_get_object_info(session, root_handles[i], name, sizeof(name), &size) == 0) {
-            if (is_boot_image(name)) {
-                os_entry_t *entry = &reg->entries[reg->count];
-                k_memset(entry, 0, sizeof(os_entry_t));
+        uint32_t sub_folders[32];
+        char sub_folder_names[32][48];
+        uint32_t sub_folder_count = 0;
 
-                guess_distro_title(name, entry->title, sizeof(entry->title));
-                copy_str(entry->filename, name, sizeof(entry->filename));
-                copy_str(entry->storage_desc, "Android Phone MTP (Root)", sizeof(entry->storage_desc));
-                entry->file_size = size;
-                entry->storage_type = OS_STORAGE_MTP_ANDROID;
-                entry->approach = BOOT_APPROACH_MTP_IN_RAM;
-                entry->mtp_handle = root_handles[i];
-                entry->mtp_session = session;
+        // Check root files first
+        for (uint32_t i = 0; i < root_count && reg->count < MAX_OS_ENTRIES; i++) {
+            char name[64];
+            uint64_t size = 0;
+            if (mtp_get_object_info(session, root_handles[i], name, sizeof(name), &size) == 0) {
+                if (is_boot_image(name)) {
+                    os_entry_t *entry = &reg->entries[reg->count];
+                    k_memset(entry, 0, sizeof(os_entry_t));
 
-                populate_os_persistence_profiles(entry);
+                    guess_distro_title(name, entry->title, sizeof(entry->title));
+                    copy_str(entry->filename, name, sizeof(entry->filename));
+                    snprintf(entry->storage_desc, sizeof(entry->storage_desc),
+                             "Phone MTP Root (%s)", (s_idx == 0) ? "Internal" : "SD Card");
+                    entry->file_size = size;
+                    entry->storage_type = OS_STORAGE_MTP_ANDROID;
+                    entry->approach = BOOT_APPROACH_MTP_IN_RAM;
+                    entry->mtp_handle = root_handles[i];
+                    entry->mtp_session = session;
 
-                log_info("SCAN", "[+] Registered OS #%u: '%s' (%s, %u MB)",
-                         reg->count + 1, entry->title, entry->filename, (uint32_t)(size / 1024 / 1024));
-                log_info("SCAN", "    * Profiles: %u data profiles in /BootManager/persistence/",
-                         entry->profile_count);
-                reg->count++;
-            } else if (size == 0 && sub_folder_count < 4) {
-                if (str_eq_nocase(name, "Download") || str_eq_nocase(name, "Downloads") ||
-                    str_eq_nocase(name, "Documents") || str_eq_nocase(name, "BootManager")) {
-                    sub_folders[sub_folder_count++] = root_handles[i];
+                    populate_os_persistence_profiles(entry);
+
+                    log_info("SCAN", "[+] Registered OS #%u: '%s' (%s, %u MB)",
+                             reg->count + 1, entry->title, entry->filename, (uint32_t)(size / 1024 / 1024));
+                    reg->count++;
+                } else if (size == 0 && !is_system_folder(name) && sub_folder_count < 32) {
+                    sub_folders[sub_folder_count] = root_handles[i];
+                    copy_str(sub_folder_names[sub_folder_count], name, sizeof(sub_folder_names[sub_folder_count]));
+                    sub_folder_count++;
                 }
             }
         }
-    }
 
-    // Inspect candidate sub-folders (Download, Documents, BootManager)
-    for (uint32_t sf = 0; sf < sub_folder_count && reg->count < MAX_OS_ENTRIES; sf++) {
-        uint32_t child_handles[64];
-        uint32_t child_count = 0;
-        if (mtp_get_object_handles(session, storage_id, sub_folders[sf], child_handles, 64, &child_count) == 0) {
-            log_info("SCAN", "Inspecting MTP folder (handle 0x%08X): %u items", sub_folders[sf], child_count);
-            for (uint32_t c = 0; c < child_count && reg->count < MAX_OS_ENTRIES; c++) {
-                char cname[64];
-                uint64_t csize = 0;
-                if (mtp_get_object_info(session, child_handles[c], cname, sizeof(cname), &csize) == 0) {
-                    if (is_boot_image(cname)) {
-                        os_entry_t *entry = &reg->entries[reg->count];
-                        k_memset(entry, 0, sizeof(os_entry_t));
+        // Inspect candidate user sub-folders (Download, ISOs, Ventoy, Linux, Documents, etc.)
+        for (uint32_t sf = 0; sf < sub_folder_count && reg->count < MAX_OS_ENTRIES; sf++) {
+            uint32_t child_handles[256];
+            uint32_t child_count = 0;
+            if (mtp_get_object_handles(session, storage_id, sub_folders[sf], child_handles, 256, &child_count) == 0) {
+                log_info("SCAN", "Inspecting MTP folder '/%s/' (handle 0x%08X): %u items",
+                         sub_folder_names[sf], sub_folders[sf], child_count);
+                for (uint32_t c = 0; c < child_count && reg->count < MAX_OS_ENTRIES; c++) {
+                    char cname[64];
+                    uint64_t csize = 0;
+                    if (mtp_get_object_info(session, child_handles[c], cname, sizeof(cname), &csize) == 0) {
+                        if (is_boot_image(cname)) {
+                            os_entry_t *entry = &reg->entries[reg->count];
+                            k_memset(entry, 0, sizeof(os_entry_t));
 
-                        guess_distro_title(cname, entry->title, sizeof(entry->title));
-                        copy_str(entry->filename, cname, sizeof(entry->filename));
-                        copy_str(entry->storage_desc, "Android Phone MTP (Folder)", sizeof(entry->storage_desc));
-                        entry->file_size = csize;
-                        entry->storage_type = OS_STORAGE_MTP_ANDROID;
-                        entry->approach = BOOT_APPROACH_MTP_IN_RAM;
-                        entry->mtp_handle = child_handles[c];
-                        entry->mtp_session = session;
+                            guess_distro_title(cname, entry->title, sizeof(entry->title));
+                            copy_str(entry->filename, cname, sizeof(entry->filename));
+                            snprintf(entry->storage_desc, sizeof(entry->storage_desc),
+                                     "Phone MTP: /%s/ (%s)", sub_folder_names[sf], (s_idx == 0) ? "Internal" : "SD");
+                            entry->file_size = csize;
+                            entry->storage_type = OS_STORAGE_MTP_ANDROID;
+                            entry->approach = BOOT_APPROACH_MTP_IN_RAM;
+                            entry->mtp_handle = child_handles[c];
+                            entry->mtp_session = session;
 
-                        populate_os_persistence_profiles(entry);
+                            populate_os_persistence_profiles(entry);
 
-                        log_info("SCAN", "[+] Registered OS #%u: '%s' (%s, %u MB)",
-                                 reg->count + 1, entry->title, entry->filename, (uint32_t)(csize / 1024 / 1024));
-                        log_info("SCAN", "    * Profiles: %u data profiles in /BootManager/persistence/",
-                                 entry->profile_count);
-                        reg->count++;
+                            log_info("SCAN", "[+] Registered OS #%u: '%s' (%s, %u MB)",
+                                     reg->count + 1, entry->title, entry->filename, (uint32_t)(csize / 1024 / 1024));
+                            reg->count++;
+                        }
                     }
                 }
             }
@@ -515,12 +495,75 @@ static void scan_ram_storage(os_registry_t *reg) {
 }
 
 // -----------------------------------------------------------------------------
+// 5. Scan Android Phone over Root ADB (Discovers all ISOs on /sdcard directly)
+// -----------------------------------------------------------------------------
+static void scan_adb_storage(adb_session_t *session, os_registry_t *reg) {
+    if (!session || !session->is_connected || reg->count >= MAX_OS_ENTRIES) return;
+
+    log_info("SCAN", "Querying Android Phone via ADB Root Bridge for ISO images...");
+
+    static char adb_out[1024];
+    adb_out[0] = '\0';
+    const char *cmd = "su -c 'ls -1 /sdcard/Download/*.iso /sdcard/Download/*.img /sdcard/ISO/*.iso /sdcard/ISO/*.img /sdcard/ISOs/*.iso /sdcard/ISOs/*.img /sdcard/Ventoy/*.iso /sdcard/Ventoy/*.img /sdcard/*.iso /sdcard/*.img 2>/dev/null'";
+    if (adb_execute_shell(session, cmd, adb_out, sizeof(adb_out)) != 0 || adb_out[0] == '\0') {
+        return;
+    }
+
+    char *p = adb_out;
+    while (*p && reg->count < MAX_OS_ENTRIES) {
+        while (*p == '\r' || *p == '\n' || *p == ' ') p++;
+        if (!*p) break;
+
+        char *line_start = p;
+        while (*p && *p != '\r' && *p != '\n') p++;
+        if (*p) {
+            *p = '\0';
+            p++;
+        }
+
+        // Extract filename from path
+        char *fn = line_start;
+        for (int i = 0; line_start[i]; i++) {
+            if (line_start[i] == '/') fn = &line_start[i + 1];
+        }
+
+        if (!is_boot_image(fn)) continue;
+
+        // Check if already registered
+        bool already_registered = false;
+        for (uint32_t i = 0; i < reg->count; i++) {
+            if (str_eq_nocase(reg->entries[i].filename, fn)) {
+                already_registered = true;
+                break;
+            }
+        }
+        if (already_registered) continue;
+
+        os_entry_t *entry = &reg->entries[reg->count];
+        k_memset(entry, 0, sizeof(os_entry_t));
+
+        guess_distro_title(fn, entry->title, sizeof(entry->title));
+        copy_str(entry->filename, fn, sizeof(entry->filename));
+        snprintf(entry->storage_desc, sizeof(entry->storage_desc), "Phone Storage (Root UMS On-Demand)");
+        entry->storage_type = OS_STORAGE_MTP_ANDROID;
+        entry->approach = BOOT_APPROACH_MTP_IN_RAM;
+
+        populate_os_persistence_profiles(entry);
+
+        log_info("SCAN", "[+] Registered Phone OS #%u: '%s' (%s)",
+                 reg->count + 1, entry->title, entry->filename);
+        reg->count++;
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Main Orchestration: Scan All Available Storage Layers
 // -----------------------------------------------------------------------------
 int os_scan_all_storages(boot_info_t *boot_info,
                           xhci_controller_t *xhci,
                           usb_device_t *msc_dev,
                           mtp_session_t *mtp_session,
+                          adb_session_t *adb_session,
                           os_registry_t *out_registry) {
     (void)xhci;
     if (!out_registry) return -1;
@@ -540,10 +583,15 @@ int os_scan_all_storages(boot_info_t *boot_info,
         scan_mtp_storage(mtp_session, out_registry);
     }
 
-    // 3. Scan Preloaded In-RAM ISO Storage (Simulation / Pre-cached MTP)
+    // 3. Scan Android Phone over ADB (Rooted Phone - discovers all ISOs on /sdcard)
+    if (adb_session && adb_session->is_connected) {
+        scan_adb_storage(adb_session, out_registry);
+    }
+
+    // 4. Scan Preloaded In-RAM ISO Storage (Simulation / Pre-cached MTP)
     scan_ram_storage(out_registry);
 
-    // 4. Scan Local SD Card FAT32 Storage (Bootloader Home Storage)
+    // 5. Scan Local SD Card FAT32 Storage (Bootloader Home Storage)
     uint8_t boot_drive = boot_info ? (uint8_t)boot_info->boot_drive : 0x80;
     scan_sd_storage(boot_drive, out_registry);
 

@@ -37,8 +37,28 @@ def build_mbr_partition(active: bool, ptype: int, start_lba: int, total_sectors:
     struct.pack_into("<I", entry, 12, total_sectors)
     return bytes(entry)
 
-def create_fat32_partition(total_sectors: int, hidden_lba: int) -> bytes:
-    """Creates a FAT32 filesystem containing pre-allocated BOOTLOG.TXT."""
+import tarfile
+import io
+
+def generate_alpine_apkovl() -> bytes:
+    """Creates a minimal Alpine apkovl.tar.gz containing pre-configured /etc/lbu/lbu.conf."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        conf_content = (
+            b"# Alpine Local Backup (LBU) Configuration\n"
+            b"# Pre-configured by BootManager for SD Card / USB Persistence\n"
+            b'LBU_MEDIA="sda1"\n'
+            b'LBU_BACKUP_DIR="/media/sda1"\n'
+        )
+        ti = tarfile.TarInfo(name="etc/lbu/lbu.conf")
+        ti.size = len(conf_content)
+        ti.mode = 0o644
+        ti.mtime = 1700000000
+        tar.addfile(ti, io.BytesIO(conf_content))
+    return buf.getvalue()
+
+def create_fat32_partition(total_sectors: int, hidden_lba: int, adb_key_data: bytes = None) -> bytes:
+    """Creates a FAT32 filesystem containing pre-allocated BOOTLOG.TXT, APKOVL.TGZ, and optional ADBKEY.PUB."""
     bytes_per_sector = 512
     sectors_per_cluster = 8          # 4 KiB clusters
     reserved_sectors = 32
@@ -91,9 +111,9 @@ def create_fat32_partition(total_sectors: int, hidden_lba: int) -> bytes:
     struct.pack_into("<I", fsinfo, 484, 0x61417272) # "rrAa"
     total_data_sectors = total_sectors - data_start_lba
     total_clusters = total_data_sectors // sectors_per_cluster
-    free_clusters = max(0, total_clusters - 17)
+    free_clusters = max(0, total_clusters - 20)
     struct.pack_into("<I", fsinfo, 488, free_clusters)
-    struct.pack_into("<I", fsinfo, 492, 19)
+    struct.pack_into("<I", fsinfo, 492, 21)
     struct.pack_into("<I", fsinfo, 508, 0xAA550000)
 
     part_bytes[1*512:2*512] = fsinfo
@@ -104,6 +124,8 @@ def create_fat32_partition(total_sectors: int, hidden_lba: int) -> bytes:
     # Cluster 2 (Root dir): 0x0FFFFFFF
     # Cluster 3..17: Next cluster pointer
     # Cluster 18: 0x0FFFFFFF (End of BOOTLOG.TXT chain)
+    # Cluster 19: 0x0FFFFFFF (Optional ADBKEY.PUB)
+    # Cluster 20: 0x0FFFFFFF (APKOVL.TGZ)
     fat_table = bytearray(fat_size * bytes_per_sector)
     struct.pack_into("<I", fat_table, 0*4, 0x0FFFFFF8)
     struct.pack_into("<I", fat_table, 1*4, 0x0FFFFFFF)
@@ -111,6 +133,14 @@ def create_fat32_partition(total_sectors: int, hidden_lba: int) -> bytes:
     for c in range(3, 18):
         struct.pack_into("<I", fat_table, c*4, c + 1)
     struct.pack_into("<I", fat_table, 18*4, 0x0FFFFFFF)
+
+    # Cluster 19 (Optional ADBKEY.PUB)
+    if adb_key_data:
+        struct.pack_into("<I", fat_table, 19*4, 0x0FFFFFFF)
+
+    # Cluster 20 (APKOVL.TGZ for Alpine persistence)
+    apkovl_data = generate_alpine_apkovl()
+    struct.pack_into("<I", fat_table, 20*4, 0x0FFFFFFF)
 
     part_bytes[fat1_lba*512:(fat1_lba + fat_size)*512] = fat_table
     part_bytes[fat2_lba*512:(fat2_lba + fat_size)*512] = fat_table
@@ -134,11 +164,39 @@ def create_fat32_partition(total_sectors: int, hidden_lba: int) -> bytes:
     struct.pack_into("<I", ent1, 28, len(INITIAL_BOOTLOG_TEXT)) # File size
     root_dir[32:64] = ent1
 
+    # ADBKEY.PUB entry (Cluster 19) if present
+    if adb_key_data:
+        ent2 = bytearray(32)
+        ent2[0:11] = b'ADBKEY  PUB'
+        ent2[11] = 0x20 # ATTR_ARCHIVE
+        struct.pack_into("<H", ent2, 20, 0)
+        struct.pack_into("<H", ent2, 26, 19)        # Cluster 19
+        struct.pack_into("<I", ent2, 28, len(adb_key_data))
+        root_dir[64:96] = ent2
+
+    # APKOVL.TGZ entry (Cluster 20)
+    ent3 = bytearray(32)
+    ent3[0:11] = b'APKOVL  TGZ'
+    ent3[11] = 0x20 # ATTR_ARCHIVE
+    struct.pack_into("<H", ent3, 20, 0)
+    struct.pack_into("<H", ent3, 26, 20)            # Cluster 20
+    struct.pack_into("<I", ent3, 28, len(apkovl_data))
+    root_dir[96:128] = ent3
+
     part_bytes[root_dir_offset:root_dir_offset + len(root_dir)] = root_dir
 
     # 5. Populate BOOTLOG.TXT cluster 3
     file_offset = (data_start_lba + (3 - 2) * sectors_per_cluster) * 512
     part_bytes[file_offset:file_offset + len(INITIAL_BOOTLOG_TEXT)] = INITIAL_BOOTLOG_TEXT
+
+    # 6. Populate ADBKEY.PUB cluster 19 if present
+    if adb_key_data:
+        key_offset = (data_start_lba + (19 - 2) * sectors_per_cluster) * 512
+        part_bytes[key_offset:key_offset + len(adb_key_data)] = adb_key_data
+
+    # 7. Populate APKOVL.TGZ cluster 20
+    apkovl_offset = (data_start_lba + (20 - 2) * sectors_per_cluster) * 512
+    part_bytes[apkovl_offset:apkovl_offset + len(apkovl_data)] = apkovl_data
 
     return bytes(part_bytes)
 
@@ -149,6 +207,8 @@ def main():
     parser.add_argument("--stage3", required=True, help="Path to stage3.bin")
     parser.add_argument("--output", required=True, help="Output boot.img path")
     parser.add_argument("--size-mb", type=int, default=64, help="Total image size in MiB (default: 64)")
+    parser.add_argument("--adb-key", default=os.path.expanduser("~/.android/adbkey.pub"),
+                        help="Path to ADB public key (default: ~/.android/adbkey.pub)")
     args = parser.parse_args()
 
     with open(args.stage1, "rb") as f:
@@ -211,9 +271,18 @@ def main():
     raw_log_header = bytearray(512)
     struct.pack_into("<IIIII", raw_log_header, 0, 0x544F4F42, 0x21474F4C, len(INITIAL_BOOTLOG_TEXT), 0, 0x80)
 
+    adb_key_data = None
+    if os.path.exists(args.adb_key):
+        try:
+            with open(args.adb_key, "rb") as kf:
+                adb_key_data = kf.read().strip()
+            print(f"[+] Loaded dynamic host ADB key ({len(adb_key_data)} B) from: {args.adb_key}")
+        except Exception as e:
+            print(f"[!] Warning reading ADB key: {e}")
+
     # Generate FAT32 filesystem for Partition 1
     print(f"[*] Formatting Partition 1 (LBA {PARTITION_START_LBA}..{total_image_sectors - 1}) as FAT32 with BOOTLOG.TXT...")
-    fat32_data = create_fat32_partition(partition1_sectors, hidden_lba=PARTITION_START_LBA)
+    fat32_data = create_fat32_partition(partition1_sectors, hidden_lba=PARTITION_START_LBA, adb_key_data=adb_key_data)
 
     # Create output image
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
