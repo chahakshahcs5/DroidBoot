@@ -31,6 +31,7 @@ Status Definitions:
 | **Phase 13** | Android ADB Root Bridge & UMS Switch | **IMPLEMENTED** | **VERIFIED IN QEMU** | ADB authentication with dynamic `ADBKEY.PUB`, shell bridge, kernel `configfs` gadget LUN attachment, and port re-probing. |
 | **Phase 14** | Multi-OS Scanner & Persistence Engine | **IMPLEMENTED** | **VERIFIED IN QEMU** | Aggregates ISOs across storages, parses Casper/Alpine kernels, and attaches persistence profiles (`apkovl`, `/BootManager/persistence/`). |
 | **Phase 15** | PC Speaker Audio Feedback Subsystem | **IMPLEMENTED** | **VERIFIED IN QEMU** | Non-blocking PIT channel 2 audio cues for boot tone, device connected, prompt alerts, errors, and kernel handoff fanfare. |
+| **Phase 16** | Universal Production-Grade Architecture | **IMPLEMENTED** | **VERIFIED IN QEMU** | ChaN FatFs (R0.15), TLSF 24 MiB heap allocator, PIT-calibrated microsecond TSC timer, Rock Ridge/Joliet ISO reader, universal GRUB/Syslinux config parser, multi-LUN USB MSC, dynamic SD directory scan, and interactive arrow-key TUI with in-place kernel command-line editor. |
 
 ---
 
@@ -41,23 +42,25 @@ Status Definitions:
 | **Stage 1 (MBR)** | `src/stage1/stage1.asm` | Custom / Syslinux | **VERIFIED IN QEMU** |
 | **Stage 2 (Bootstrap)** | `src/stage2/stage2.asm` | Custom / Limine / Syslinux | **VERIFIED IN QEMU** |
 | **Stage 3 Core Runtime** | `src/stage3/core/` | Custom freestanding C | **VERIFIED IN QEMU** |
-| **Memory Allocator** | `src/stage3/memory/` | Custom physical bump/slab | **VERIFIED IN QEMU** |
+| **Hardware Timer** | `src/stage3/core/timer.c` | Calibrated PIT Ch2 + TSC | **VERIFIED IN QEMU** |
+| **Memory & Heap Allocator** | `src/stage3/memory/heap.c` | Two-Level Segregated Free List | **VERIFIED IN QEMU** |
 | **Serial Logger (0x3F8)**| `src/stage3/debug/serial.c` | Custom freestanding C | **VERIFIED IN QEMU** |
 | **VGA Text Driver** | `src/stage3/debug/vga.c` | Custom memory mapped (`0xB8000`) | **VERIFIED IN QEMU** |
 | **PCI Configuration** | `src/stage3/pci/` | Custom x86 ports `0xCF8/0xCFC` | **VERIFIED IN QEMU** |
 | **xHCI Driver** | `src/stage3/xhci/` | coreboot / libpayload | **VERIFIED IN QEMU** |
-| **USB Enumeration** | `src/stage3/usb/usb.c` | coreboot / libpayload | **VERIFIED IN QEMU** |
-| **USB Mass Storage (MSC)** | `src/stage3/usb/usb_msc.c` | SCSI BOT Specification | **VERIFIED IN QEMU** |
+| **USB Enumeration & Stall Clear** | `src/stage3/usb/usb.c` | coreboot / libpayload | **VERIFIED IN QEMU** |
+| **Multi-LUN USB MSC Block Driver** | `src/stage3/usb/usb_msc.c` | SCSI BOT Specification | **VERIFIED IN QEMU** |
 | **Android ADB Root Bridge** | `src/stage3/adb/adb.c` | AOSP ADB Wire Protocol | **VERIFIED IN QEMU** |
 | **MTP Initiator & Streamer**| `src/stage3/mtp/` | AOSP / libmtp | **VERIFIED IN QEMU** |
 | **BootSource Abstraction**| `src/include/boot_source.h` | Custom VFS interface | **VERIFIED IN QEMU** |
-| **FAT Filesystem** | `src/stage3/filesystem/fat_source.c`| ChaN FatFs / Custom | **VERIFIED IN QEMU** |
-| **ISO 9660 Reader** | `src/stage3/filesystem/iso_reader.c`| Custom ISO9660 / El Torito | **VERIFIED IN QEMU** |
+| **FAT Filesystem** | `src/stage3/filesystem/` | ChaN's FatFs (R0.15) | **VERIFIED IN QEMU** |
+| **Rock Ridge ISO Reader** | `src/stage3/filesystem/iso_reader.c`| ISO9660 / Rock Ridge / Joliet | **VERIFIED IN QEMU** |
+| **Universal Boot Config Parser** | `src/stage3/filesystem/boot_cfg_parser.c` | GRUB/Syslinux/Isolinux AST | **VERIFIED IN QEMU** |
 | **Image Format Detector**| `src/stage3/image/image_detect.c` | Custom bzImage / MBR / GPT / ISO | **VERIFIED IN QEMU** |
 | **Dynamic Multi-OS Scanner**| `src/stage3/image/os_scanner.c` | Custom OS discovery engine | **VERIFIED IN QEMU** |
 | **Linux Boot Protocol** | `src/stage3/linux/linux_boot.c` | Linux Specification / SeaBIOS | **VERIFIED IN QEMU** |
-| **Interactive Boot Menu**| `src/stage3/ui/menu.c` | Custom VGA, BIOS INT 16h & UART TUI | **VERIFIED IN QEMU** |
+| **Interactive TUI Boot Menu**| `src/stage3/ui/menu.c` | Custom VGA, BIOS INT 16h, UART, Arrow keys | **VERIFIED IN QEMU** |
 | **BIOS Thunking Gateway** | `src/stage3/bios/bios_thunk.S` | Custom 32-bit/16-bit transition | **VERIFIED IN QEMU** |
-| **Dual Persistent Disk Logger** | `src/stage3/debug/disk_log.c` | Custom FAT32 & Raw LBA 256 | **VERIFIED IN QEMU** |
+| **Dual Persistent Disk Logger** | `src/stage3/debug/disk_log.c` | Custom FAT32 & Raw LBA 1024 | **VERIFIED IN QEMU** |
 | **PC Speaker Audio Engine** | `src/stage3/debug/sound.h` | Custom PIT timer channel 2 | **VERIFIED IN QEMU** |
 

@@ -78,20 +78,20 @@ bootmanager/
 │   ├── stage1/           # 512-byte BIOS MBR boot sector (16-bit real mode NASM)
 │   ├── stage2/           # Bootstrap loader (A20, E820, protected mode transition)
 │   ├── stage3/           # 32-bit Flat Protected Mode C runtime
-│   │   ├── core/         # Entry point (entry.S), main orchestrator (main.c), printf
-│   │   ├── memory/       # E820 memory map parser, physical bump/pool allocator
+│   │   ├── core/         # Entry point (entry.S), main orchestrator (main.c), timer (timer.c), printf
+│   │   ├── memory/       # E820 memory map parser, segregated free-list heap (heap.c), memory.c
 │   │   ├── bios/         # 16-bit BIOS thunk (bios_thunk.S), BIOS disk I/O, VBE video
 │   │   ├── pci/          # PCI bus configuration scanner (ports 0xCF8 / 0xCFC)
 │   │   ├── xhci/         # xHCI host controller driver (libpayload-derived)
-│   │   ├── usb/          # USB enumeration, descriptor parsing, USB MSC block driver
+│   │   ├── usb/          # USB enumeration, descriptor parsing, multi-LUN MSC block driver (usb_msc.c)
 │   │   ├── mtp/          # MTP initiator, packet framing, file streaming (AOSP/libmtp)
 │   │   ├── adb/          # ADB authentication bridge, RSA auth, root UMS switch
-│   │   ├── filesystem/   # ChaN FatFs, ISO 9660 reader (iso_reader.c)
-│   │   ├── image/        # bzImage/MBR/GPT detector, multi-OS scanner (os_scanner.c)
+│   │   ├── filesystem/   # ChaN FatFs (ff.c), diskio.c, Rock Ridge ISO reader, boot_cfg_parser.c
+│   │   ├── image/        # bzImage/MBR/GPT detector, universal multi-OS scanner (os_scanner.c)
 │   │   ├── linux/        # 32-bit Linux boot protocol, boot_params setup, trampoline
-│   │   ├── ui/           # Interactive color VGA & serial boot menu (menu.c)
+│   │   ├── ui/           # Interactive TUI with arrow keys, live badges, and cmdline editor (menu.c)
 │   │   └── debug/        # Dual SD disk logger (disk_log.c), serial (0x3F8), PC speaker
-│   └── include/          # Shared bootloader header files (boot.h, boot_source.h, io.h)
+│   └── include/          # Shared bootloader header files (boot.h, boot_source.h, io.h, usb_defs.h)
 ├── tools/
 │   ├── mkimage.py                  # Automated boot.img builder with FAT32 partition & logs
 │   ├── qemu_test.py                # Automated headless test runner with assertion checking
@@ -101,7 +101,8 @@ bootmanager/
 │   ├── test_dynamic_msc_switch.py  # Test for runtime USB disconnect/reconnect & UMS switch
 │   ├── test_phone_switch.py        # Automated ADB trigger & re-enumeration test
 │   ├── test_physical_phone_qemu.py # Passthrough physical Android phone via USB to QEMU
-│   ├── read_log.py                 # Extractor for BOOTLOG.TXT and raw LBA 256 backup logs
+│   ├── read_log.py                 # Extractor for BOOTLOG.TXT and raw LBA 1024 backup logs
+│   ├── read_bootlog.py             # Formatted parser for persistent boot logs
 │   ├── phone_ums_enable.sh         # On-phone shell script to configure mass_storage gadget
 │   └── phone_restore_mtp.sh        # On-phone shell script to restore MTP USB configuration
 ├── Makefile              # Native GNU Makefile (WSL / Linux)

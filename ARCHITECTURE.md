@@ -201,23 +201,60 @@ This document specifies the technical architecture of the Android → Linux Lega
 * **Strategy**:
   * Maintains a 64 KiB circular in-memory log buffer.
   * Intercepts all `printk` and `log_info` calls.
-  * **FAT32 BOOTLOG.TXT**: Directly updates the cluster sectors of `BOOTLOG.TXT` on Partition 1 via BIOS thunking.
-  * **Raw LBA 256 Backup**: Atomically writes a 512-byte header with magic `BOOTLOG!` and log sectors starting at fixed LBA 256. If FAT32 is damaged, logs can always be extracted via `tools/read_log.py`.
+  * **FAT32 BOOTLOG.TXT**: Directly updates the cluster sectors of `BOOTLOG.TXT` on Partition 1 via ChaN FatFs / BIOS thunking.
+  * **Raw LBA 1024 Backup**: Atomically writes a 512-byte header with magic `BOOTLOG!` and log sectors starting at fixed LBA 1024 (sectors 1024..1151). Moving raw logging to LBA 1024 expands Stage 3 binary headroom up to 510 KB (LBA 3..1023). If FAT32 is damaged, logs can always be extracted via `tools/read_bootlog.py` or `tools/read_log.py`.
   * Audio feedback on flush via PC speaker (`sound.h`).
 
-### 2.8 Dynamic Multi-OS Scanner & Persistence Engine
-* **Filenames**: `src/stage3/image/os_scanner.c`, `src/stage3/filesystem/iso_reader.c`
+### 2.8 Dynamic Multi-OS Scanner & Universal Boot Config Parser
+* **Filenames**: `src/stage3/image/os_scanner.c`, `src/stage3/filesystem/iso_reader.c`, `src/stage3/filesystem/boot_cfg_parser.c`
 * **Features**:
   * Probes USB MSC devices, MTP sessions, ADB root directories, and the boot SD card.
-  * ISO 9660 reader parses Primary Volume Descriptors, directory records, and path tables without loading entire images.
-  * Identifies Linux kernels (`vmlinuz`, `bzImage`) and initramfs files (`initrd.img`, `initramfs-lts`).
-  * Detects distribution flavors (Ubuntu Casper live, Alpine Linux, Arch, Debian).
-  * Automatically configures distribution-specific persistence:
-    * **Ubuntu / Casper**: `boot=casper persistent persistent-path=/BootManager/persistence/`
+  * ISO 9660 reader with **Rock Ridge (SUSP/RRIP NM)** and **Joliet (UCS-2)** support for un-truncated POSIX filenames and deep directory traversal without loading full images.
+  * **Universal Dynamic Config Parser**:
+    * Dynamically discovers and parses distro-native boot configurations (`/boot/grub/grub.cfg`, `/boot/grub/loopback.cfg`, `/isolinux/isolinux.cfg`, `/syslinux/syslinux.cfg`, etc.).
+    * Extracts distro-native kernel paths (`vmlinuz*`, `linux*`), initramfs paths (`initrd*`, `initramfs*`), and distro-native boot parameters (e.g. `boot=casper`, `alpine_repo=`, `archisobasedir=`, `root=`).
+    * Resolves GRUB variables (e.g. `${iso_path}`) dynamically.
+  * Automatically configures distribution-specific persistence and boot parameters:
+    * **Ubuntu / Debian / Casper**: `boot=casper persistent persistent-path=/BootManager/persistence/`
     * **Alpine Linux**: `phram=iso,ADDR,SIZE memdisk=yes apkovl=sda1:`
-    * **Clean Session**: Ephemeral in-memory execution with no disk modifications.
+    * **Generic Distros**: Preserves native distro options with user-customizable command-line editor.
 
-### 2.9 Linux 32-bit Boot Protocol Loader & Trampoline Handoff
+### 2.9 PIT & TSC Calibrated Hardware Timer Subsystem
+* **Filename**: `src/stage3/core/timer.c`, `timer.h`
+* **Features**:
+  * Frequency-calibrated Intel 8254 Programmable Interval Timer (PIT) on Channel 2 / Port `0x61`.
+  * RDTSC (Read Time-Stamp Counter) hardware calibration for cycle-accurate nanosecond/microsecond delays (`udelay`, `mdelay`).
+  * Non-blocking timeout primitives (`timer_now_ms`, `timer_elapsed_ms`) preventing infinite hangs during USB enumeration and SCSI handshakes.
+
+### 2.10 Free-List Dynamic Heap Allocator
+* **Filename**: `src/stage3/memory/heap.c`, `heap.h`
+* **Features**:
+  * Segregated free-list memory allocator with boundary-tag block headers and bi-directional coalescing.
+  * O(1) best-fit / first-fit allocation with split and merge, preventing heap fragmentation across long sessions.
+  * Integrates seamlessly with ChaN FatFs dynamic long filename (LFN) working buffers (`FF_USE_LFN = 3`).
+
+### 2.11 Universal ChaN FatFs VFS Integration
+* **Filenames**: `src/stage3/filesystem/ff.c`, `diskio.c`, `fat_source.c`
+* **Features**:
+  * Production-grade ChaN FatFs R0.15c with dynamic LFN, 4096-byte sector support (`FF_MAX_SS = 4096`), read/write support (`FF_FS_READONLY = 0`), and CMOS RTC timestamps.
+  * Unified block driver `diskio.c` binding Drive 0 to BIOS INT 13h SD Card and Drive 1 to xHCI USB Mass Storage (SCSI).
+  * High-level VFS wrapper `fat_source.c` providing unified directory enumeration, file streaming, and file creation.
+
+### 2.12 Multi-LUN SCSI Block-Only Transport (BOT)
+* **Filename**: `src/stage3/usb/usb_msc.c`
+* **Features**:
+  * Full SCSI Command Block Wrapper (CBW) / Command Status Wrapper (CSW) protocol implementation.
+  * Probes and addresses multiple Logical Unit Numbers (LUNs) via `GET_MAX_LUN`.
+  * Auto-recovery: automatic `CLEAR_FEATURE(ENDPOINT_HALT)` and SCSI Request Sense on transport stalls and condition met/check status.
+
+### 2.13 Arrow-Key Interactive TUI & Live Cmdline Editor
+* **Filename**: `src/stage3/ui/menu.c`, `menu.h`
+* **Features**:
+  * Full ANSI keyboard navigation (Arrow Up, Arrow Down, Enter, 'c' for Edit, 'r' for Rescan, 'h' for Help).
+  * Real-time USB hotplug badge and OS type badges (`[LIVE-DIR]`, `[ISO-9660]`, `[MTP-STREAM]`).
+  * Live in-place kernel command-line editor enabling on-the-fly kernel parameter overrides.
+
+### 2.14 Linux 32-bit Boot Protocol Loader & Trampoline Handoff
 * **Filename**: `src/stage3/linux/linux_boot.c`, `linux_boot.h`
 * **Specifications**:
   * Validates Linux setup header magic `0x53726448` (`HdrS`) at offset `0x1F1` and protocol version $\ge 2.00$.
@@ -228,4 +265,5 @@ This document specifies the technical architecture of the Android → Linux Lega
   * For in-RAM ISOs, deploys standard **mBFT** (MEMDISK Boot Information Table) at `0x000E_0000`.
   * Shuts down xHCI controller rings cleanly via `xhci_stop()`.
   * Deploys relocation trampoline to `0x0000_8000`: relocates protected-mode kernel code to `0x0010_0000`, loads 32-bit segment selectors (`0x10`), sets `ESI = boot_params`, clears registers, and jumps to `code32_start`.
+
 
