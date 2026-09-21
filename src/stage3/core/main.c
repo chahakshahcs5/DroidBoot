@@ -1075,11 +1075,11 @@ void c_main(boot_info_t *boot_info) {
                         if (!ums_booted && selected->mtp_handle != 0) {
                             vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
                             log_info("BOOT", "UMS direct block access not active for '%s'.", selected->filename);
-                            log_info("BOOT", "Stream full image into RAM via MTP? (Press 'Y' to stream, any other key to cancel): ");
+                            log_info("BOOT", "Stream full image into RAM via MTP? (Press 'Y' or Enter to stream, 'N' to cancel): ");
                             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                             disk_log_flush();
                             char ans = (char)menu_get_char();
-                            if (ans != 'y' && ans != 'Y') {
+                            if (ans == 'n' || ans == 'N' || ans == 27) {
                                 log_info("BOOT", "MTP RAM boot cancelled by user. Returning to menu...");
                                 disk_log_flush();
                                 for (int w = 0; w < 1000000; w++) io_wait();
