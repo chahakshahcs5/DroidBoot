@@ -170,23 +170,64 @@ static bool is_boot_drive_msc(usb_device_t *dev) {
         }
     }
 
-    // Signature 3: Check MBR and Partition 1 VBR (LBA 2048)
-    if (usb_msc_read_sectors(dev, 0, 1, sec) == 0 && sec[510] == 0x55 && sec[511] == 0xAA) {
-        uint32_t part1_lba = *(uint32_t *)(&sec[0x1BE + 8]);
-        if (part1_lba == 0 || part1_lba > 10000000) part1_lba = 2048;
-
-        if (usb_msc_read_sectors(dev, part1_lba, 1, sec) == 0) {
-            if (sec[510] == 0x55 && sec[511] == 0xAA) {
-                if (k_memcmp(&sec[0x47], "BOOTLOADER ", 11) == 0 ||
-                    k_memcmp(&sec[3], "MSWIN4.1", 8) == 0 ||
-                    k_memcmp(&sec[0x52], "FAT32   ", 8) == 0) {
-                    return true;
+    // Signature 3: Check MBR and all Partition VBRs
+    if (usb_msc_read_sectors(dev, 0, 1, sec) == 0) {
+        // Superfloppy check directly at LBA 0
+        if (k_memcmp(&sec[0x47], "BOOTLOADER ", 11) == 0 ||
+            k_memcmp(&sec[0x52], "FAT32   ", 8) == 0) {
+            return true;
+        }
+        if (sec[510] == 0x55 && sec[511] == 0xAA) {
+            for (int p_idx = 0; p_idx < 4; p_idx++) {
+                uint32_t part_lba = *(uint32_t *)(&sec[0x1BE + p_idx * 16 + 8]);
+                if (part_lba == 0 && p_idx == 0) part_lba = 2048;
+                if (part_lba > 0 && part_lba < 0x20000000) {
+                    static uint8_t vbr[512];
+                    if (usb_msc_read_sectors(dev, part_lba, 1, vbr) == 0) {
+                        if (vbr[510] == 0x55 && vbr[511] == 0xAA) {
+                            if (k_memcmp(&vbr[0x47], "BOOTLOADER ", 11) == 0 ||
+                                k_memcmp(&vbr[3], "MSWIN4.1", 8) == 0 ||
+                                k_memcmp(&vbr[0x52], "FAT32   ", 8) == 0 ||
+                                k_memcmp(&vbr[0x36], "FAT16   ", 8) == 0) {
+                                return true;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     return false;
+}
+
+static void handle_msc_device(usb_device_t *msc_dev, uint8_t root_port) {
+    if (!msc_dev || !msc_dev->has_msc) return;
+    if (is_boot_drive_msc(msc_dev)) {
+        k_memcpy(&boot_msc_device, msc_dev, sizeof(usb_device_t));
+        boot_msc_detected = true;
+        log_info("STAGE3", "Port %u: Boot Drive SD/USB verified! Enabling direct xHCI logging.", root_port);
+        disk_log_register_usb_msc(&boot_msc_device);
+        diskio_set_usb_msc_device(&boot_msc_device);
+        if (!external_msc_detected) {
+            active_msc_dev = &boot_msc_device;
+        }
+    } else {
+        register_external_msc(&external_usb_dev, msc_dev, root_port);
+    }
+}
+
+static void check_and_handle_hub(xhci_controller_t *ctrl, usb_device_t *dev, uint8_t root_port) {
+    if (dev->dev_desc.bDeviceClass != USB_CLASS_HUB) return;
+    log_info("STAGE3", "Port %u: USB Hub detected! Scanning downstream ports for boot drive / storage...", root_port);
+    usb_device_t hub_msc_dev;
+    k_memset(&hub_msc_dev, 0, sizeof(hub_msc_dev));
+    if (usb_probe_hub_downstream(ctrl, dev, &hub_msc_dev) == 0) {
+        if (hub_msc_dev.has_msc) {
+            log_info("STAGE3", "Hub Port downstream MSC device acquired!");
+            handle_msc_device(&hub_msc_dev, root_port);
+        }
+    }
 }
 
 static void test_linux_boot_simulation(boot_info_t *boot_info) {
@@ -820,6 +861,7 @@ void c_main(boot_info_t *boot_info) {
 
     // Dynamic ADB Authentication Key (Loaded from FAT32 boot drive if present)
     load_dynamic_adb_key((uint8_t)boot_info->boot_drive);
+    diskio_set_bios_drive((uint8_t)boot_info->boot_drive);
 
     bool phone_prompted = false;
     bool mtp_found = false;
@@ -888,20 +930,9 @@ void c_main(boot_info_t *boot_info) {
                     }
 
                     if (current_dev.has_msc) {
-                        if (is_boot_drive_msc(&current_dev)) {
-                            k_memcpy(&boot_msc_device, &current_dev, sizeof(usb_device_t));
-                            boot_msc_detected = true;
-                            log_info("STAGE3", "Port %u: Boot Drive SD/USB verified! Enabling direct xHCI logging.", p);
-                            disk_log_register_usb_msc(&boot_msc_device);
-                            diskio_set_usb_msc_device(&boot_msc_device);
-
-                            // Point active_msc_dev to boot_msc_device if no external MSC registered yet
-                            if (!external_msc_detected) {
-                                active_msc_dev = &boot_msc_device;
-                            }
-                        } else {
-                            register_external_msc(&external_usb_dev, &current_dev, p);
-                        }
+                        handle_msc_device(&current_dev, p);
+                    } else if (current_dev.dev_desc.bDeviceClass == USB_CLASS_HUB) {
+                        check_and_handle_hub(&xhci_ctrl, &current_dev, p);
                     } else if (external_usb_detected && external_usb_dev.has_mtp && !active_adb_session.is_connected && !active_mtp_session.session_active) {
                         log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
                         int mtp_res = mtp_init_session(&external_usb_dev, &active_mtp_session);
@@ -916,7 +947,7 @@ void c_main(boot_info_t *boot_info) {
                             mtp_found = true;
                             phone_save_boot_log(&active_adb_session, &active_mtp_session);
                         }
-                    } else if (!current_dev.has_msc && !current_dev.has_adb && !current_dev.has_mtp) {
+                    } else if (!current_dev.has_msc && !current_dev.has_adb && !current_dev.has_mtp && current_dev.dev_desc.bDeviceClass != USB_CLASS_HUB) {
                         log_info("STAGE3", "Port %u: Attached device (VID 0x%04X, PID 0x%04X) is in Charging/No-Data mode.",
                                  p, current_dev.dev_desc.idVendor, current_dev.dev_desc.idProduct);
                         vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
@@ -988,19 +1019,11 @@ void c_main(boot_info_t *boot_info) {
                         }
 
                         if (current_dev.has_msc) {
-                            if (is_boot_drive_msc(&current_dev)) {
-                                k_memcpy(&boot_msc_device, &current_dev, sizeof(usb_device_t));
-                                boot_msc_detected = true;
-                                log_info("STAGE3", "Port %u: Boot Drive SD/USB verified! Enabling direct xHCI logging.", p);
-                                disk_log_register_usb_msc(&boot_msc_device);
-                                diskio_set_usb_msc_device(&boot_msc_device);
-                                if (!external_msc_detected) {
-                                    active_msc_dev = &boot_msc_device;
-                                }
-                            } else {
-                                register_external_msc(&external_usb_dev, &current_dev, p);
-                                break;
-                            }
+                            handle_msc_device(&current_dev, p);
+                            if (external_msc_detected) break;
+                        } else if (current_dev.dev_desc.bDeviceClass == USB_CLASS_HUB) {
+                            check_and_handle_hub(&xhci_ctrl, &current_dev, p);
+                            if (external_msc_detected) break;
                         } else if (external_usb_detected && external_usb_dev.has_mtp && !active_adb_session.is_connected && !active_mtp_session.session_active) {
                             log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
                             int mtp_res = mtp_init_session(&external_usb_dev, &active_mtp_session);
@@ -1077,18 +1100,9 @@ void c_main(boot_info_t *boot_info) {
                             adb_init_session(&external_usb_dev, &active_adb_session);
                         }
                         if (current_dev.has_msc) {
-                            if (is_boot_drive_msc(&current_dev)) {
-                                k_memcpy(&boot_msc_device, &current_dev, sizeof(usb_device_t));
-                                boot_msc_detected = true;
-                                log_info("STAGE3", "Port %u: Boot Drive SD/USB verified! Enabling direct xHCI logging.", p);
-                                disk_log_register_usb_msc(&boot_msc_device);
-                                diskio_set_usb_msc_device(&boot_msc_device);
-                                if (!external_msc_detected) {
-                                    active_msc_dev = &boot_msc_device;
-                                }
-                            } else {
-                                register_external_msc(&external_usb_dev, &current_dev, p);
-                            }
+                            handle_msc_device(&current_dev, p);
+                        } else if (current_dev.dev_desc.bDeviceClass == USB_CLASS_HUB) {
+                            check_and_handle_hub(&xhci_ctrl, &current_dev, p);
                         } else if (external_usb_detected && external_usb_dev.has_mtp && !active_adb_session.is_connected && !active_mtp_session.session_active) {
                             if (mtp_init_session(&external_usb_dev, &active_mtp_session) == 0) {
                                 mtp_found = true;

@@ -445,8 +445,10 @@ void disk_log_enable_bios_fallback(void) {
     if (log_state == LOG_STATE_USB_MSC) return; // USB MSC is already active and preferred
 
     static uint8_t test_buf[512];
-    if (bios_disk_read(disk_boot_drive, 0, 1, test_buf) == 0) {
+    int res = bios_disk_read(disk_boot_drive, 0, 1, test_buf);
+    if (res == 0) {
         log_state = LOG_STATE_BIOS;
+        log_info("LOG", "BIOS disk fallback active on Drive 0x%02X.", disk_boot_drive);
         disk_log_flush();
         return;
     }
@@ -457,10 +459,14 @@ void disk_log_enable_bios_fallback(void) {
         if (candidates[i] != disk_boot_drive && bios_disk_read(candidates[i], 0, 1, test_buf) == 0) {
             disk_boot_drive = candidates[i];
             log_state = LOG_STATE_BIOS;
+            log_info("LOG", "BIOS disk fallback active on alternate Drive 0x%02X.", disk_boot_drive);
             disk_log_flush();
             return;
         }
     }
+
+    log_info("LOG", "BIOS disk fallback unavailable after xHCI takeover (Drive 0x%02X, code %d). Log buffered in RAM.",
+             disk_boot_drive, res);
 }
 
 void disk_log_register_usb_msc(void *usb_dev) {

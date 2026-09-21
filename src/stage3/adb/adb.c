@@ -289,12 +289,13 @@ int adb_init_session(usb_device_t *dev, adb_session_t *session) {
     return -3;
 }
 
-int adb_execute_shell(adb_session_t *session, const char *cmd, char *out_buf, uint32_t max_len) {
+int adb_execute_shell_timeout(adb_session_t *session, const char *cmd, char *out_buf, uint32_t max_len, int timeout_sec) {
     if (!session || !session->is_connected || !cmd) return -1;
+    if (timeout_sec <= 0) timeout_sec = 6;
 
     bool is_b64_log_chunk = adb_str_starts_with_nocase(cmd, "echo ") && adb_str_contains(cmd, "base64 -d");
     if (!is_b64_log_chunk) {
-        log_debug("ADB", "Executing Shell: '%s'", cmd);
+        log_debug("ADB", "Executing Shell (timeout %ds): '%s'", timeout_sec, cmd);
     }
 
     static char open_dest[4096];
@@ -316,8 +317,7 @@ int adb_execute_shell(adb_session_t *session, const char *cmd, char *out_buf, ui
     uint32_t total_out = 0;
 
     while (1) {
-        // Allow up to 4 seconds for shell command to respond
-        res = adb_recv_msg_wait(session, &resp, chunk_buf, sizeof(chunk_buf) - 1, &chunk_len, 4);
+        res = adb_recv_msg_wait(session, &resp, chunk_buf, sizeof(chunk_buf) - 1, &chunk_len, timeout_sec);
         if (res != 0) break;
 
         // Discard any stale packets from older closed streams
@@ -369,6 +369,10 @@ int adb_execute_shell(adb_session_t *session, const char *cmd, char *out_buf, ui
         return res;
     }
     return 0;
+}
+
+int adb_execute_shell(adb_session_t *session, const char *cmd, char *out_buf, uint32_t max_len) {
+    return adb_execute_shell_timeout(session, cmd, out_buf, max_len, 6);
 }
 
 static bool adb_str_contains(const char *haystack, const char *needle) {
@@ -837,27 +841,29 @@ int adb_create_sparse_overlay(adb_session_t *session, const char *overlay_path, 
     char cmd[512];
     // Universal Android sparse allocation:
     // 1. mkdir & touch .nomedia (unprivileged works on /sdcard/)
-    // 2. dd with bs=1048576 count=1 seek=(mb-1) -> takes 0.003s, writes 1 block at (mb-1)MB, creates exact MB sparse file!
-    // 3. verify file exists on phone storage
+    // 2. truncate -s %uM is instantaneous (<5ms) on Android toybox
+    // 3. Fallback to dd with bs=1048576 count=1 seek=(mb-1) if truncate is absent
+    // 4. verify file exists on phone storage
     snprintf(cmd, sizeof(cmd),
              "mkdir -p /sdcard/BootManager/persistence 2>/dev/null; "
              "touch /sdcard/BootManager/persistence/.nomedia 2>/dev/null; "
-             "(dd if=/dev/zero of=%s bs=1048576 count=1 seek=%u 2>/dev/null || truncate -s %uM %s 2>/dev/null); "
+             "(truncate -s %uM %s 2>/dev/null || dd if=/dev/zero of=%s bs=1048576 count=1 seek=%u 2>/dev/null); "
              "[ -f %s ] && echo OK_CREATED || echo ERR_NOT_CREATED",
-             overlay_path, mb - 1, mb, overlay_path,
+             mb, overlay_path, overlay_path, mb - 1,
              overlay_path);
 
     char out[256] = {0};
-    int res = adb_execute_shell(session, cmd, out, sizeof(out));
+    int res = adb_execute_shell_timeout(session, cmd, out, sizeof(out), 15);
     if (res != 0 || !adb_str_contains(out, "OK_CREATED")) {
         // Fallback with su -c
         snprintf(cmd, sizeof(cmd),
                  "su -c 'mkdir -p /sdcard/BootManager/persistence; "
-                 "dd if=/dev/zero of=%s bs=1048576 count=1 seek=%u 2>/dev/null; "
+                 "truncate -s %uM %s 2>/dev/null || dd if=/dev/zero of=%s bs=1048576 count=1 seek=%u 2>/dev/null; "
                  "[ -f %s ] && echo OK_CREATED'",
-                 overlay_path, mb - 1, overlay_path);
+                 mb, overlay_path, overlay_path, mb - 1,
+                 overlay_path);
         out[0] = '\0';
-        res = adb_execute_shell(session, cmd, out, sizeof(out));
+        res = adb_execute_shell_timeout(session, cmd, out, sizeof(out), 15);
     }
 
     if (res == 0 && adb_str_contains(out, "OK_CREATED")) {
@@ -918,23 +924,23 @@ int adb_save_log_to_phone(adb_session_t *session) {
              "rm -f /data/local/tmp/boot.log 2>/dev/null; "
              "mkdir -p /sdcard/BootManager/logs /storage/emulated/0/BootManager/logs /data/local/tmp 2>/dev/null; "
              "chmod 777 /sdcard/BootManager /sdcard/BootManager/logs /storage/emulated/0/BootManager 2>/dev/null");
-    adb_execute_shell(session, prep_cmd, NULL, 0);
+    adb_execute_shell_timeout(session, prep_cmd, NULL, 0, 8);
 
-    // 2. Stream log data in atomic base64 chunks via adb_execute_shell
-    // Chunk size 1024 bytes -> 1368 base64 bytes -> ~1420 bytes command
-    static char b64_chunk[2048];
-    static char cmd_buf[2500];
+    // 2. Stream log data in atomic base64 chunks via adb_execute_shell_timeout
+    // Chunk size 1536 bytes -> 2048 base64 bytes -> ~2100 bytes command
+    static char b64_chunk[2500];
+    static char cmd_buf[3000];
     uint32_t offset = 0;
     bool write_failed = false;
 
     while (offset < total_len) {
         uint32_t chunk = total_len - offset;
-        if (chunk > 1024) chunk = 1024;
+        if (chunk > 1536) chunk = 1536;
 
         adb_base64_encode((const uint8_t *)(log_buf + offset), chunk, b64_chunk);
         snprintf(cmd_buf, sizeof(cmd_buf), "echo %s | base64 -d >> /data/local/tmp/boot.log", b64_chunk);
 
-        int res = adb_execute_shell(session, cmd_buf, NULL, 0);
+        int res = adb_execute_shell_timeout(session, cmd_buf, NULL, 0, 8);
         if (res != 0) {
             log_error("ADB", "Failed to write base64 chunk at offset %u (code %d)", offset, res);
             write_failed = true;
@@ -951,9 +957,9 @@ int adb_save_log_to_phone(adb_session_t *session) {
                  "mkdir -p /sdcard/BootManager/logs /storage/emulated/0/BootManager/logs 2>/dev/null; "
                  "cp /data/local/tmp/boot.log /sdcard/BootManager/boot.log 2>/dev/null; "
                  "cp /data/local/tmp/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; "
-                 "chmod 666 /data/local/tmp/boot.log /sdcard/BootManager/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; sync",
+                 "chmod 666 /data/local/tmp/boot.log /sdcard/BootManager/boot.log /sdcard/BootManager/logs/%s 2>/dev/null",
                  s_boot_session_file, s_boot_session_file);
-        adb_execute_shell(session, copy_cmd, NULL, 0);
+        adb_execute_shell_timeout(session, copy_cmd, NULL, 0, 10);
 
         // Step 2b: Root su copy fallback (in case shell user lacks permission to write to /sdcard)
         char root_cmd[512];
@@ -961,9 +967,9 @@ int adb_save_log_to_phone(adb_session_t *session) {
                  "su -c \"mkdir -p /sdcard/BootManager/logs 2>/dev/null; "
                  "cp /data/local/tmp/boot.log /sdcard/BootManager/boot.log 2>/dev/null; "
                  "cp /data/local/tmp/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; "
-                 "chmod 666 /sdcard/BootManager/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; sync\"",
+                 "chmod 666 /sdcard/BootManager/boot.log /sdcard/BootManager/logs/%s 2>/dev/null\"",
                  s_boot_session_file, s_boot_session_file);
-        adb_execute_shell(session, root_cmd, NULL, 0);
+        adb_execute_shell_timeout(session, root_cmd, NULL, 0, 10);
 
         // Step 2c: Mirror to any removable MicroSD card mounted on phone (/storage/XXXX-XXXX)
         char ext_cmd[512];
@@ -974,9 +980,9 @@ int adb_save_log_to_phone(adb_session_t *session) {
                  "    cp /data/local/tmp/boot.log \"$SD/BootManager/boot.log\" 2>/dev/null; "
                  "    cp /data/local/tmp/boot.log \"$SD/BootManager/logs/%s\" 2>/dev/null; "
                  "  fi; "
-                 "done; sync",
+                 "done",
                  s_boot_session_file);
-        adb_execute_shell(session, ext_cmd, NULL, 0);
+        adb_execute_shell_timeout(session, ext_cmd, NULL, 0, 10);
     }
 
     // 3. Post-write verification

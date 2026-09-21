@@ -16,6 +16,7 @@ void vprintk(const char *fmt, va_list args);
 
 void log_info(const char *tag, const char *fmt, ...);
 void log_error(const char *tag, const char *fmt, ...);
+#define log_warn log_info
 
 #if IS_DEBUG_BUILD
 void log_debug(const char *tag, const char *fmt, ...);

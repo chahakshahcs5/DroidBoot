@@ -749,6 +749,87 @@ int usb_clear_endpoint_halt(usb_device_t *dev, uint8_t ep_addr) {
     return res;
 }
 
+int usb_abort_bulk_endpoint(usb_device_t *dev, uint8_t ep_addr) {
+    if (!dev || !dev->ctrl) return -1;
+    log_info("USB", "Aborting timed out transfer on EP 0x%02X...", ep_addr);
+
+    uint8_t ep_num = ep_addr & 0x0F;
+    bool is_in = (ep_addr & 0x80) != 0;
+    uint8_t ep_ctx_idx = (ep_num * 2) + (is_in ? 1 : 0);
+
+    // 1. Issue Stop Endpoint Command (Type 15) to transition from Running to Stopped
+    xhci_trb_t stop_cmd;
+    stop_cmd.parameter = 0;
+    stop_cmd.status = 0;
+    stop_cmd.control = TRB_TYPE(TRB_STOP_ENDPOINT_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
+    xhci_trb_t evt;
+    xhci_send_command(dev->ctrl, &stop_cmd, &evt);
+
+    // 2. Drain any pending transfer events for this device/endpoint from the event ring
+    for (int i = 0; i < XHCI_EVENT_RING_TRBS; i++) {
+        xhci_trb_t *ev = &dev->ctrl->event_ring[dev->ctrl->event_dequeue_idx];
+        if ((ev->control & 1U) == dev->ctrl->event_cycle_state) {
+            uint32_t type = (ev->control >> TRB_TYPE_SHIFT) & 0x3F;
+            if (type == TRB_TRANSFER_EVENT) {
+                dev->ctrl->event_dequeue_idx++;
+                if (dev->ctrl->event_dequeue_idx == XHCI_EVENT_RING_TRBS) {
+                    dev->ctrl->event_dequeue_idx = 0;
+                    dev->ctrl->event_cycle_state ^= 1;
+                }
+                uintptr_t intr0 = dev->ctrl->rt_regs + 0x20;
+                uintptr_t erdp = (uintptr_t)&dev->ctrl->event_ring[dev->ctrl->event_dequeue_idx];
+                xhci_write64(intr0 + XHCI_INTR_ERDP, erdp | XHCI_ERDP_EHB);
+            }
+        } else {
+            break;
+        }
+    }
+
+    // 3. Reset the transfer ring pointers and clear the ring
+    xhci_trb_t *ring = (ep_ctx_idx < 32 && dev->ep_rings[ep_ctx_idx]) ? dev->ep_rings[ep_ctx_idx] : (is_in ? dev->bulk_in_ring : dev->bulk_out_ring);
+    if (ring) {
+        for (int i = 0; i < EP_RING_TRBS - 1; i++) {
+            ring[i].parameter = 0;
+            ring[i].status = 0;
+            ring[i].control = 0;
+        }
+        ring[EP_RING_TRBS - 1].parameter = (uintptr_t)ring;
+        ring[EP_RING_TRBS - 1].status = 0;
+        ring[EP_RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE_CYCLE;
+
+        if (ep_ctx_idx < 32) {
+            dev->ep_enqueue_idx[ep_ctx_idx] = 0;
+            dev->ep_cycle_state[ep_ctx_idx] = 1;
+        }
+        if (is_in) {
+            dev->bulk_in_enqueue_idx = 0;
+            dev->bulk_in_cycle_state = 1;
+        } else {
+            dev->bulk_out_enqueue_idx = 0;
+            dev->bulk_out_cycle_state = 1;
+        }
+
+        // 4. Issue Set TR Dequeue Pointer Command to point back to ring[0] with DCS = 1
+        xhci_trb_t deq_cmd;
+        deq_cmd.parameter = (uintptr_t)ring | 1U; // DCS = 1
+        deq_cmd.status = 0;
+        deq_cmd.control = TRB_TYPE(TRB_SET_TR_DEQ_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
+        xhci_send_command(dev->ctrl, &deq_cmd, &evt);
+    }
+
+    // 5. Send CLEAR_FEATURE(ENDPOINT_HALT) to USB device to reset data toggle
+    usb_setup_packet_t req;
+    req.bmRequestType = 0x02;
+    req.bRequest = USB_REQ_CLEAR_FEATURE;
+    req.wValue = 0;
+    req.wIndex = ep_addr;
+    req.wLength = 0;
+    usb_control_transfer(dev, &req, NULL, 0);
+
+    log_info("USB", "EP 0x%02X transfer ring aborted and re-synchronized successfully.", ep_addr);
+    return 0;
+}
+
 int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t len, uint32_t *transferred_out) {
     if (!dev || !data || len == 0) return -1;
 
@@ -963,6 +1044,7 @@ int usb_bulk_transfer_wait(usb_device_t *dev, uint8_t ep_addr, void *data, uint3
     }
 
     log_error("USB", "Bulk transfer timed out on EP 0x%02X after %d sec!", ep_addr, max_seconds);
+    usb_abort_bulk_endpoint(dev, ep_addr);
     return -100;
 }
 
@@ -1049,6 +1131,432 @@ int usb_reprobe_as_msc(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *
     }
 
     log_error("USB", "Timed out waiting for USB Mass Storage re-enumeration on Port %u!", port_num);
+    return -1;
+}
+
+static void usb_local_memcpy(void *dst, const void *src, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    for (size_t i = 0; i < n; i++) d[i] = s[i];
+}
+
+static void usb_local_memset(void *dst, uint8_t val, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    for (size_t i = 0; i < n; i++) d[i] = val;
+}
+
+int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb_device_t *out_msc_dev) {
+    if (!ctrl || !hub_dev) return -1;
+    if (hub_dev->dev_desc.bDeviceClass != USB_CLASS_HUB) return -1;
+
+    // 1. Retrieve Hub Descriptor
+    uint8_t hub_desc_buf[16];
+    usb_local_memset(hub_desc_buf, 0, sizeof(hub_desc_buf));
+
+    usb_setup_packet_t req_hub;
+    req_hub.bmRequestType = 0xA0; // Class-specific, Device recipient, IN
+    req_hub.bRequest = USB_REQ_GET_DESCRIPTOR;
+    req_hub.wIndex = 0;
+
+    uint8_t num_ports = 0;
+    uint8_t pwr_good = 0;
+
+    if (hub_dev->speed >= 4) {
+        // SuperSpeed Hub (USB 3.0+)
+        req_hub.wValue = (USB_DT_SS_HUB << 8);
+        req_hub.wLength = 12;
+        int desc_res = usb_control_transfer(hub_dev, &req_hub, hub_desc_buf, 12);
+        if (desc_res != 0) {
+            log_error("HUB", "Failed to read SuperSpeed Hub Descriptor on Port %u (error %d)",
+                      hub_dev->port_num, desc_res);
+            return -2;
+        }
+        num_ports = hub_desc_buf[2];
+        pwr_good = hub_desc_buf[5];
+    } else {
+        // USB 2.0 Hub
+        req_hub.wValue = (USB_DT_HUB << 8);
+        req_hub.wLength = 9;
+        int desc_res = usb_control_transfer(hub_dev, &req_hub, hub_desc_buf, 9);
+        if (desc_res != 0) {
+            req_hub.wLength = 7;
+            desc_res = usb_control_transfer(hub_dev, &req_hub, hub_desc_buf, 7);
+        }
+        if (desc_res != 0) {
+            log_error("HUB", "Failed to read USB 2.0 Hub Descriptor on Port %u (error %d)",
+                      hub_dev->port_num, desc_res);
+            return -2;
+        }
+        num_ports = hub_desc_buf[2];
+        pwr_good = hub_desc_buf[5];
+    }
+
+    log_info("HUB", "Hub on Root Port %u (Slot %u): Found %u downstream ports (PwrOn2PwrGood: %u ms)",
+             hub_dev->port_num, hub_dev->slot_id, num_ports, (uint32_t)pwr_good * 2);
+
+    if (num_ports == 0 || num_ports > 15) {
+        num_ports = (num_ports > 15) ? 15 : 4;
+    }
+
+    // 2. Evaluate Context on xHC to inform hardware that this slot is a Hub
+    uint8_t *hub_input_ctx = (uint8_t *)kmalloc_aligned(4096, 64);
+    usb_local_memset(hub_input_ctx, 0, 4096);
+    uint8_t ctx_sz = ctrl->context_size ? ctrl->context_size : 32;
+
+    // Add bit 0 (Slot Context)
+    *(uint32_t *)(hub_input_ctx + 4) = (1U << 0);
+
+    void *hub_dev_ctx = (void *)(uintptr_t)ctrl->dcbaa[hub_dev->slot_id];
+    uint8_t *slot_ctx_bytes = hub_input_ctx + ctx_sz;
+    if (hub_dev_ctx) {
+        usb_local_memcpy(slot_ctx_bytes, hub_dev_ctx, ctx_sz);
+    }
+    uint32_t *hub_slot_ctx = (uint32_t *)slot_ctx_bytes;
+    // Set Hub flag: bit 26
+    hub_slot_ctx[0] |= (1U << 26);
+    // Set Number of Downstream Ports: bits 24..31 of info_2
+    hub_slot_ctx[1] = (hub_slot_ctx[1] & 0x00FFFFFFU) | ((uint32_t)num_ports << 24);
+
+    xhci_trb_t eval_cmd;
+    eval_cmd.parameter = (uintptr_t)hub_input_ctx;
+    eval_cmd.status = 0;
+    eval_cmd.control = TRB_TYPE(TRB_EVAL_CTX_CMD) | ((uint32_t)hub_dev->slot_id << 24);
+    xhci_trb_t eval_evt;
+    int eval_res = xhci_send_command(ctrl, &eval_cmd, &eval_evt);
+    if (eval_res != 0) {
+        log_info("HUB", "Evaluate Context for Hub Slot %u returned code %d (proceeding...)",
+                 hub_dev->slot_id, eval_res);
+    } else {
+        log_info("HUB", "Hub Slot %u successfully registered with xHCI controller.", hub_dev->slot_id);
+    }
+
+    // 3. SuperSpeed Hub Depth (required by USB 3.0 spec 10.14.2.9)
+    if (hub_dev->speed >= 4) {
+        usb_setup_packet_t req_depth;
+        req_depth.bmRequestType = 0x20; // Host-to-Device, Class, Device
+        req_depth.bRequest = HUB_SET_DEPTH;
+        req_depth.wValue = 0; // Tier 1 hub depth is 0
+        req_depth.wIndex = 0;
+        req_depth.wLength = 0;
+        usb_control_transfer(hub_dev, &req_depth, NULL, 0);
+    }
+
+    // 4. Power on all downstream ports
+    for (uint8_t p = 1; p <= num_ports; p++) {
+        usb_setup_packet_t req_pwr;
+        req_pwr.bmRequestType = 0x23; // Host-to-Device, Class, Other/Port
+        req_pwr.bRequest = USB_REQ_SET_FEATURE;
+        req_pwr.wValue = HUB_FEATURE_PORT_POWER;
+        req_pwr.wIndex = p;
+        req_pwr.wLength = 0;
+        usb_control_transfer(hub_dev, &req_pwr, NULL, 0);
+    }
+
+    // Wait for power stabilization
+    uint32_t settle_ms = (pwr_good > 0) ? (uint32_t)pwr_good * 2 : 50;
+    if (settle_ms < 50) settle_ms = 50;
+    mdelay(settle_ms);
+
+    // 5. Probe each downstream port
+    for (uint8_t p = 1; p <= num_ports; p++) {
+        usb_setup_packet_t req_st;
+        req_st.bmRequestType = 0xA3; // Device-to-Host, Class, Other/Port
+        req_st.bRequest = USB_REQ_GET_STATUS;
+        req_st.wValue = 0;
+        req_st.wIndex = p;
+        req_st.wLength = 4;
+        uint32_t port_st = 0;
+        int st_res = usb_control_transfer(hub_dev, &req_st, &port_st, 4);
+        if (st_res != 0) {
+            continue;
+        }
+
+        uint16_t status = (uint16_t)(port_st & 0xFFFF);
+
+        // Bit 0: PORT_CONNECTION
+        if (!(status & (1U << HUB_FEATURE_PORT_CONNECTION))) {
+            continue; // Port is unoccupied
+        }
+
+        log_info("HUB", "Downstream Port %u: Connected device detected! Status: 0x%04X", p, status);
+
+        uint8_t child_speed = 1; // Default Full-Speed
+
+        if (hub_dev->speed >= 4) {
+            // SuperSpeed Hub downstream port
+            child_speed = 4; // SuperSpeed (5 Gbps)
+            // If port is not yet enabled/in U0, trigger PORT_RESET
+            if (!(status & (1U << HUB_FEATURE_PORT_ENABLE))) {
+                usb_setup_packet_t req_rst;
+                req_rst.bmRequestType = 0x23;
+                req_rst.bRequest = USB_REQ_SET_FEATURE;
+                req_rst.wValue = HUB_FEATURE_PORT_RESET;
+                req_rst.wIndex = p;
+                req_rst.wLength = 0;
+                usb_control_transfer(hub_dev, &req_rst, NULL, 0);
+
+                for (int w = 0; w < 20; w++) {
+                    mdelay(5);
+                    usb_control_transfer(hub_dev, &req_st, &port_st, 4);
+                    if (port_st & (1U << HUB_FEATURE_PORT_ENABLE)) break;
+                }
+
+                usb_setup_packet_t req_clr;
+                req_clr.bmRequestType = 0x23;
+                req_clr.bRequest = USB_REQ_CLEAR_FEATURE;
+                req_clr.wValue = HUB_FEATURE_C_PORT_RESET;
+                req_clr.wIndex = p;
+                req_clr.wLength = 0;
+                usb_control_transfer(hub_dev, &req_clr, NULL, 0);
+            }
+        } else {
+            // USB 2.0 Hub downstream port: trigger Port Reset to enable & determine speed
+            usb_setup_packet_t req_rst;
+            req_rst.bmRequestType = 0x23;
+            req_rst.bRequest = USB_REQ_SET_FEATURE;
+            req_rst.wValue = HUB_FEATURE_PORT_RESET;
+            req_rst.wIndex = p;
+            req_rst.wLength = 0;
+            usb_control_transfer(hub_dev, &req_rst, NULL, 0);
+
+            // Wait for port reset to complete (PORT_RESET bit 4 clears)
+            uint32_t st2 = 0;
+            for (int w = 0; w < 20; w++) {
+                mdelay(10);
+                usb_control_transfer(hub_dev, &req_st, &st2, 4);
+                if (!(st2 & (1U << 4))) break;
+            }
+
+            // Acknowledge reset change
+            usb_setup_packet_t req_clr;
+            req_clr.bmRequestType = 0x23;
+            req_clr.bRequest = USB_REQ_CLEAR_FEATURE;
+            req_clr.wValue = HUB_FEATURE_C_PORT_RESET;
+            req_clr.wIndex = p;
+            req_clr.wLength = 0;
+            usb_control_transfer(hub_dev, &req_clr, NULL, 0);
+
+            // Query speed from status
+            uint16_t status2 = (uint16_t)(st2 & 0xFFFF);
+            if (status2 & (1U << 10)) {
+                child_speed = 3; // High-Speed (480 Mbps)
+            } else if (status2 & (1U << 9)) {
+                child_speed = 2; // Low-Speed (1.5 Mbps)
+            } else {
+                child_speed = 1; // Full-Speed (12 Mbps)
+            }
+        }
+
+        const char *sp_str = (child_speed == 4) ? "SuperSpeed" :
+                             ((child_speed == 3) ? "High-Speed" :
+                             ((child_speed == 1) ? "Full-Speed" : "Low-Speed"));
+        log_info("HUB", "Downstream Port %u: Port reset complete. Link speed: %s (%u)",
+                 p, sp_str, child_speed);
+
+        // 6. Enable Slot in xHCI
+        uint8_t child_slot = 0;
+        int slot_res = xhci_enable_slot(ctrl, &child_slot);
+        if (slot_res != 0 || child_slot == 0) {
+            log_error("HUB", "Enable Slot failed for downstream device on Hub Port %u!", p);
+            continue;
+        }
+
+        // Allocate Device Context
+        void *child_dev_ctx = kmalloc_aligned(4096, 64);
+        ctrl->dcbaa[child_slot] = (uintptr_t)child_dev_ctx;
+
+        // Allocate Input Context
+        uint8_t *child_in_ctx = (uint8_t *)kmalloc_aligned(4096, 64);
+        usb_local_memset(child_in_ctx, 0, 4096);
+
+        // Add Slot (bit 0) and EP0 (bit 1)
+        *(uint32_t *)(child_in_ctx + 4) = (1U << 0) | (1U << 1);
+
+        // Slot Context
+        uint32_t *c_slot_ctx = (uint32_t *)(child_in_ctx + ctx_sz);
+        uint32_t route_string = (p & 0x0FU); // Tier-1 downstream port
+        c_slot_ctx[0] = route_string | ((uint32_t)child_speed << 20) | (1U << 27);
+        c_slot_ctx[1] = ((uint32_t)hub_dev->port_num << 16); // Root Hub Port Number
+        c_slot_ctx[2] = ((uint32_t)hub_dev->slot_id & 0xFF) | (((uint32_t)p & 0xFF) << 8); // Parent Slot ID & Parent Port
+
+        // Endpoint 0 Context
+        uint32_t *c_ep0_ctx = (uint32_t *)(child_in_ctx + 2 * ctx_sz);
+        uint16_t c_max_packet = (child_speed >= 4) ? 512 : ((child_speed == 3) ? 64 : 8);
+        c_ep0_ctx[0] = 0;
+        c_ep0_ctx[1] = (3U << 1) | (4U << 3) | ((uint32_t)c_max_packet << 16);
+
+        // Allocate EP0 Transfer Ring
+        usb_device_t child_dev;
+        usb_local_memset(&child_dev, 0, sizeof(child_dev));
+        child_dev.ctrl = ctrl;
+        child_dev.slot_id = child_slot;
+        child_dev.port_num = hub_dev->port_num;
+        child_dev.speed = child_speed;
+
+        uint32_t ep0_bytes = EP_RING_TRBS * sizeof(xhci_trb_t);
+        child_dev.ep0_ring = (xhci_trb_t *)kmalloc_aligned(ep0_bytes, 64);
+        usb_local_memset(child_dev.ep0_ring, 0, ep0_bytes);
+        child_dev.ep0_ring[EP_RING_TRBS - 1].parameter = (uintptr_t)child_dev.ep0_ring;
+        child_dev.ep0_ring[EP_RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE_CYCLE;
+        child_dev.ep0_enqueue_idx = 0;
+        child_dev.ep0_cycle_state = 1;
+
+        *(uint64_t *)(&c_ep0_ctx[2]) = (uintptr_t)child_dev.ep0_ring | 1U;
+        c_ep0_ctx[4] = 8;
+
+        // 7. Issue Address Device Command
+        xhci_trb_t c_addr_cmd;
+        c_addr_cmd.parameter = (uintptr_t)child_in_ctx;
+        c_addr_cmd.status = 0;
+        c_addr_cmd.control = TRB_TYPE(TRB_ADDRESS_DEV_CMD) | ((uint32_t)child_slot << 24);
+
+        xhci_trb_t c_addr_evt;
+        int c_addr_res = xhci_send_command(ctrl, &c_addr_cmd, &c_addr_evt);
+        if (c_addr_res != 0) {
+            log_error("HUB", "Address Device failed for device on Hub Port %u (code %d)!", p, c_addr_res);
+            xhci_disable_slot(ctrl, child_slot);
+            continue;
+        }
+
+        log_info("HUB", "Device on Hub Downstream Port %u Addressed Successfully (Slot %u)!", p, child_slot);
+
+        // 8. Get Device Descriptor
+        usb_setup_packet_t c_req_dev;
+        c_req_dev.bmRequestType = 0x80;
+        c_req_dev.bRequest = USB_REQ_GET_DESCRIPTOR;
+        c_req_dev.wValue = (USB_DESC_DEVICE << 8);
+        c_req_dev.wIndex = 0;
+        c_req_dev.wLength = sizeof(usb_device_desc_t);
+
+        int c_desc_res = usb_control_transfer(&child_dev, &c_req_dev, &child_dev.dev_desc, sizeof(usb_device_desc_t));
+        if (c_desc_res != 0) {
+            log_error("HUB", "Failed to retrieve Device Descriptor on Hub Port %u (error %d)", p, c_desc_res);
+            continue;
+        }
+
+        log_info("HUB", "Downstream Device: VID=0x%04X, PID=0x%04X, Class=0x%02X, Subclass=0x%02X, Proto=0x%02X",
+                 child_dev.dev_desc.idVendor, child_dev.dev_desc.idProduct,
+                 child_dev.dev_desc.bDeviceClass, child_dev.dev_desc.bDeviceSubClass, child_dev.dev_desc.bDeviceProtocol);
+
+        // Update EP0 MaxPacket if needed
+        uint16_t c_dev_ep0_max = child_dev.dev_desc.bMaxPacketSize0;
+        if (child_speed >= 4) {
+            c_dev_ep0_max = (1U << child_dev.dev_desc.bMaxPacketSize0);
+        }
+        if (c_dev_ep0_max > 0 && c_dev_ep0_max != c_max_packet) {
+            *(uint32_t *)(child_in_ctx + 0) = 0;
+            *(uint32_t *)(child_in_ctx + 4) = (1U << 1);
+            c_ep0_ctx[1] = (c_ep0_ctx[1] & ~0xFFFF0000U) | ((uint32_t)c_dev_ep0_max << 16);
+            xhci_trb_t eval_cmd2;
+            eval_cmd2.parameter = (uintptr_t)child_in_ctx;
+            eval_cmd2.status = 0;
+            eval_cmd2.control = TRB_TYPE(TRB_EVAL_CTX_CMD) | ((uint32_t)child_slot << 24);
+            xhci_send_command(ctrl, &eval_cmd2, &c_addr_evt);
+        }
+
+        // Query String Identifiers
+        char c_mfg[48] = {0};
+        char c_prod[48] = {0};
+        if (child_dev.dev_desc.iManufacturer) usb_get_string_descriptor(&child_dev, child_dev.dev_desc.iManufacturer, c_mfg, sizeof(c_mfg));
+        if (child_dev.dev_desc.iProduct) usb_get_string_descriptor(&child_dev, child_dev.dev_desc.iProduct, c_prod, sizeof(c_prod));
+        if (c_mfg[0] || c_prod[0]) {
+            log_info("HUB", "Downstream Ident: [%s] [%s]", c_mfg, c_prod);
+        }
+
+        // 9. Get Configuration Descriptor
+        usb_setup_packet_t c_req_cfg;
+        c_req_cfg.bmRequestType = 0x80;
+        c_req_cfg.bRequest = USB_REQ_GET_DESCRIPTOR;
+        c_req_cfg.wValue = (USB_DESC_CONFIGURATION << 8);
+        c_req_cfg.wIndex = 0;
+        c_req_cfg.wLength = 9;
+
+        usb_config_desc_t c_cfg_hdr;
+        int c_cfg_res = usb_control_transfer(&child_dev, &c_req_cfg, &c_cfg_hdr, 9);
+        if (c_cfg_res != 0) {
+            log_error("HUB", "Failed to retrieve Config Header on Hub Port %u (error %d)", p, c_cfg_res);
+            continue;
+        }
+
+        uint16_t c_total = c_cfg_hdr.wTotalLength;
+        if (c_total > sizeof(child_dev.config_buf)) c_total = sizeof(child_dev.config_buf);
+        c_req_cfg.wLength = c_total;
+        c_cfg_res = usb_control_transfer(&child_dev, &c_req_cfg, child_dev.config_buf, c_total);
+        if (c_cfg_res != 0) {
+            log_error("HUB", "Failed to retrieve Config Descriptor on Hub Port %u (error %d)", p, c_cfg_res);
+            continue;
+        }
+        child_dev.config_len = c_total;
+
+        // 10. Parse Interfaces & Endpoints
+        uint8_t *c_ptr = child_dev.config_buf;
+        uint8_t *c_end = c_ptr + c_total;
+        bool is_msc_iface = false;
+        uint8_t cur_iface = 0;
+
+        while (c_ptr + 2 <= c_end) {
+            uint8_t len = c_ptr[0];
+            uint8_t type = c_ptr[1];
+            if (len == 0 || c_ptr + len > c_end) break;
+
+            if (type == USB_DESC_INTERFACE) {
+                usb_interface_desc_t *iface = (usb_interface_desc_t *)c_ptr;
+                cur_iface = iface->bInterfaceNumber;
+                if (iface->bInterfaceClass == USB_CLASS_MASS_STORAGE && iface->bInterfaceProtocol == 0x50) {
+                    is_msc_iface = true;
+                    child_dev.has_msc = true;
+                    child_dev.msc_iface_num = cur_iface;
+                    log_info("HUB", "  Hub Port %u: Found USB Mass Storage Interface %u!", p, cur_iface);
+                } else {
+                    is_msc_iface = false;
+                }
+            } else if (type == USB_DESC_ENDPOINT && is_msc_iface) {
+                usb_endpoint_desc_t *ep = (usb_endpoint_desc_t *)c_ptr;
+                uint8_t ep_type = ep->bmAttributes & 0x03;
+                if (ep_type == 2) { // Bulk
+                    if (ep->bEndpointAddress & 0x80) {
+                        child_dev.msc_bulk_in_ep = ep->bEndpointAddress;
+                        child_dev.msc_bulk_in_max_packet = ep->wMaxPacketSize;
+                        log_info("HUB", "    -> MSC Bulk IN EP: 0x%02X (MaxPacket: %u)", ep->bEndpointAddress, ep->wMaxPacketSize);
+                    } else {
+                        child_dev.msc_bulk_out_ep = ep->bEndpointAddress;
+                        child_dev.msc_bulk_out_max_packet = ep->wMaxPacketSize;
+                        log_info("HUB", "    -> MSC Bulk OUT EP: 0x%02X (MaxPacket: %u)", ep->bEndpointAddress, ep->wMaxPacketSize);
+                    }
+                }
+            }
+            c_ptr += len;
+        }
+
+        // 11. Activate Configuration 1
+        usb_setup_packet_t c_set_cfg;
+        c_set_cfg.bmRequestType = 0x00;
+        c_set_cfg.bRequest = USB_REQ_SET_CONFIGURATION;
+        c_set_cfg.wValue = 1;
+        c_set_cfg.wIndex = 0;
+        c_set_cfg.wLength = 0;
+        usb_control_transfer(&child_dev, &c_set_cfg, NULL, 0);
+
+        // 12. If Mass Storage: configure bulk endpoints & initialize SCSI device
+        if (child_dev.has_msc) {
+            int msc_cfg = usb_configure_bulk_endpoints(&child_dev,
+                                                       child_dev.msc_bulk_in_ep, child_dev.msc_bulk_in_max_packet,
+                                                       child_dev.msc_bulk_out_ep, child_dev.msc_bulk_out_max_packet);
+            if (msc_cfg == 0) {
+                int msc_init = usb_msc_init_device(&child_dev);
+                if (msc_init == 0) {
+                    log_info("HUB", "Mass Storage device on Hub Port %u fully initialized!", p);
+                    if (out_msc_dev) {
+                        usb_local_memcpy(out_msc_dev, &child_dev, sizeof(usb_device_t));
+                    }
+                    return 0; // Found and configured MSC device!
+                } else {
+                    log_error("HUB", "usb_msc_init_device failed on Hub Port %u (code %d)", p, msc_init);
+                }
+            }
+        }
+    }
+
     return -1;
 }
 

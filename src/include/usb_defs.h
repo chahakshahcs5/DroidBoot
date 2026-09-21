@@ -31,6 +31,24 @@
 #define USB_CLASS_HUB               0x09
 #define USB_CLASS_VENDOR_SPEC       0xFF
 
+// USB Hub Descriptors & Features
+#define USB_DT_HUB                  0x29
+#define USB_DT_SS_HUB               0x2A
+
+#define HUB_FEATURE_PORT_CONNECTION 0
+#define HUB_FEATURE_PORT_ENABLE     1
+#define HUB_FEATURE_PORT_SUSPEND    2
+#define HUB_FEATURE_PORT_OVER_CURRENT 3
+#define HUB_FEATURE_PORT_RESET      4
+#define HUB_FEATURE_PORT_POWER      8
+#define HUB_FEATURE_C_PORT_CONNECTION 16
+#define HUB_FEATURE_C_PORT_ENABLE   17
+#define HUB_FEATURE_C_PORT_SUSPEND  18
+#define HUB_FEATURE_C_PORT_OVER_CURRENT 19
+#define HUB_FEATURE_C_PORT_RESET    20
+
+#define HUB_SET_DEPTH               12
+
 // MTP Standard Interface Identifiers (PTP/Still Image)
 #define MTP_INTERFACE_CLASS         0x06
 #define MTP_INTERFACE_SUBCLASS      0x01
