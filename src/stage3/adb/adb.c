@@ -704,13 +704,41 @@ int adb_scan_persistence_profiles(adb_session_t *session, struct os_entry *entry
                 for (int k = l - 1; k > 0; k--) {
                     if (clean_label[k] == '.') {
                         clean_label[k] = '\0';
+                        l = k;
                         break;
                     }
                 }
-                char prof_title[64];
-                snprintf(prof_title, sizeof(prof_title), "Profile: %s", clean_label[0] ? clean_label : base);
-                os_add_custom_profile(entry, prof_title, base, (uint64_t)2 * 1024 * 1024 * 1024);
-                log_info("ADB", "[+] Matched profile for '%s': '%s'", iso_stem, base);
+
+                // Parse trailing _<digits>MB if present (e.g. "work_2048MB")
+                uint32_t parsed_mb = 2048;
+                if (l >= 4 && (clean_label[l - 2] == 'M' || clean_label[l - 2] == 'm') &&
+                              (clean_label[l - 1] == 'B' || clean_label[l - 1] == 'b')) {
+                    int under = l - 3;
+                    while (under >= 0 && clean_label[under] >= '0' && clean_label[under] <= '9') {
+                        under--;
+                    }
+                    if (under >= 0 && clean_label[under] == '_' && under < l - 3) {
+                        uint32_t val = 0;
+                        for (int d = under + 1; d < l - 2; d++) {
+                            val = val * 10 + (uint32_t)(clean_label[d] - '0');
+                        }
+                        if (val > 0) {
+                            parsed_mb = val;
+                            clean_label[under] = '\0';
+                        }
+                    }
+                }
+
+                char prof_title[80];
+                if (iso_stem[0]) {
+                    snprintf(prof_title, sizeof(prof_title), "[%s] %s (%u MB)", iso_stem,
+                             clean_label[0] ? clean_label : base, parsed_mb);
+                } else {
+                    snprintf(prof_title, sizeof(prof_title), "%s (%u MB)",
+                             clean_label[0] ? clean_label : base, parsed_mb);
+                }
+                os_add_custom_profile(entry, prof_title, base, (uint64_t)parsed_mb * 1024 * 1024);
+                log_info("ADB", "[+] Matched profile for '%s': '%s' -> '%s'", iso_stem, base, prof_title);
             }
         }
     }

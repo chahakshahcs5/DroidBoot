@@ -14,8 +14,8 @@
 #define MAX_PERSISTENCE_PROFILES 8
 
 typedef struct {
-    char     profile_name[64]; // e.g. "Work Profile", "Personal Profile", "Clean Disposable"
-    char     filename[96];     // e.g. "ubuntu_work.casper-rw", "alpine_dev.apkovl.tar.gz"
+    char     profile_name[80]; // e.g. "[alpine-standard-3.24.2-x86_64] work (2048 MB)"
+    char     filename[96];     // e.g. "alpine-standard-3.24.2-x86_64_work_2048MB.img"
     uint64_t file_size;        // Size in bytes
     uint32_t mtp_handle;       // PTP handle if MTP
     bool     is_clean_session; // True for non-persistent disposable session

@@ -254,7 +254,7 @@ def test_custom_capacity_selection(port=4446):
         ("8 GB  (Developer", "8 GB option listed"),
         ("16 GB (Heavy Workstation", "16 GB option listed"),
         ("Allocated 8 GB developer overlay capacity", "8 GB capacity registered"),
-        ("Profile: devwork (8192 MB)", "Custom profile attached"),
+        ("devwork (8192 MB)", "Custom profile attached"),
         ("devwork_8192MB.casper-rw", "ISO-scoped sparse overlay filename generated"),
         ("HANDING OFF EXECUTION TO LINUX", "Kernel handoff reached with 8 GB overlay")
     ]
