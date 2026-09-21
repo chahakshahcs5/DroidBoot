@@ -1026,6 +1026,13 @@ void c_main(boot_info_t *boot_info) {
                                 boot_from_usb_msc(&detected_msc_dev, boot_info, prof);
                                 ums_booted = true;
                                 break;
+                            } else {
+                                vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+                                log_error("BOOT", "Hot-swap failed (%d). Returning to menu...", upd);
+                                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                                disk_log_flush();
+                                for (int w = 0; w < 2000000; w++) io_wait();
+                                continue;
                             }
                         }
                     }
@@ -1098,8 +1105,15 @@ void c_main(boot_info_t *boot_info) {
                         } else if (selected->approach == BOOT_APPROACH_MTP_IN_RAM) {
                             if (active_mtp_session.session_active) {
                                 boot_from_android_mtp(selected, boot_info, prof);
-                            } else {
+                            } else if (selected->storage_type == OS_STORAGE_MTP_ANDROID && selected->mtp_handle == 0 && selected->file_size > 0 && *(uint32_t *)LINUX_RAM_ISO_PHYS != 0) {
                                 boot_from_in_ram_iso(selected, boot_info, prof);
+                            } else {
+                                vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+                                log_error("BOOT", "MTP session not active and image not in RAM! Press 'R' to rescan.");
+                                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                                disk_log_flush();
+                                for (int w = 0; w < 2000000; w++) io_wait();
+                                continue;
                             }
                         }
                     }

@@ -562,19 +562,20 @@ int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path, c
     log_info("ADB", "Hot-swapping USB Mass Storage: LUN0='%s' (ro=%d), LUN1='%s'...",
              req_name[0] ? req_name : "*.iso", ro_val, prof_name[0] ? prof_name : "(none)");
 
-    char update_cmd[1024];
+    static char update_cmd[4096];
     snprintf(update_cmd, sizeof(update_cmd),
              "su -c '"
-             "ISO=\"%s\"; PROF=\"%s\"; "
-             "F=$(find /sdcard /storage/emulated/0 /storage -name \"$ISO\" 2>/dev/null | head -1); "
+             "ISO=\"%s\"; PROF=\"%s\"; RO=%d; "
+             "F=$(find /sdcard /storage/emulated/0 -name \"$ISO\" 2>/dev/null | head -1); "
              "[ -z \"$F\" ] && [ -f \"/sdcard/Download/$ISO\" ] && F=\"/sdcard/Download/$ISO\"; "
              "[ -z \"$F\" ] && [ -f \"/sdcard/$ISO\" ] && F=\"/sdcard/$ISO\"; "
              "if [ -z \"$F\" ] || [ ! -f \"$F\" ]; then echo ERR_NO_FILE; exit 2; fi; "
+             "DONE=0; "
              "for M in /config/usb_gadget/*/functions/mass_storage* /sys/kernel/config/usb_gadget/*/functions/mass_storage*; do "
              "  if [ -d \"$M\" ]; then "
              "    echo \"\" > \"$M/lun.0/file\" 2>/dev/null; "
              "    echo \"$F\" > \"$M/lun.0/file\" 2>/dev/null; "
-             "    echo %d > \"$M/lun.0/ro\" 2>/dev/null; "
+             "    echo $RO > \"$M/lun.0/ro\" 2>/dev/null; "
              "    if [ -n \"$PROF\" ] && [ -f \"$PROF\" ]; then "
              "      mkdir -p \"$M/lun.1\" 2>/dev/null; "
              "      echo \"\" > \"$M/lun.1/file\" 2>/dev/null; "
@@ -584,19 +585,27 @@ int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path, c
              "    else "
              "      echo \"\" > \"$M/lun.1/file\" 2>/dev/null; "
              "    fi; "
-             "    echo OK_UPDATED:\"$F\"; "
-             "    exit 0; "
+             "    DONE=1; "
+             "    break; "
              "  fi; "
              "done; "
-             "for L in /sys/class/android_usb/android0/f_mass_storage/lun /sys/class/android_usb/android0/f_mass_storage/lun0; do "
-             "  if [ -f \"$L/file\" ]; then "
-             "    echo \"\" > \"$L/file\" 2>/dev/null; "
-             "    echo \"$F\" > \"$L/file\" 2>/dev/null; "
-             "    echo OK_UPDATED:\"$F\"; "
-             "    exit 0; "
-             "  fi; "
-             "done; "
-             "echo ERR_NO_LUN; exit 3;'",
+             "if [ $DONE -eq 0 ]; then "
+             "  for L in /sys/class/android_usb/android0/f_mass_storage/lun /sys/class/android_usb/android0/f_mass_storage/lun0; do "
+             "    if [ -f \"$L/file\" ]; then "
+             "      echo \"\" > \"$L/file\" 2>/dev/null; "
+             "      echo \"$F\" > \"$L/file\" 2>/dev/null; "
+             "      echo $RO > \"$L/ro\" 2>/dev/null; "
+             "      if [ -n \"$PROF\" ] && [ -f \"$PROF\" ]; then "
+             "        echo \"\" > \"$L/../lun1/file\" 2>/dev/null; "
+             "        echo \"$PROF\" > \"$L/../lun1/file\" 2>/dev/null; "
+             "        echo 0 > \"$L/../lun1/ro\" 2>/dev/null; "
+             "      fi; "
+             "      DONE=1; "
+             "      break; "
+             "    fi; "
+             "  done; "
+             "fi; "
+             "if [ $DONE -eq 1 ]; then echo OK_UPDATED:\"$F\"; exit 0; else echo ERR_NO_LUN; exit 3; fi;'",
              req_name, prof_name, ro_val);
 
     char out[256] = {0};
