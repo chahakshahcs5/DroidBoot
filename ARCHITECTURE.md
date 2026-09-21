@@ -216,8 +216,8 @@ This document specifies the technical architecture of the Android → Linux Lega
     * Resolves GRUB variables (e.g. `${iso_path}`) dynamically.
   * Automatically configures distribution-specific persistence and boot parameters:
     * **Ubuntu / Debian / Casper**: `boot=casper persistent persistent-path=/BootManager/persistence/`
-    * **Alpine Linux**: `phram=iso,ADDR,SIZE memdisk=yes apkovl=sda1:`
-    * **Generic Distros**: Preserves native distro options with user-customizable command-line editor.
+    * **Alpine Linux**: `phram=iso,ADDR,SIZE memdisk=yes` (attaches `apkovl=LABEL=BOOTLOADER:<profile>` only when an Alpine persistence profile is actively selected)
+    * **Generic Distros / Hard Drive OS**: Preserves native distro options extracted from boot configuration without forcing unnecessary overlays.
 
 ### 2.9 PIT & TSC Calibrated Hardware Timer Subsystem
 * **Filename**: `src/stage3/core/timer.c`, `timer.h`

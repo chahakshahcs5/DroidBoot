@@ -49,7 +49,7 @@ An advanced x86/x86-64 Legacy BIOS bare-metal bootloader that boots from an SD c
    * Traverses phone storage datasets via PTP opcodes (`OpenSession`, `GetStorageIDs`, `GetObjectHandles`, `GetObjectInfo`).
    * Streams the ISO image in 1 MB chunks into high RAM (`0x04000000`).
    * Deploys an **mBFT** (MEMDISK Boot Information Table) at `0x000E0000` so Alpine/Linux decompressors and `memdiskfind` locate the root filesystem.
-   * Supports persistent user overlays stored on the boot SD card (`apkovl=sda1:` or Casper persistence).
+   * Supports persistent user overlays stored on the boot SD card (Casper persistence or Alpine overlays).
 
 ---
 

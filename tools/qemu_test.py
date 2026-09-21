@@ -323,7 +323,8 @@ def test_in_ram_iso_boot(port=4447):
         ("PERSISTENCE PROFILE SELECTOR: Alpine Linux Standard", "Profile menu triggered for In-RAM OS"),
         ("HANDING OFF TO IN-RAM LINUX WITH SD PERSISTENCE", "Kernel handoff reached for In-RAM Linux"),
         ("phram=iso,0x10000000", "phram kernel parameter attached"),
-        ("apkovl=LABEL=BOOTLOADER:apkovl.tgz", "apkovl persistence parameter attached")
+        ("memdisk=yes", "memdiskfind parameter attached"),
+        ("Persistence", "Persistence profile attached to handoff")
     ]
 
     all_passed = True

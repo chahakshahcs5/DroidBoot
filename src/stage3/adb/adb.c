@@ -128,8 +128,19 @@ static int adb_recv_msg_wait(adb_session_t *s, adb_message_t *out_msg, void *out
     return 0;
 }
 
-static char     g_adb_key_buffer[1024] = {0};
+static char     g_adb_key_buffer[2048] = {0};
 static uint32_t g_adb_key_len = 0;
+
+/* Fallback standard base64 RSA-2048 public key formatted for Android adbd.
+ * Format: "<base64_encoded_RSAPublicKey> bootmanager@universal\0"
+ * Ensures adbd can parse and store the key structure even when no ADBKEY.PUB is loaded.
+ * NOTE on Android ADB Protocol:
+ * Android connects silently without prompt ONLY if host provides ADB_AUTH_SIGNATURE (RSA private key signature).
+ * When sending ADB_AUTH_RSAPUBLICKEY, Android security policy always triggers the on-screen
+ * "Allow USB debugging?" dialog to prevent unauthorized machines from using stolen public keys.
+ */
+static const char g_default_adb_pubkey[] =
+    "QAAAALmgODt3mu7cr8HQgPfSBYzZZ0oarkDDL1f0vVoh09jiWs9t8YIe9G+OjnsceuBu77Y0Giupea3Nx5gVxbvrmddp0evTn0K8UcbL0xF0hm7HoL1DhbVmZkfzDV1fuaYdsMUMObVbsnrzTVItNlxGpeTY1a0aB58SLHDBuSwtsQBmsQ2+tPSVbWLSILQYbWYKHUxLHl+gKeQ7q9RUs4VKdHkq5wzAez3T1CUTFOVtIdsmP0JBeLnSeAYINqEzCRHP8W5G1qexdqTJS6sm/EuHHGLDmF0AynFzXJiL78G9EzLXNmuDwRLjTVTpgt9ImjhwQ5VHp8LcMqVizqtgpzdgGyYW0QXeDWNngcOGQj9sf3lnXpqzwN7iK2TYKBw72EttXMo18nRWJEDhDoEwLOwKc1nfcST/a5KeCbWlZq3L3m1S+gLOBqzucpe9ssJzSzswS5y776mhL9SF0B4jidFsUqRYYTwUw0DZSULRqQKGmd3Y6OFTeF/E0OHQcTI18wVYMCPbvlCWEpyG7RAKYJCPIGQZGnEBL8y7jiZmS5bkI5JEouVYhx+vSqofIZ+yRuqQ22Od1KiLxLbji7m+HyIaQJ2TikWYNvjaxr4J9bsxdhDpEGckFx9mQFrSUpuv7lkHekQrppBAzW9vIGcymlk4d2Nxpt4O/6tksHoDDGvkTn8ZuML5mQEAAQA= bootmanager@universal";
 
 void adb_set_public_key(const char *key_str, uint32_t len) {
     if (!key_str || len == 0 || len >= sizeof(g_adb_key_buffer)) return;
@@ -185,8 +196,8 @@ int adb_init_session(usb_device_t *dev, adb_session_t *session) {
         return 0;
     } else if (resp.command == A_AUTH) {
         log_info("ADB", "ADB Authentication challenge received. Sending RSA Public Key...");
-        const char *key_to_send = (g_adb_key_len > 0) ? g_adb_key_buffer : "bootmanager@baremetal\0";
-        uint32_t key_len = (g_adb_key_len > 0) ? g_adb_key_len : 22;
+        const char *key_to_send = (g_adb_key_len > 0) ? g_adb_key_buffer : g_default_adb_pubkey;
+        uint32_t key_len = (g_adb_key_len > 0) ? g_adb_key_len : (uint32_t)sizeof(g_default_adb_pubkey);
 
         res = adb_send_msg(session, A_AUTH, ADB_AUTH_RSAPUBLICKEY, 0, key_to_send, key_len);
         if (res != 0) {

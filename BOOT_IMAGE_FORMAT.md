@@ -49,10 +49,11 @@ LBA 2048 .. END     0x100000 - END            Partition 1: FAT32 Boot Filesystem
                     LBA 2080:                 FAT 1 (256 Sectors)
                     LBA 2336:                 FAT 2 (256 Sectors)
                     LBA 2592:                 Data Area (Root Directory at Cluster 2)
-                                              - BOOTLOG.TXT (Pre-allocated Cluster 3..18)
-                                              - APKOVL.TGZ  (Pre-configured Alpine overlay)
-                                              - ADBKEY.PUB  (Cluster 19, if present)
-                                              - Distribution persistence overlays
+                                              - BOOTLOG.TXT (Active boot log, Clusters 3..18)
+                                              - BOOTCNT.DAT (Monotonic boot session counter, Cluster 19)
+                                              - BOOT0001.LOG .. BOOT0010.LOG (10 rotating per-boot log archives, Clusters 20..179)
+                                              - ADBKEY.PUB  (Optional dynamic host ADB public key, Cluster 180)
+                                              - Dynamic multi-OS persistence profiles (/BootManager/persistence/)
 ```
 
 ---

@@ -272,7 +272,7 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
                 printk("|      * Mode  : Direct Block Access (0 MB OS in RAM, Instant Boot)     |\n");
             } else {
                 vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
-                printk("|      * Mode  : In-RAM Boot + SD Card Persistence (apkovl=sda1:)      |\n");
+                printk("|      * Mode  : In-RAM Boot + Hardware Storage Persistence             |\n");
             }
         }
     } else {

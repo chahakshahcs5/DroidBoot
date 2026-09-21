@@ -67,6 +67,40 @@ static size_t k_strlen(const char *s) {
     return len;
 }
 
+static inline int to_lower(int c) {
+    if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
+    return c;
+}
+
+static bool str_ends_with_nocase(const char *str, const char *suffix) {
+    if (!str || !suffix) return false;
+    size_t str_len = k_strlen(str);
+    size_t sfx_len = k_strlen(suffix);
+    if (str_len < sfx_len) return false;
+    for (size_t i = 0; i < sfx_len; i++) {
+        if (to_lower(str[str_len - sfx_len + i]) != to_lower(suffix[i])) return false;
+    }
+    return true;
+}
+
+static bool str_contains_nocase(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return false;
+    size_t h_len = k_strlen(haystack);
+    size_t n_len = k_strlen(needle);
+    if (n_len > h_len) return false;
+    for (size_t i = 0; i <= h_len - n_len; i++) {
+        bool match = true;
+        for (size_t j = 0; j < n_len; j++) {
+            if (to_lower(haystack[i + j]) != to_lower(needle[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 static bool is_boot_drive_msc(usb_device_t *dev) {
     if (!dev || !dev->has_msc) return false;
     static uint8_t sec[512];
@@ -275,11 +309,20 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
     char cmdline[512];
     if (iso_files.cmdline[0] != '\0') {
         snprintf(cmdline, sizeof(cmdline), "%s", iso_files.cmdline);
-        if (prof && !prof->is_clean_session && iso_files.is_casper) {
+        if (prof && !prof->is_clean_session) {
             size_t clen = k_strlen(cmdline);
             if (clen + 64 < sizeof(cmdline)) {
-                snprintf(cmdline + clen, sizeof(cmdline) - clen,
-                         " persistent persistent-path=/BootManager/persistence/");
+                if (iso_files.is_casper) {
+                    snprintf(cmdline + clen, sizeof(cmdline) - clen,
+                             " persistent persistent-path=/BootManager/persistence/");
+                } else if (str_ends_with_nocase(prof->filename, ".apkovl.tar.gz") ||
+                           str_ends_with_nocase(prof->filename, ".tgz")) {
+                    snprintf(cmdline + clen, sizeof(cmdline) - clen,
+                             " apkovl=LABEL=BOOTLOADER:%s", prof->filename);
+                } else {
+                    snprintf(cmdline + clen, sizeof(cmdline) - clen,
+                             " persistent persistent-path=/BootManager/persistence/");
+                }
             }
         }
     } else if (iso_files.is_casper) {
@@ -291,13 +334,20 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
                      "boot=casper persistent persistent-path=/BootManager/persistence/ modprobe.blacklist=floppy nosplash console=tty1");
         }
     } else {
-        // Alpine Linux / Generic Live System
-        if (prof && prof->is_clean_session) {
-            snprintf(cmdline, sizeof(cmdline),
-                     "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 modloop=/boot/modloop-lts quiet");
+        // Generic Live System / Hard Drive OS Fallback
+        if (prof && !prof->is_clean_session) {
+            if (str_ends_with_nocase(prof->filename, ".apkovl.tar.gz") ||
+                str_ends_with_nocase(prof->filename, ".tgz")) {
+                snprintf(cmdline, sizeof(cmdline),
+                         "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 apkovl=LABEL=BOOTLOADER:%s quiet",
+                         prof->filename);
+            } else {
+                snprintf(cmdline, sizeof(cmdline),
+                         "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 persistent persistent-path=/BootManager/persistence/ quiet");
+            }
         } else {
             snprintf(cmdline, sizeof(cmdline),
-                     "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 modloop=/boot/modloop-lts apkovl=LABEL=BOOTLOADER:apkovl.tgz quiet");
+                     "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 quiet");
         }
     }
 
@@ -375,38 +425,80 @@ static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_fil
     // Install mBFT table at 0x000E0000 for Alpine memdiskfind
     linux_setup_mbft(LINUX_RAM_ISO_PHYS, total_iso_bytes);
 
-    char alpine_cmdline[512];
+    char kernel_cmdline[512];
     if (iso_files && iso_files->cmdline[0] != '\0') {
-        snprintf(alpine_cmdline, sizeof(alpine_cmdline),
+        snprintf(kernel_cmdline, sizeof(kernel_cmdline),
                  "%s phram=iso,0x%08X,0x%08X memdisk=yes",
                  iso_files->cmdline, LINUX_RAM_ISO_PHYS, total_iso_bytes);
         if (prof && !prof->is_clean_session) {
-            size_t clen = k_strlen(alpine_cmdline);
-            if (clen + 48 < sizeof(alpine_cmdline)) {
-                snprintf(alpine_cmdline + clen, sizeof(alpine_cmdline) - clen,
-                         " apkovl=LABEL=BOOTLOADER:apkovl.tgz");
+            size_t clen = k_strlen(kernel_cmdline);
+            if (clen + 64 < sizeof(kernel_cmdline)) {
+                if (iso_files->is_casper) {
+                    snprintf(kernel_cmdline + clen, sizeof(kernel_cmdline) - clen,
+                             " persistent persistent-path=/BootManager/persistence/");
+                } else if (str_ends_with_nocase(prof->filename, ".apkovl.tar.gz") ||
+                           str_ends_with_nocase(prof->filename, ".tgz")) {
+                    snprintf(kernel_cmdline + clen, sizeof(kernel_cmdline) - clen,
+                             " apkovl=LABEL=BOOTLOADER:%s", prof->filename);
+                } else {
+                    snprintf(kernel_cmdline + clen, sizeof(kernel_cmdline) - clen,
+                             " persistent persistent-path=/BootManager/persistence/");
+                }
             }
         }
-    } else if (prof && prof->is_clean_session) {
-        snprintf(alpine_cmdline, sizeof(alpine_cmdline),
-                 "console=tty0 console=tty1 modprobe.blacklist=floppy noapic modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes debug_init quiet",
-                 LINUX_RAM_ISO_PHYS, total_iso_bytes);
+    } else if (iso_files && iso_files->is_casper) {
+        if (prof && prof->is_clean_session) {
+            snprintf(kernel_cmdline, sizeof(kernel_cmdline),
+                     "boot=casper console=tty0 console=tty1 modprobe.blacklist=floppy phram=iso,0x%08X,0x%08X memdisk=yes quiet",
+                     LINUX_RAM_ISO_PHYS, total_iso_bytes);
+        } else {
+            snprintf(kernel_cmdline, sizeof(kernel_cmdline),
+                     "boot=casper console=tty0 console=tty1 modprobe.blacklist=floppy phram=iso,0x%08X,0x%08X memdisk=yes persistent persistent-path=/BootManager/persistence/ quiet",
+                     LINUX_RAM_ISO_PHYS, total_iso_bytes);
+        }
     } else {
-        snprintf(alpine_cmdline, sizeof(alpine_cmdline),
-                 "console=tty0 console=tty1 modprobe.blacklist=floppy noapic modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes apkovl=LABEL=BOOTLOADER:apkovl.tgz debug_init quiet",
-                 LINUX_RAM_ISO_PHYS, total_iso_bytes);
+        bool is_alpine = false;
+        if (iso_files && (str_contains_nocase(iso_files->title, "alpine") ||
+                          str_contains_nocase(iso_files->cmdline, "alpine") ||
+                          (prof && (str_ends_with_nocase(prof->filename, ".apkovl.tar.gz") ||
+                                    str_ends_with_nocase(prof->filename, ".tgz"))))) {
+            is_alpine = true;
+        }
+
+        if (is_alpine) {
+            if (prof && prof->is_clean_session) {
+                snprintf(kernel_cmdline, sizeof(kernel_cmdline),
+                         "console=tty0 console=tty1 modprobe.blacklist=floppy noapic modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes debug_init quiet",
+                         LINUX_RAM_ISO_PHYS, total_iso_bytes);
+            } else {
+                const char *apkovl_target = (prof && prof->filename[0]) ? prof->filename : "apkovl.tgz";
+                snprintf(kernel_cmdline, sizeof(kernel_cmdline),
+                         "console=tty0 console=tty1 modprobe.blacklist=floppy noapic modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes apkovl=LABEL=BOOTLOADER:%s debug_init quiet",
+                         LINUX_RAM_ISO_PHYS, total_iso_bytes, apkovl_target);
+            }
+        } else {
+            // Universal / generic Live OS fallback
+            if (prof && prof->is_clean_session) {
+                snprintf(kernel_cmdline, sizeof(kernel_cmdline),
+                         "console=tty0 console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes quiet",
+                         LINUX_RAM_ISO_PHYS, total_iso_bytes);
+            } else {
+                snprintf(kernel_cmdline, sizeof(kernel_cmdline),
+                         "console=tty0 console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes persistent persistent-path=/BootManager/persistence/ quiet",
+                         LINUX_RAM_ISO_PHYS, total_iso_bytes);
+            }
+        }
     }
 
-    // Standard 80x25 VGA text mode for maximum compatibility with Alpine Linux & Linux distributions
-    // (Preserves text display and avoids black screen from unsupported 24-bit VBE modes)
-    linux_boot_params_t *alpine_params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
+    // Standard 80x25 VGA text mode for maximum compatibility across distributions
+    linux_boot_params_t *kernel_params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
     linux_prepare_boot_params(kernel_buf, iso_files->kernel_size,
                               iso_files->found_initrd ? initrd_buf : NULL,
                               iso_files->found_initrd ? iso_files->initrd_size : 0,
-                              alpine_cmdline, boot_info,
+                              kernel_cmdline, boot_info,
                               NULL, // Standard 80x25 VGA text mode
                               LINUX_RAM_ISO_PHYS, total_iso_bytes,
-                              alpine_params);
+                              kernel_params);
 
     vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
     log_info("BOOT", "==========================================================");
@@ -415,9 +507,10 @@ static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_fil
              LINUX_RAM_ISO_PHYS, total_iso_bytes / 1024 / 1024);
     if (prof && prof->is_clean_session) {
         log_info("BOOT", "  * Persistence    : Clean Session (100%% In-RAM, no saved changes)");
+    } else if (prof) {
+        log_info("BOOT", "  * Persistence    : %s (%s)", prof->profile_name, prof->filename);
     } else {
-        log_info("BOOT", "  * Persistence    : %s (apkovl=LABEL=BOOTLOADER:apkovl.tgz)",
-                 prof ? prof->profile_name : "Default");
+        log_info("BOOT", "  * Persistence    : Direct Hardware Access (Standard OS)");
     }
     log_info("BOOT", "==========================================================");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
@@ -630,8 +723,8 @@ static void load_dynamic_adb_key(uint8_t boot_drive) {
 
     if (fat_src->open(fat_src, "ADBKEY.PUB") == 0) {
         uint32_t fsize = (uint32_t)fat_src->size(fat_src);
-        if (fsize > 0 && fsize < 1024) {
-            static char key_buf[1024];
+        if (fsize > 0 && fsize < 2048) {
+            static char key_buf[2048];
             uint32_t nread = fat_src->read(fat_src, key_buf, fsize);
             if (nread > 0) {
                 while (nread > 0 && (key_buf[nread - 1] == '\r' || key_buf[nread - 1] == '\n' || key_buf[nread - 1] == ' ')) {
