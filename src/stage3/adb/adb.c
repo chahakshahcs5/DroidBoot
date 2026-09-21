@@ -261,8 +261,8 @@ int adb_execute_shell(adb_session_t *session, const char *cmd, char *out_buf, ui
     uint32_t total_out = 0;
 
     while (1) {
-        // Allow up to 12 seconds for su / root shell to spawn and execute
-        res = adb_recv_msg_wait(session, &resp, chunk_buf, sizeof(chunk_buf) - 1, &chunk_len, 12);
+        // Allow up to 4 seconds for shell command to respond
+        res = adb_recv_msg_wait(session, &resp, chunk_buf, sizeof(chunk_buf) - 1, &chunk_len, 4);
         if (res != 0) break;
 
         // Discard any stale packets from older closed streams

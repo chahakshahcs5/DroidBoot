@@ -257,22 +257,39 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
     printk("+------------------------------------------------------------------------+\n");
     printk("| Discovered Operating Systems & Boot Options:                           |\n");
+    printk("| #  Operating System Image               Size    Storage Mode           |\n");
     printk("+------------------------------------------------------------------------+\n");
 
     if (registry && registry->count > 0) {
         for (uint32_t i = 0; i < registry->count; i++) {
             const os_entry_t *entry = &registry->entries[i];
             vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-            printk("|  [%u] %s\n", i + 1, entry->title);
+            printk("| [%u] ", i + 1);
             vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-            printk("|      * Source: %s\n", entry->storage_desc);
-            printk("|      * File  : %s (%u MB)\n", entry->filename, (uint32_t)(entry->file_size / 1024 / 1024));
+
+            char title_col[35];
+            int tlen = 0;
+            while (entry->title[tlen] && tlen < 34) {
+                title_col[tlen] = entry->title[tlen];
+                tlen++;
+            }
+            while (tlen < 34) title_col[tlen++] = ' ';
+            title_col[34] = '\0';
+            printk("%s ", title_col);
+
+            uint32_t mb = (uint32_t)(entry->file_size / 1024 / 1024);
+            if (mb > 0) {
+                printk("%4u MB ", mb);
+            } else {
+                printk("   --   ");
+            }
+
             if (entry->approach == BOOT_APPROACH_BLOCK_ON_DEMAND) {
                 vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
-                printk("|      * Mode  : Direct Block Access (0 MB OS in RAM, Instant Boot)     |\n");
+                printk(" Direct Block |\n");
             } else {
                 vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
-                printk("|      * Mode  : In-RAM Boot + Hardware Storage Persistence             |\n");
+                printk(" In-RAM Cache |\n");
             }
         }
     } else {

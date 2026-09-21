@@ -554,6 +554,7 @@ static void scan_ram_storage(os_registry_t *reg) {
 
             log_info("SCAN", "[+] Registered OS #%u: '%s' (%u MB In-RAM)",
                      reg->count + 1, entry->title, (uint32_t)(total_bytes / 1024 / 1024));
+            log_info("SCAN", "    * Source  : %s", entry->storage_desc);
             log_info("SCAN", "    * Profiles: %u data profiles in /BootManager/persistence/",
                      entry->profile_count);
             reg->count++;
@@ -571,9 +572,15 @@ static void scan_adb_storage(adb_session_t *session, os_registry_t *reg) {
 
     static char adb_out[1024];
     adb_out[0] = '\0';
-    const char *cmd = "su -c 'ls -1 /sdcard/Download/*.iso /sdcard/Download/*.img /sdcard/ISO/*.iso /sdcard/ISO/*.img /sdcard/ISOs/*.iso /sdcard/ISOs/*.img /sdcard/Ventoy/*.iso /sdcard/Ventoy/*.img /sdcard/*.iso /sdcard/*.img /mnt/media_rw/*/*.iso /mnt/media_rw/*/*.img 2>/dev/null'";
-    if (adb_execute_shell(session, cmd, adb_out, sizeof(adb_out)) != 0 || adb_out[0] == '\0') {
-        return;
+    // 1. Try standard unprivileged shell first (fast, direct /sdcard access, no Magisk root prompts/hangs)
+    const char *cmd_std = "ls -1 /sdcard/Download/*.iso /sdcard/Download/*.img /sdcard/ISO/*.iso /sdcard/ISO/*.img /sdcard/ISOs/*.iso /sdcard/ISOs/*.img /sdcard/Ventoy/*.iso /sdcard/Ventoy/*.img /sdcard/*.iso /sdcard/*.img 2>/dev/null";
+    int sh_res = adb_execute_shell(session, cmd_std, adb_out, sizeof(adb_out));
+    if (sh_res != 0 || adb_out[0] == '\0') {
+        // 2. Fallback to su root shell if standard shell could not read candidate folders
+        const char *cmd_su = "su -c 'ls -1 /sdcard/Download/*.iso /sdcard/Download/*.img /sdcard/ISO/*.iso /sdcard/ISO/*.img /sdcard/ISOs/*.iso /sdcard/ISOs/*.img /sdcard/Ventoy/*.iso /sdcard/Ventoy/*.img /sdcard/*.iso /sdcard/*.img /mnt/media_rw/*/*.iso /mnt/media_rw/*/*.img 2>/dev/null'";
+        if (adb_execute_shell(session, cmd_su, adb_out, sizeof(adb_out)) != 0 || adb_out[0] == '\0') {
+            return;
+        }
     }
 
     char *p = adb_out;

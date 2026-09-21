@@ -92,6 +92,11 @@ int boot_cfg_parse(const char *cfg_data, uint32_t len, const char *iso_filename,
         if (pos < len && cfg_data[pos] == '\n') pos++;
         line[l_len] = '\0';
 
+        // Trim trailing \r, \n, and whitespace
+        while (l_len > 0 && (line[l_len - 1] == '\r' || line[l_len - 1] == '\n' || line[l_len - 1] == ' ' || line[l_len - 1] == '\t')) {
+            line[--l_len] = '\0';
+        }
+
         // Trim leading spaces
         const char *p = line;
         while (*p && is_space(*p)) p++;

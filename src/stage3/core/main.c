@@ -60,6 +60,24 @@ static void k_memcpy(void *dst, const void *src, size_t n) {
     for (size_t i = 0; i < n; i++) d[i] = s[i];
 }
 
+static void register_external_msc(usb_device_t *target, const usb_device_t *source, uint8_t p) {
+    log_info("STAGE3", "Port %u: USB Mass Storage Block Storage registered.", p);
+    if (external_usb_detected && target->port_num == p) {
+        // Composite device (MSC + ADB / MTP): preserve active session state & endpoint rings!
+        target->has_msc = true;
+        target->msc_iface_num = source->msc_iface_num;
+        target->msc_bulk_in_ep = source->msc_bulk_in_ep;
+        target->msc_bulk_in_max_packet = source->msc_bulk_in_max_packet;
+        target->msc_bulk_out_ep = source->msc_bulk_out_ep;
+        target->msc_bulk_out_max_packet = source->msc_bulk_out_max_packet;
+    } else {
+        k_memcpy(target, source, sizeof(usb_device_t));
+    }
+    external_usb_detected = true;
+    external_msc_detected = true;
+    active_msc_dev = target;
+}
+
 static size_t k_strlen(const char *s) {
     size_t len = 0;
     if (!s) return 0;
@@ -846,11 +864,7 @@ void c_main(boot_info_t *boot_info) {
                                 active_msc_dev = &boot_msc_device;
                             }
                         } else {
-                            log_info("STAGE3", "Port %u: USB Mass Storage Block Storage registered.", p);
-                            k_memcpy(&external_usb_dev, &current_dev, sizeof(usb_device_t));
-                            external_usb_detected = true;
-                            external_msc_detected = true;
-                            active_msc_dev = &external_usb_dev;
+                            register_external_msc(&external_usb_dev, &current_dev, p);
                         }
                     } else if (external_usb_detected && external_usb_dev.has_mtp && !active_mtp_session.session_active) {
                         log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
@@ -945,11 +959,7 @@ void c_main(boot_info_t *boot_info) {
                                     active_msc_dev = &boot_msc_device;
                                 }
                             } else {
-                                log_info("STAGE3", "Port %u: USB Mass Storage Block Storage registered.", p);
-                                k_memcpy(&external_usb_dev, &current_dev, sizeof(usb_device_t));
-                                external_usb_detected = true;
-                                external_msc_detected = true;
-                                active_msc_dev = &external_usb_dev;
+                                register_external_msc(&external_usb_dev, &current_dev, p);
                                 break;
                             }
                         } else if (external_usb_detected && external_usb_dev.has_mtp) {
@@ -1034,10 +1044,7 @@ void c_main(boot_info_t *boot_info) {
                                     active_msc_dev = &boot_msc_device;
                                 }
                             } else {
-                                k_memcpy(&external_usb_dev, &current_dev, sizeof(usb_device_t));
-                                external_usb_detected = true;
-                                external_msc_detected = true;
-                                active_msc_dev = &external_usb_dev;
+                                register_external_msc(&external_usb_dev, &current_dev, p);
                             }
                         } else if (external_usb_detected && external_usb_dev.has_mtp && !active_mtp_session.session_active) {
                             if (mtp_init_session(&external_usb_dev, &active_mtp_session) == 0) {
@@ -1073,8 +1080,17 @@ void c_main(boot_info_t *boot_info) {
                     snprintf(prof_path, sizeof(prof_path), "/sdcard/BootManager/persistence/%s", prof->filename);
                 }
 
-                // If phone is ALREADY operating as USB Mass Storage, hot-swap image without dropping bus!
+                // If phone is ALREADY operating as USB Mass Storage, check if selected image is already active!
                 if (external_msc_detected && external_usb_dev.has_msc) {
+                    if (sel_img->approach == BOOT_APPROACH_BLOCK_ON_DEMAND && sel_img->storage_type == OS_STORAGE_BLOCK_USB) {
+                        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                        log_info("BOOT", "Image '%s' is already active on USB Mass Storage LUN 0!", sel_img->title);
+                        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                        disk_log_flush();
+                        boot_from_usb_msc(&external_usb_dev, boot_info, prof);
+                        break;
+                    }
+
                     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
                     log_info("STAGE3", "Phone already in UMS mode. Hot-swapping image to '%s' (Profile: '%s')...",
                              sel_img->filename, prof_path[0] ? prof->filename : "Clean Session");
@@ -1180,11 +1196,25 @@ void c_main(boot_info_t *boot_info) {
 
                     bool ums_booted = false;
 
-                    // If phone is ALREADY operating as USB Mass Storage and ADB is connected, hot-swap immediately!
+                    // 1. If selected image is ALREADY on the active USB block storage, boot directly without touching ADB!
+                    if (selected->approach == BOOT_APPROACH_BLOCK_ON_DEMAND && selected->storage_type == OS_STORAGE_BLOCK_USB) {
+                        usb_device_t *target_msc = selected->usb_dev ? selected->usb_dev : active_msc_dev;
+                        if (target_msc && target_msc->has_msc) {
+                            vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                            log_info("BOOT", "Booting '%s' directly from active USB Mass Storage Block Device...", selected->title);
+                            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                            disk_log_flush();
+                            boot_from_usb_msc(target_msc, boot_info, prof);
+                            ums_booted = true;
+                            break;
+                        }
+                    }
+
+                    // 2. If phone is in UMS mode and a DIFFERENT image was selected, hot-swap via ADB!
                     if (external_msc_detected && external_usb_dev.has_msc) {
                         if (active_adb_session.is_connected) {
                             vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
-                            log_info("BOOT", "Phone already in UMS mode. Hot-swapping to '%s' (Profile: '%s')...",
+                            log_info("BOOT", "Phone in UMS mode. Hot-swapping to '%s' (Profile: '%s')...",
                                      selected->filename, prof_path[0] ? prof->filename : "Clean Session");
                             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                             disk_log_flush();

@@ -177,7 +177,8 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
 
     // Endpoint 0 Context (offset = 2 * ctx_sz: 0x40 in 32-byte mode, 0x80 in 64-byte mode)
     uint32_t *ep0_ctx = (uint32_t *)(input_ctx + 2 * ctx_sz);
-    uint16_t max_packet = (speed == 4) ? 512 : ((speed == 2) ? 8 : 64);
+    // Per xHCI Spec 4.3.3: SuperSpeed=512, HighSpeed=64, FullSpeed/LowSpeed=8 initially
+    uint16_t max_packet = (speed >= 4) ? 512 : ((speed == 3) ? 64 : 8);
     ep0_ctx[0] = 0;
     ep0_ctx[1] = (3U << 1) | (4U << 3) | ((uint32_t)max_packet << 16); // CErr=3, EP Type = 4 (Control), MaxPacket
 
@@ -208,6 +209,13 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
     xhci_trb_t addr_evt;
     int addr_res = xhci_send_command(ctrl, &addr_cmd, &addr_evt);
     if (addr_res != 0) {
+        log_error("USB", "Address Device failed (code %d) on Port %u. Retrying after reset...", addr_res, port_num);
+        for (int w = 0; w < 50000; w++) io_wait();
+        xhci_reset_port(ctrl, port_num);
+        for (int w = 0; w < 50000; w++) io_wait();
+        addr_res = xhci_send_command(ctrl, &addr_cmd, &addr_evt);
+    }
+    if (addr_res != 0) {
         log_error("USB", "Address Device command failed (code %d)!", addr_res);
         return -4;
     }
@@ -225,6 +233,18 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
     if (get_desc_res != 0) {
         log_error("USB", "Failed to retrieve Device Descriptor (error %d)!", get_desc_res);
         return -5;
+    }
+
+    if (out_dev->dev_desc.bMaxPacketSize0 > 0 && out_dev->dev_desc.bMaxPacketSize0 != max_packet) {
+        log_info("USB", "Updating EP0 MaxPacketSize to %u via Evaluate Context...", out_dev->dev_desc.bMaxPacketSize0);
+        *(uint32_t *)(input_ctx + 0) = 0;
+        *(uint32_t *)(input_ctx + 4) = (1U << 1); // Add EP0 Context
+        ep0_ctx[1] = (ep0_ctx[1] & ~0xFFFF0000U) | ((uint32_t)out_dev->dev_desc.bMaxPacketSize0 << 16);
+        xhci_trb_t eval_cmd;
+        eval_cmd.parameter = (uintptr_t)input_ctx;
+        eval_cmd.status = 0;
+        eval_cmd.control = TRB_TYPE(TRB_EVAL_CTX_CMD) | ((uint32_t)slot_id << 24);
+        xhci_send_command(ctrl, &eval_cmd, &addr_evt);
     }
 
     log_info("USB", "Device Descriptor: VID=0x%04X, PID=0x%04X, Class=0x%02X, Subclass=0x%02X, Proto=0x%02X, Configs=%u",
