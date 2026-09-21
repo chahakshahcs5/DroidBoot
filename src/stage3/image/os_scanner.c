@@ -3,6 +3,7 @@
 #include "../memory/memory.h"
 #include "../bios/bios_disk.h"
 #include "../filesystem/fat_source.h"
+#include "../filesystem/diskio.h"
 #include "../usb/usb_msc.h"
 
 static void k_memset(void *dst, uint8_t val, size_t n) {
@@ -333,8 +334,8 @@ static void scan_mtp_storage(mtp_session_t *session, os_registry_t *reg) {
 // 3. Scan Local SD Card FAT32 Partition - Approach 1: Direct Block Access
 // -----------------------------------------------------------------------------
 static int sd_read_sectors(void *priv, uint32_t lba, uint32_t count, void *buf) {
-    uint8_t drive = (uint8_t)(uintptr_t)priv;
-    return bios_disk_read(drive, lba, (uint16_t)count, buf);
+    (void)priv;
+    return (disk_read(0, (uint8_t *)buf, lba, count) == RES_OK) ? 0 : -1;
 }
 
 typedef struct {
@@ -375,11 +376,12 @@ static void sd_fat_scan_cb(const char *filename, uint64_t size, bool is_dir, voi
 }
 
 static void scan_sd_storage(uint8_t boot_drive, os_registry_t *reg) {
+    (void)boot_drive;
     if (reg->count >= MAX_OS_ENTRIES) return;
 
     static uint8_t sector_buf[512];
-    if (bios_disk_read(boot_drive, 0, 1, sector_buf) != 0) {
-        log_info("SCAN", "Failed to read MBR on SD Card (Drive 0x%02X).", boot_drive);
+    if (disk_read(0, sector_buf, 0, 1) != RES_OK) {
+        log_info("SCAN", "Boot drive storage unavailable (BIOS disengaged / no MSC fallback).");
         return;
     }
 

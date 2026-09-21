@@ -118,9 +118,9 @@ def create_fat32_partition(total_sectors: int, hidden_lba: int, adb_key_data: by
     struct.pack_into("<I", fsinfo, 484, 0x61417272) # "rrAa"
     total_data_sectors = total_sectors - data_start_lba
     total_clusters = total_data_sectors // sectors_per_cluster
-    free_clusters = max(0, total_clusters - 20)
+    free_clusters = max(0, total_clusters - 182)
     struct.pack_into("<I", fsinfo, 488, free_clusters)
-    struct.pack_into("<I", fsinfo, 492, 21)
+    struct.pack_into("<I", fsinfo, 492, 182)
     struct.pack_into("<I", fsinfo, 508, 0xAA550000)
 
     part_bytes[1*512:2*512] = fsinfo
@@ -130,9 +130,11 @@ def create_fat32_partition(total_sectors: int, hidden_lba: int, adb_key_data: by
     # Cluster 0: 0x0FFFFFF8, Cluster 1: 0x0FFFFFFF
     # Cluster 2 (Root dir): 0x0FFFFFFF
     # Cluster 3..17: Next cluster pointer
-    # Cluster 18: 0x0FFFFFFF (End of BOOTLOG.TXT chain)
+    # Cluster 18: 0x0FFFFFFF (End of BOOTLOG.TXT chain, 64 KiB)
     # Cluster 19: 0x0FFFFFFF (Optional ADBKEY.PUB)
     # Cluster 20: 0x0FFFFFFF (APKOVL.TGZ)
+    # Cluster 21: 0x0FFFFFFF (BOOTCNT.DAT - Monotonic boot session counter)
+    # Clusters 22..181: 10 dedicated boot session logs (BOOT0001.LOG..BOOT0010.LOG, 64 KiB each)
     fat_table = bytearray(fat_size * bytes_per_sector)
     struct.pack_into("<I", fat_table, 0*4, 0x0FFFFFF8)
     struct.pack_into("<I", fat_table, 1*4, 0x0FFFFFFF)
@@ -149,27 +151,50 @@ def create_fat32_partition(total_sectors: int, hidden_lba: int, adb_key_data: by
     apkovl_data = generate_alpine_apkovl()
     struct.pack_into("<I", fat_table, 20*4, 0x0FFFFFFF)
 
+    # Cluster 21 (BOOTCNT.DAT)
+    struct.pack_into("<I", fat_table, 21*4, 0x0FFFFFFF)
+
+    # Clusters 22..181 (10 dedicated per-boot historical log files, 16 clusters = 64 KiB each)
+    for b in range(10):
+        start_c = 22 + b * 16
+        for c in range(start_c, start_c + 15):
+            struct.pack_into("<I", fat_table, c*4, c + 1)
+        struct.pack_into("<I", fat_table, (start_c + 15)*4, 0x0FFFFFFF)
+
     part_bytes[fat1_lba*512:(fat1_lba + fat_size)*512] = fat_table
     part_bytes[fat2_lba*512:(fat2_lba + fat_size)*512] = fat_table
 
     # 4. Root Directory (Cluster 2)
     root_dir_offset = data_start_lba * 512
     root_dir = bytearray(sectors_per_cluster * 512)
+    dir_idx = 0
 
     # Volume ID entry
     ent0 = bytearray(32)
     ent0[0:11] = b'BOOTLOADER '
     ent0[11] = 0x08 # ATTR_VOLUME_ID
-    root_dir[0:32] = ent0
+    root_dir[dir_idx:dir_idx+32] = ent0
+    dir_idx += 32
 
-    # BOOTLOG.TXT entry
+    # BOOTLOG.TXT entry (Always holds the latest boot log)
     ent1 = bytearray(32)
     ent1[0:11] = b'BOOTLOG TXT'
     ent1[11] = 0x20 # ATTR_ARCHIVE
     struct.pack_into("<H", ent1, 20, 0)             # First cluster HI
     struct.pack_into("<H", ent1, 26, 3)             # First cluster LO (Cluster 3)
     struct.pack_into("<I", ent1, 28, len(INITIAL_BOOTLOG_TEXT)) # File size
-    root_dir[32:64] = ent1
+    root_dir[dir_idx:dir_idx+32] = ent1
+    dir_idx += 32
+
+    # BOOTCNT.DAT entry (Cluster 21, holds monotonic boot counter)
+    ent_cnt = bytearray(32)
+    ent_cnt[0:11] = b'BOOTCNT DAT'
+    ent_cnt[11] = 0x20 # ATTR_ARCHIVE
+    struct.pack_into("<H", ent_cnt, 20, 0)
+    struct.pack_into("<H", ent_cnt, 26, 21)         # Cluster 21
+    struct.pack_into("<I", ent_cnt, 28, 4)          # 4 bytes (uint32)
+    root_dir[dir_idx:dir_idx+32] = ent_cnt
+    dir_idx += 32
 
     # ADBKEY.PUB entry (Cluster 19) if present
     if adb_key_data:
@@ -179,7 +204,8 @@ def create_fat32_partition(total_sectors: int, hidden_lba: int, adb_key_data: by
         struct.pack_into("<H", ent2, 20, 0)
         struct.pack_into("<H", ent2, 26, 19)        # Cluster 19
         struct.pack_into("<I", ent2, 28, len(adb_key_data))
-        root_dir[64:96] = ent2
+        root_dir[dir_idx:dir_idx+32] = ent2
+        dir_idx += 32
 
     # APKOVL.TGZ entry (Cluster 20)
     ent3 = bytearray(32)
@@ -188,7 +214,23 @@ def create_fat32_partition(total_sectors: int, hidden_lba: int, adb_key_data: by
     struct.pack_into("<H", ent3, 20, 0)
     struct.pack_into("<H", ent3, 26, 20)            # Cluster 20
     struct.pack_into("<I", ent3, 28, len(apkovl_data))
-    root_dir[96:128] = ent3
+    root_dir[dir_idx:dir_idx+32] = ent3
+    dir_idx += 32
+
+    # 10 Dedicated Per-Boot Historical Log Slots (BOOT0001.LOG .. BOOT0010.LOG)
+    for b in range(10):
+        slot_num = b + 1
+        name_83 = f"BOOT{slot_num:04d}LOG".encode('ascii')
+        ent_b = bytearray(32)
+        ent_b[0:11] = name_83
+        ent_b[11] = 0x20 # ATTR_ARCHIVE
+        start_c = 22 + b * 16
+        struct.pack_into("<H", ent_b, 20, 0)
+        struct.pack_into("<H", ent_b, 26, start_c)
+        init_size = len(INITIAL_BOOTLOG_TEXT) if b == 0 else 0
+        struct.pack_into("<I", ent_b, 28, init_size)
+        root_dir[dir_idx:dir_idx+32] = ent_b
+        dir_idx += 32
 
     part_bytes[root_dir_offset:root_dir_offset + len(root_dir)] = root_dir
 
@@ -196,14 +238,24 @@ def create_fat32_partition(total_sectors: int, hidden_lba: int, adb_key_data: by
     file_offset = (data_start_lba + (3 - 2) * sectors_per_cluster) * 512
     part_bytes[file_offset:file_offset + len(INITIAL_BOOTLOG_TEXT)] = INITIAL_BOOTLOG_TEXT
 
-    # 6. Populate ADBKEY.PUB cluster 19 if present
+    # 6. Populate BOOTCNT.DAT cluster 21 (Initial boot counter = 1)
+    cnt_offset = (data_start_lba + (21 - 2) * sectors_per_cluster) * 512
+    struct.pack_into("<I", part_bytes, cnt_offset, 1)
+
+    # 7. Populate BOOT0001.LOG cluster 22
+    b1_offset = (data_start_lba + (22 - 2) * sectors_per_cluster) * 512
+    part_bytes[b1_offset:b1_offset + len(INITIAL_BOOTLOG_TEXT)] = INITIAL_BOOTLOG_TEXT
+
+    # 8. Populate ADBKEY.PUB cluster 19 if present
     if adb_key_data:
         key_offset = (data_start_lba + (19 - 2) * sectors_per_cluster) * 512
         part_bytes[key_offset:key_offset + len(adb_key_data)] = adb_key_data
 
-    # 7. Populate APKOVL.TGZ cluster 20
+    # 9. Populate APKOVL.TGZ cluster 20
     apkovl_offset = (data_start_lba + (20 - 2) * sectors_per_cluster) * 512
     part_bytes[apkovl_offset:apkovl_offset + len(apkovl_data)] = apkovl_data
+
+    return bytes(part_bytes)
 
     return bytes(part_bytes)
 

@@ -3,6 +3,7 @@
 #include "../memory/memory.h"
 #include "../../include/io.h"
 #include "../debug/vga.h"
+#include "../debug/disk_log.h"
 
 // 60-byte self-contained relocation trampoline for 32-bit Linux handoff
 static const uint8_t trampoline_template[] = {
@@ -306,6 +307,9 @@ void linux_boot_jump(uint32_t kernel_source_addr, uint32_t kernel_target_addr,
              kernel_size, kernel_source_addr, kernel_target_addr);
     log_info("LINUX", "Handoff to code32_start at 0x%08X with ESI=0x%08X...",
              entry_point, boot_params_addr);
+
+    // Guaranteed final log flush right before handing off execution to Linux!
+    disk_log_flush_with_feedback();
 
     typedef void (*trampoline_fn_t)(uint32_t src, uint32_t dst, uint32_t len,
                                     uint32_t params, uint32_t entry);

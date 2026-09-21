@@ -12,6 +12,12 @@
 #define RAW_LOG_LBA             1024
 #define RAW_LOG_SECTORS         128     // 64 KiB
 
+typedef enum {
+    LOG_STATE_BIOS = 0,     // Early boot: safe to use BIOS INT 13h
+    LOG_STATE_BUFFERED = 1, // Transitional: xHCI handover in progress, buffer in RAM only (NO BIOS calls!)
+    LOG_STATE_USB_MSC = 2   // xHCI active: direct hardware USB Mass Storage (SCSI BOT)
+} disk_log_state_t;
+
 typedef struct disk_log_header {
     uint32_t magic1;        // "BOOT" (0x544F4F42)
     uint32_t magic2;        // "LOG!" (0x21474F4C)
@@ -21,24 +27,24 @@ typedef struct disk_log_header {
     uint32_t error_count;   // Total flush errors encountered
     uint32_t log_start;     // Start offset in circular buffer (0 if not wrapped)
     uint32_t total_written; // Total bytes ever written (monotonic, for reader tools)
-    uint8_t  reserved[480]; // Pad to 512-byte sector
+    uint32_t boot_count;    // Monotonic boot session counter (1, 2, 3...)
+    uint8_t  session_name[16]; // e.g. "BOOT0001.LOG\0"
+    uint8_t  reserved[460]; // Pad to 512-byte sector
 } __attribute__((packed)) disk_log_header_t;
 
-// Initialize disk logging subsystem and resolve FAT32 BOOTLOG.TXT
+// Initialize disk logging subsystem and resolve FAT32 BOOTLOG.TXT & per-boot session file
 void disk_log_init(boot_info_t *boot_info);
 
 // Character sink called by printf
 void disk_log_putc(char c);
 
-// Flush in-memory log buffer to SD card (both FAT32 BOOTLOG.TXT and raw LBA 256)
+// Flush in-memory log buffer to disk (both latest BOOTLOG.TXT and dedicated BOOTxxxx.LOG)
 void disk_log_flush(void);
 
 // Flush with PC speaker audio feedback (beep on success, buzz on failure)
-// Use this for critical checkpoints when screen is broken
 void disk_log_flush_with_feedback(void);
 
 // Auto-flush if enough new data has accumulated since last flush (≥4KB)
-// Call this periodically from printk to ensure output is captured
 void disk_log_auto_flush_if_needed(void);
 
 // Register native USB Mass Storage device for persistent logging after xHCI takeover
@@ -46,6 +52,16 @@ void disk_log_register_usb_msc(void *usb_dev);
 
 // Disable BIOS INT 13h disk access (called before xHCI reset to prevent hangs)
 void disk_log_disable_bios(void);
+
+// Re-enable BIOS fallback if boot drive was not on xHCI USB (e.g. IDE in QEMU)
+void disk_log_enable_bios_fallback(void);
+
+// Get current logging backend state
+disk_log_state_t disk_log_get_state(void);
+
+// Get current boot session id and file name (e.g. 1, "BOOT0001.LOG")
+uint32_t disk_log_get_session_id(void);
+const char *disk_log_get_session_filename(void);
 
 // Get current log buffer stats
 uint32_t disk_log_get_length(void);

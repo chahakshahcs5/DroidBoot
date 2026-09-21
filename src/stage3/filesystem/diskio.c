@@ -4,10 +4,19 @@
 #include "../core/printf.h"
 
 static uint8_t      bios_drive = 0x80;
+static bool         bios_enabled = true;
 static usb_device_t *msc_device = NULL;
 
 void diskio_set_bios_drive(uint8_t drive) {
     bios_drive = drive;
+}
+
+void diskio_disable_bios(void) {
+    bios_enabled = false;
+}
+
+void diskio_enable_bios_fallback(void) {
+    bios_enabled = true;
 }
 
 void diskio_set_usb_msc_device(usb_device_t *dev) {
@@ -16,7 +25,10 @@ void diskio_set_usb_msc_device(usb_device_t *dev) {
 
 DSTATUS disk_initialize(uint8_t pdrv) {
     if (pdrv == 0) {
-        return 0; // BIOS drive ready
+        if (!bios_enabled && msc_device) {
+            return (usb_msc_init_device(msc_device) == 0) ? 0 : STA_NOINIT;
+        }
+        return bios_enabled ? 0 : STA_NOINIT;
     } else if (pdrv == 1) {
         if (!msc_device || !msc_device->has_msc) return STA_NODISK;
         return (usb_msc_init_device(msc_device) == 0) ? 0 : STA_NOINIT;
@@ -25,7 +37,12 @@ DSTATUS disk_initialize(uint8_t pdrv) {
 }
 
 DSTATUS disk_status(uint8_t pdrv) {
-    if (pdrv == 0) return 0;
+    if (pdrv == 0) {
+        if (!bios_enabled && msc_device) {
+            return msc_device->has_msc ? 0 : STA_NODISK;
+        }
+        return bios_enabled ? 0 : STA_NODISK;
+    }
     if (pdrv == 1) {
         return (msc_device && msc_device->has_msc) ? 0 : STA_NODISK;
     }
@@ -36,6 +53,11 @@ DRESULT disk_read(uint8_t pdrv, uint8_t *buff, uint32_t sector, uint32_t count) 
     if (!buff || count == 0) return RES_PARERR;
 
     if (pdrv == 0) {
+        if (!bios_enabled && msc_device) {
+            int res = usb_msc_read_sectors(msc_device, sector, (uint16_t)count, buff);
+            return (res == 0) ? RES_OK : RES_ERROR;
+        }
+        if (!bios_enabled) return RES_NOTRDY;
         int res = bios_disk_read(bios_drive, sector, (uint16_t)count, buff);
         return (res == 0) ? RES_OK : RES_ERROR;
     } else if (pdrv == 1) {
@@ -51,6 +73,11 @@ DRESULT disk_write(uint8_t pdrv, const uint8_t *buff, uint32_t sector, uint32_t 
     if (!buff || count == 0) return RES_PARERR;
 
     if (pdrv == 0) {
+        if (!bios_enabled && msc_device) {
+            int res = usb_msc_write_sectors(msc_device, sector, (uint16_t)count, buff);
+            return (res == 0) ? RES_OK : RES_ERROR;
+        }
+        if (!bios_enabled) return RES_NOTRDY;
         int res = bios_disk_write(bios_drive, sector, (uint16_t)count, buff);
         return (res == 0) ? RES_OK : RES_ERROR;
     } else if (pdrv == 1) {

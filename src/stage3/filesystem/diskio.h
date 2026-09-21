@@ -20,6 +20,8 @@ typedef enum {
 
 // Driver registration
 void diskio_set_bios_drive(uint8_t drive);
+void diskio_disable_bios(void);
+void diskio_enable_bios_fallback(void);
 struct usb_device;
 void diskio_set_usb_msc_device(struct usb_device *dev);
 
