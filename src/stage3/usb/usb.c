@@ -1212,10 +1212,10 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
         usb_local_memcpy(slot_ctx_bytes, hub_dev_ctx, ctx_sz);
     }
     uint32_t *hub_slot_ctx = (uint32_t *)slot_ctx_bytes;
-    // Set Hub flag: bit 26
-    hub_slot_ctx[0] |= (1U << 26);
-    // Set Number of Downstream Ports: bits 24..31 of info_2
-    hub_slot_ctx[1] = (hub_slot_ctx[1] & 0x00FFFFFFU) | ((uint32_t)num_ports << 24);
+    hub_slot_ctx[0] = (hub_slot_ctx[0] & ~(0x0FU << 20)) | ((uint32_t)hub_dev->speed << 20);
+    hub_slot_ctx[0] |= (1U << 26); // Set Hub flag (bit 26)
+    if ((hub_slot_ctx[0] >> 27) == 0) hub_slot_ctx[0] |= (1U << 27); // Ensure Context Entries >= 1
+    hub_slot_ctx[1] = (hub_slot_ctx[1] & 0x0000FFFFU) | ((uint32_t)hub_dev->port_num << 16) | ((uint32_t)num_ports << 24);
 
     xhci_trb_t eval_cmd;
     eval_cmd.parameter = (uintptr_t)hub_input_ctx;
@@ -1377,9 +1377,14 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
         uint32_t route_string = (p & 0x0FU); // Tier-1 downstream port
         c_slot_ctx[0] = route_string | ((uint32_t)child_speed << 20) | (1U << 27);
         c_slot_ctx[1] = ((uint32_t)hub_dev->port_num << 16); // Root Hub Port Number
-        c_slot_ctx[2] = ((uint32_t)hub_dev->slot_id & 0xFF) | (((uint32_t)p & 0xFF) << 8); // Parent Slot ID & Parent Port
-
-        // Endpoint 0 Context
+        // Per xHCI Spec 6.2.2: Parent Hub Slot ID & Port in DWORD 2 (tt_info)
+        // MUST only be set if the device is Low/Full-speed attached to a High-speed hub (Transaction Translator).
+        // For High-Speed (speed 3) and SuperSpeed (speed 4), this field MUST be 0 to prevent Parameter Error (CC=17).
+        if (child_speed < 3 && hub_dev->speed == 3) {
+            c_slot_ctx[2] = ((uint32_t)hub_dev->slot_id & 0xFF) | (((uint32_t)p & 0xFF) << 8);
+        } else {
+            c_slot_ctx[2] = 0;
+        }
         uint32_t *c_ep0_ctx = (uint32_t *)(child_in_ctx + 2 * ctx_sz);
         uint16_t c_max_packet = (child_speed >= 4) ? 512 : ((child_speed == 3) ? 64 : 8);
         c_ep0_ctx[0] = 0;
