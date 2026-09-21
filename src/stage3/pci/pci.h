@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#define PCI_CLASS_MASS_STORAGE      0x01
+#define PCI_CLASS_NETWORK           0x02
+#define PCI_CLASS_DISPLAY           0x03
 #define PCI_CLASS_SERIAL_BUS        0x0C
 #define PCI_SUBCLASS_USB            0x03
 #define PCI_PROGIF_UHCI             0x00

@@ -29,6 +29,49 @@ static const char *get_speed_name(uint8_t speed) {
     }
 }
 
+const char *xhci_cc_to_string(uint8_t cc) {
+    switch (cc) {
+        case 1:  return "Success (1)";
+        case 2:  return "Data Buffer Error (2)";
+        case 3:  return "Babble Detected (3)";
+        case 4:  return "USB Transaction Error (4)";
+        case 5:  return "TRB Error (5)";
+        case 6:  return "Stall Error (6)";
+        case 7:  return "Resource Error (7)";
+        case 8:  return "Bandwidth Error (8)";
+        case 9:  return "No Slots Available (9)";
+        case 10: return "Invalid Stream Type (10)";
+        case 11: return "Slot Not Enabled (11)";
+        case 12: return "Endpoint Not Enabled (12)";
+        case 13: return "Short Packet (13)";
+        case 14: return "Ring Underrun (14)";
+        case 15: return "Ring Overrun (15)";
+        case 17: return "Parameter Error (17)";
+        case 19: return "Context State Error (19)";
+        case 21: return "Event Ring Full (21)";
+        default: return "Unknown Code";
+    }
+}
+
+const char *xhci_pls_to_string(uint8_t pls) {
+    switch (pls) {
+        case 0:  return "U0 (Active)";
+        case 1:  return "U1 (Sleep 1)";
+        case 2:  return "U2 (Sleep 2)";
+        case 3:  return "U3 (Suspended)";
+        case 4:  return "Disabled";
+        case 5:  return "RxDetect";
+        case 6:  return "Inactive";
+        case 7:  return "Polling";
+        case 8:  return "Recovery";
+        case 9:  return "Hot Reset";
+        case 10: return "Compliance";
+        case 11: return "Test Mode";
+        case 15: return "Resume";
+        default: return "Reserved";
+    }
+}
+
 static void xhci_bios_handoff(xhci_controller_t *ctrl) {
     uint32_t hccparams1 = xhci_read32(ctrl->mmio_base + XHCI_CAP_HCCPARAMS1);
     uint32_t xecp = (hccparams1 >> 16) & 0xFFFF;
@@ -260,9 +303,21 @@ void xhci_poll_ports(xhci_controller_t *ctrl) {
         uintptr_t port_reg = ctrl->op_regs + XHCI_OP_PORTS_BASE + (p - 1) * 0x10;
         uint32_t portsc = xhci_read32(port_reg);
 
-        if (portsc & XHCI_PORT_CCS) {
-            uint8_t speed = (uint8_t)((portsc & XHCI_PORT_SPEED_MASK) >> XHCI_PORT_SPEED_SHIFT);
-            bool enabled = (portsc & XHCI_PORT_PED) != 0;
+        uint8_t speed = (uint8_t)((portsc & XHCI_PORT_SPEED_MASK) >> XHCI_PORT_SPEED_SHIFT);
+        uint8_t pls = (uint8_t)((portsc & XHCI_PORT_PLS_MASK) >> 5);
+        (void)pls;
+        bool connected = (portsc & XHCI_PORT_CCS) != 0;
+        bool enabled = (portsc & XHCI_PORT_PED) != 0;
+
+#if IS_DEBUG_BUILD
+        if (connected || (portsc & XHCI_PORT_PP)) {
+            log_debug("XHCI", "  Port %02u: PORTSC=0x%08X (Conn:%u En:%u Pwr:%u | Speed:%s | PLS:%s)",
+                      p, portsc, connected, enabled, (portsc & XHCI_PORT_PP) != 0,
+                      get_speed_name(speed), xhci_pls_to_string(pls));
+        }
+#endif
+
+        if (connected) {
             log_info("XHCI", "  Port %u: CONNECTED | Speed: %s | Enabled: %s",
                      p, get_speed_name(speed), enabled ? "YES" : "NO");
             connected_count++;
@@ -283,14 +338,18 @@ int xhci_reset_port(xhci_controller_t *ctrl, uint8_t port_id) {
     // If device is not connected, nothing to reset
     if (!(portsc & XHCI_PORT_CCS)) return -1;
 
-    // If port is already enabled SuperSpeed (speed >= 4, e.g. USB 3.0 SD card reader), no reset needed
     uint8_t speed = (uint8_t)((portsc & XHCI_PORT_SPEED_MASK) >> XHCI_PORT_SPEED_SHIFT);
+    log_debug("XHCI", "Port %u Reset start: PORTSC=0x%08X (Speed: %s)", port_id, portsc, get_speed_name(speed));
+
+    // If port is already enabled SuperSpeed (speed >= 4, e.g. USB 3.0 SD card reader), no reset needed
     if ((portsc & XHCI_PORT_PED) && speed >= 4) {
+        log_debug("XHCI", "Port %u: already SuperSpeed enabled (PED=1), skipping reset", port_id);
         return 0;
     }
 
     if (speed >= 4) {
         // SuperSpeed (USB 3.0+): Warm Port Reset (WPR, bit 31)
+        log_debug("XHCI", "Port %u: Triggering SuperSpeed Warm Port Reset (WPR)...", port_id);
         xhci_write32(port_reg, xhci_portsc_clean(portsc) | XHCI_PORT_WPR);
 
         int timeout = 100;
@@ -304,6 +363,7 @@ int xhci_reset_port(xhci_controller_t *ctrl, uint8_t port_id) {
         }
     } else {
         // USB 2.0 / USB 1.1: Port Reset (PR, bit 4)
+        log_debug("XHCI", "Port %u: Triggering USB 2.0 Port Reset (PR)...", port_id);
         xhci_write32(port_reg, xhci_portsc_clean(portsc) | XHCI_PORT_PR);
 
         int timeout = 100;
@@ -321,11 +381,17 @@ int xhci_reset_port(xhci_controller_t *ctrl, uint8_t port_id) {
     }
 
     portsc = xhci_read32(port_reg);
-    return (portsc & XHCI_PORT_PED) ? 0 : -2;
+    bool enabled = (portsc & XHCI_PORT_PED) != 0;
+    speed = (uint8_t)((portsc & XHCI_PORT_SPEED_MASK) >> XHCI_PORT_SPEED_SHIFT);
+    log_debug("XHCI", "Port %u Reset end: PORTSC=0x%08X (Enabled: %s, Speed: %s)",
+              port_id, portsc, enabled ? "YES" : "NO", get_speed_name(speed));
+    return enabled ? 0 : -2;
 }
 
 int xhci_send_command(xhci_controller_t *ctrl, xhci_trb_t *cmd, xhci_trb_t *event_out) {
     if (!ctrl || !cmd) return -1;
+
+    uint32_t cmd_type = (cmd->control >> TRB_TYPE_SHIFT) & 0x3F;
 
     // Enqueue command TRB onto Command Ring
     uint32_t idx = ctrl->cmd_enqueue_idx;
@@ -376,7 +442,14 @@ int xhci_send_command(xhci_controller_t *ctrl, xhci_trb_t *cmd, xhci_trb_t *even
                     xhci_write64(intr0 + XHCI_INTR_ERDP, erdp | XHCI_ERDP_EHB);
 
                     uint8_t cc = (uint8_t)((evt->status >> 24) & 0xFF);
-                    return (cc == TRB_COMPL_SUCCESS) ? 0 : (int)cc;
+                    if (cc == TRB_COMPL_SUCCESS) {
+                        log_debug("XHCI", "Command TRB Type %u succeeded (CC=1)", cmd_type);
+                        return 0;
+                    } else {
+                        log_error("XHCI", "Command TRB Type %u FAILED with CC %u (%s)!",
+                                  cmd_type, cc, xhci_cc_to_string(cc));
+                        return (int)cc;
+                    }
                 }
             }
 
@@ -393,7 +466,7 @@ int xhci_send_command(xhci_controller_t *ctrl, xhci_trb_t *cmd, xhci_trb_t *even
         udelay(100);
     }
 
-    log_error("XHCI", "Command completion timed out!");
+    log_error("XHCI", "Command TRB Type %u timed out!", cmd_type);
     return -100;
 }
 

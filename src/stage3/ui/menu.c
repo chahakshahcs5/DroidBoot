@@ -53,6 +53,15 @@ static void copy_str(char *dst, const char *src, uint32_t max_len) {
     dst[i] = '\0';
 }
 
+static void console_puts(const char *s) {
+    if (!s) return;
+    while (*s) {
+        serial_putchar(*s);
+        vga_putchar(*s);
+        s++;
+    }
+}
+
 static int poll_input_char(void) {
     // 1. Poll BIOS INT 16h Keyboard Service (universal for laptop built-in and USB keyboards)
     uint16_t k = bios_int16_call(0x01);
@@ -862,9 +871,9 @@ int menu_select_persistence_profile(os_entry_t *entry, adb_session_t *adb) {
 void menu_view_system_log(void) {
     vga_clear();
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
-    printk("======================================================================\n");
-    printk("  LIVE SYSTEM & BOOT DIAGNOSTICS LOG (RAM BUFFER)\n");
-    printk("======================================================================\n");
+    console_puts("======================================================================\n");
+    console_puts("  LIVE SYSTEM & BOOT DIAGNOSTICS LOG (RAM BUFFER)\n");
+    console_puts("======================================================================\n");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
     uint32_t total_len = 0;
@@ -872,8 +881,8 @@ void menu_view_system_log(void) {
     disk_log_copy_linear(log_view_buf, sizeof(log_view_buf), &total_len);
 
     if (total_len == 0) {
-        printk("No log records in memory buffer.\n\n");
-        printk("Press any key to return to main menu...");
+        console_puts("No log records in memory buffer.\n\n");
+        console_puts("Press any key to return to main menu...");
         menu_get_char();
         return;
     }
@@ -901,13 +910,13 @@ void menu_view_system_log(void) {
         } else {
             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
         }
-        printk("%s\n", line_buf);
+        console_puts(line_buf);
+        console_puts("\n");
         line_count++;
 
         if (line_count >= 21 && pos < total_len) {
-            uint32_t pct = (pos * 100) / total_len;
             vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLUE);
-            printk(" -- [SPACE/ENTER]: Next Page | [Q]: Return to Menu (%u%%) -- ", pct);
+            console_puts(" -- [SPACE/ENTER]: Next Page | [Q]: Return to Menu -- ");
             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
             int ch = menu_get_char();
             if (ch == 'q' || ch == 'Q' || ch == KEY_ESC) {
@@ -915,16 +924,16 @@ void menu_view_system_log(void) {
             }
             vga_clear();
             vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
-            printk("=== LIVE SYSTEM BOOT LOG (%u%%) ===\n", pct);
+            console_puts("=== LIVE SYSTEM BOOT LOG ===\n");
             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
             line_count = 0;
         }
     }
 
     vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-    printk("\n--- End of System Log (%u bytes) ---\n", total_len);
+    console_puts("\n--- End of System Log ---\n");
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-    printk("Press any key to return to main menu...");
+    console_puts("Press any key to return to main menu...");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     menu_get_char();
 }

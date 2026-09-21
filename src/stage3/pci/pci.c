@@ -45,14 +45,18 @@ uint8_t pci_read_config8(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset)
     return (uint8_t)((val >> ((offset & 3) * 8)) & 0xFF);
 }
 
+static uint32_t pci_device_count = 0;
+
 static void check_pci_device(uint8_t bus, uint8_t dev, uint8_t func) {
     uint16_t vendor = pci_read_config16(bus, dev, func, 0x00);
     if (vendor == 0xFFFF || vendor == 0x0000) return;
 
+    pci_device_count++;
     uint16_t device = pci_read_config16(bus, dev, func, 0x02);
     uint8_t class_code = pci_read_config8(bus, dev, func, 0x0B);
     uint8_t subclass   = pci_read_config8(bus, dev, func, 0x0A);
     uint8_t prog_if    = pci_read_config8(bus, dev, func, 0x09);
+    uint32_t bar0      = pci_read_config32(bus, dev, func, 0x10);
 
     if (class_code == PCI_CLASS_SERIAL_BUS && subclass == PCI_SUBCLASS_USB) {
         const char *usb_type = "Unknown USB";
@@ -60,8 +64,6 @@ static void check_pci_device(uint8_t bus, uint8_t dev, uint8_t func) {
         else if (prog_if == PCI_PROGIF_OHCI) usb_type = "OHCI (USB 1.1)";
         else if (prog_if == PCI_PROGIF_EHCI) usb_type = "EHCI (USB 2.0)";
         else if (prog_if == PCI_PROGIF_XHCI) usb_type = "xHCI (USB 3.0+)";
-
-        uint32_t bar0 = pci_read_config32(bus, dev, func, 0x10);
 
         log_info("PCI", "USB Controller: %02X:%02X.%u [%04X:%04X] %s (BAR0=0x%08X)",
                  bus, dev, func, vendor, device, usb_type, bar0);
@@ -80,11 +82,28 @@ static void check_pci_device(uint8_t bus, uint8_t dev, uint8_t func) {
             xhci_found = true;
         }
     }
+#if IS_DEBUG_BUILD
+    else if (class_code == PCI_CLASS_MASS_STORAGE) {
+        const char *st_type = "Storage";
+        if (subclass == 0x01) st_type = "IDE Controller";
+        else if (subclass == 0x06) st_type = "SATA / AHCI Controller";
+        else if (subclass == 0x08) st_type = "NVMe Controller";
+        log_debug("PCI", "Storage Device: %02X:%02X.%u [%04X:%04X] %s (ProgIF 0x%02X, BAR0=0x%08X)",
+                  bus, dev, func, vendor, device, st_type, prog_if, bar0);
+    } else if (class_code == PCI_CLASS_DISPLAY) {
+        log_debug("PCI", "Display Adapter: %02X:%02X.%u [%04X:%04X] VGA (BAR0=0x%08X)",
+                  bus, dev, func, vendor, device, bar0);
+    } else if (class_code == PCI_CLASS_NETWORK) {
+        log_debug("PCI", "Network Device: %02X:%02X.%u [%04X:%04X] (BAR0=0x%08X)",
+                  bus, dev, func, vendor, device, bar0);
+    }
+#endif
 }
 
 void pci_init(void) {
     log_info("PCI", "Scanning PCI bus for host controllers...");
     xhci_found = false;
+    pci_device_count = 0;
 
     for (uint16_t bus = 0; bus < 256; bus++) {
         for (uint8_t dev = 0; dev < 32; dev++) {
@@ -104,10 +123,10 @@ void pci_init(void) {
     }
 
     if (xhci_found) {
-        log_info("PCI", "Primary xHCI Host Controller selected at %02X:%02X.%u",
-                 detected_xhci.bus, detected_xhci.dev, detected_xhci.func);
+        log_info("PCI", "Primary xHCI Host Controller selected at %02X:%02X.%u (Found %u total PCI devices)",
+                 detected_xhci.bus, detected_xhci.dev, detected_xhci.func, pci_device_count);
     } else {
-        log_info("PCI", "No xHCI Host Controller detected on PCI bus.");
+        log_info("PCI", "No xHCI Host Controller detected on PCI bus (%u PCI devices enumerated).", pci_device_count);
     }
 }
 

@@ -77,5 +77,6 @@ int  mtp_get_partial_object(mtp_session_t *session, uint32_t handle, uint32_t of
 int  mtp_create_folder(mtp_session_t *session, uint32_t storage_id, uint32_t parent_handle, const char *folder_name, uint32_t *out_handle);
 int  mtp_create_empty_file(mtp_session_t *session, uint32_t storage_id, uint32_t parent_handle, const char *file_name, uint32_t *out_handle);
 int  mtp_ensure_bootmanager_dirs(mtp_session_t *session, uint32_t storage_id);
+int  mtp_save_log_to_phone(mtp_session_t *session);
 
 #endif // MTP_H

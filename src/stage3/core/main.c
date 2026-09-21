@@ -40,6 +40,38 @@ static usb_device_t     *active_msc_dev = NULL;
 static mtp_session_t     active_mtp_session;
 static adb_session_t     active_adb_session;
 
+static void phone_save_boot_log(adb_session_t *adb, mtp_session_t *mtp) {
+#if !IS_DEBUG_BUILD
+    (void)adb;
+    (void)mtp;
+    return; // In release build, phone log saving is disabled
+#else
+    static bool s_in_save = false;
+    if (s_in_save) return;
+    s_in_save = true;
+
+    disk_log_flush();
+
+    if (adb && adb->is_connected) {
+        adb_save_log_to_phone(adb);
+        s_in_save = false;
+        return;
+    }
+
+    if (mtp && mtp->session_active) {
+        mtp_save_log_to_phone(mtp);
+        s_in_save = false;
+        return;
+    }
+
+    s_in_save = false;
+#endif
+}
+
+static void phone_save_boot_log_hook(void) {
+    phone_save_boot_log(&active_adb_session, &active_mtp_session);
+}
+
 static void k_memset(void *dst, uint8_t val, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     for (size_t i = 0; i < n; i++) d[i] = val;
@@ -387,12 +419,12 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
     log_info("BOOT", "==========================================================");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-    xhci_stop(&xhci_ctrl);
-    sound_silence();
-
     log_info("LOG", "Final pre-handoff flush: %u flushes, %u errors, %u bytes logged",
              disk_log_get_flush_count(), disk_log_get_error_count(), disk_log_get_length());
     disk_log_flush_with_feedback();
+    phone_save_boot_log(&active_adb_session, &active_mtp_session);
+    xhci_stop(&xhci_ctrl);
+    sound_silence();
 
     sound_kernel_jump_tone();
 
@@ -533,12 +565,12 @@ static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_fil
     log_info("BOOT", "==========================================================");
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-    xhci_stop(&xhci_ctrl);
-    sound_silence();
-
     log_info("LOG", "Final pre-handoff flush: %u flushes, %u errors, %u bytes logged",
              disk_log_get_flush_count(), disk_log_get_error_count(), disk_log_get_length());
     disk_log_flush_with_feedback();
+    phone_save_boot_log(&active_adb_session, &active_mtp_session);
+    xhci_stop(&xhci_ctrl);
+    sound_silence();
 
     sound_kernel_jump_tone();
 
@@ -765,6 +797,8 @@ void c_main(boot_info_t *boot_info) {
 
     // 2. Initialize Persistent SD Disk Logging EARLY
     disk_log_init(boot_info);
+    disk_log_record_early_boot(boot_info);
+    disk_log_set_phone_sync_hook(phone_save_boot_log_hook);
 
     // 3. Banner
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
@@ -848,7 +882,8 @@ void c_main(boot_info_t *boot_info) {
                         log_info("STAGE3", "Port %u: Android ADB interface detected! Initializing ADB Root Bridge...", p);
                         if (adb_init_session(&external_usb_dev, &active_adb_session) == 0) {
                             log_info("STAGE3", "ADB Root Bridge connected! Phone can switch to USB Mass Storage (0 MB in RAM).");
-                            adb_save_log_to_phone(&active_adb_session);
+                            for (int w = 0; w < 100000; w++) io_wait(); // 50ms settle delay for phone adbd
+                            phone_save_boot_log(&active_adb_session, &active_mtp_session);
                         }
                     }
 
@@ -867,7 +902,7 @@ void c_main(boot_info_t *boot_info) {
                         } else {
                             register_external_msc(&external_usb_dev, &current_dev, p);
                         }
-                    } else if (external_usb_detected && external_usb_dev.has_mtp && !active_mtp_session.session_active) {
+                    } else if (external_usb_detected && external_usb_dev.has_mtp && !active_adb_session.is_connected && !active_mtp_session.session_active) {
                         log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
                         int mtp_res = mtp_init_session(&external_usb_dev, &active_mtp_session);
                         if (mtp_res == 0) {
@@ -879,6 +914,7 @@ void c_main(boot_info_t *boot_info) {
                             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                             sound_phone_connected_tone();
                             mtp_found = true;
+                            phone_save_boot_log(&active_adb_session, &active_mtp_session);
                         }
                     } else if (!current_dev.has_msc && !current_dev.has_adb && !current_dev.has_mtp) {
                         log_info("STAGE3", "Port %u: Attached device (VID 0x%04X, PID 0x%04X) is in Charging/No-Data mode.",
@@ -901,7 +937,7 @@ void c_main(boot_info_t *boot_info) {
             }
 
             // Poll loop: wait if device not yet detected
-            for (int poll_iter = 0; poll_iter < 100 && !mtp_found && !external_msc_detected; poll_iter++) {
+            for (int poll_iter = 0; poll_iter < 100 && !active_adb_session.is_connected && !mtp_found && !external_msc_detected; poll_iter++) {
                 if (poll_iter > 0) {
                     for (int d = 0; d < 200000; d++) io_wait();
                 }
@@ -946,7 +982,8 @@ void c_main(boot_info_t *boot_info) {
                             log_info("STAGE3", "Port %u: Android ADB interface detected! Initializing ADB Root Bridge...", p);
                             if (adb_init_session(&external_usb_dev, &active_adb_session) == 0) {
                                 log_info("STAGE3", "ADB Root Bridge connected! Phone can switch to USB Mass Storage (0 MB in RAM).");
-                                adb_save_log_to_phone(&active_adb_session);
+                                for (int w = 0; w < 100000; w++) io_wait(); // 50ms settle delay for phone adbd
+                                phone_save_boot_log(&active_adb_session, &active_mtp_session);
                             }
                         }
 
@@ -964,7 +1001,7 @@ void c_main(boot_info_t *boot_info) {
                                 register_external_msc(&external_usb_dev, &current_dev, p);
                                 break;
                             }
-                        } else if (external_usb_detected && external_usb_dev.has_mtp) {
+                        } else if (external_usb_detected && external_usb_dev.has_mtp && !active_adb_session.is_connected && !active_mtp_session.session_active) {
                             log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
                             int mtp_res = mtp_init_session(&external_usb_dev, &active_mtp_session);
                             if (mtp_res == 0) {
@@ -977,6 +1014,7 @@ void c_main(boot_info_t *boot_info) {
                                 vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                                 sound_phone_connected_tone();
                                 mtp_found = true;
+                                phone_save_boot_log(&active_adb_session, &active_mtp_session);
                                 break;
                             }
                         } else {
@@ -1010,11 +1048,14 @@ void c_main(boot_info_t *boot_info) {
                              active_adb_session.is_connected ? &active_adb_session : NULL,
                              &os_reg);
 
+        phone_save_boot_log(&active_adb_session, &active_mtp_session);
+
         usb_device_t *menu_usb = external_usb_detected ? &external_usb_dev : (boot_msc_detected ? &boot_msc_device : NULL);
         menu_render(boot_info, &xhci_ctrl, menu_usb, &active_mtp_session, &os_reg);
 
         // Wait for explicit user selection
         menu_selection_t choice = menu_wait_selection(&os_reg);
+        phone_save_boot_log(&active_adb_session, &active_mtp_session);
 
         if (choice.type == MENU_ACTION_RESCAN) {
             log_info("STAGE3", "Rescanning USB ports for Android phone / USB storage...");
@@ -1048,7 +1089,7 @@ void c_main(boot_info_t *boot_info) {
                             } else {
                                 register_external_msc(&external_usb_dev, &current_dev, p);
                             }
-                        } else if (external_usb_detected && external_usb_dev.has_mtp && !active_mtp_session.session_active) {
+                        } else if (external_usb_detected && external_usb_dev.has_mtp && !active_adb_session.is_connected && !active_mtp_session.session_active) {
                             if (mtp_init_session(&external_usb_dev, &active_mtp_session) == 0) {
                                 mtp_found = true;
                             }
@@ -1186,10 +1227,11 @@ void c_main(boot_info_t *boot_info) {
                     }
                     if (active_adb_session.is_connected) {
                         adb_scan_persistence_profiles(&active_adb_session, selected);
-                        adb_save_log_to_phone(&active_adb_session);
                     }
+                    phone_save_boot_log(&active_adb_session, &active_mtp_session);
 
                     selected->selected_profile = menu_select_persistence_profile(selected, active_adb_session.is_connected ? &active_adb_session : NULL);
+                    phone_save_boot_log(&active_adb_session, &active_mtp_session);
                     const persistence_profile_t *prof = (selected->profile_count > 0 && selected->selected_profile < selected->profile_count) ?
                         &selected->profiles[selected->selected_profile] : NULL;
                     char prof_path[256] = {0};
@@ -1241,26 +1283,28 @@ void c_main(boot_info_t *boot_info) {
                                 log_error("BOOT", "Hot-swap failed (%d). Returning to menu...", upd);
                                 vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                                 disk_log_flush();
+                                phone_save_boot_log(&active_adb_session, &active_mtp_session);
                                 for (int w = 0; w < 2000000; w++) io_wait();
                                 continue;
                             }
                         }
                     }
 
-                    // If image is on Android MTP and ADB is available, try Root USB Mass Storage switch first!
-                    if (!ums_booted && selected->approach == BOOT_APPROACH_MTP_IN_RAM && selected->mtp_handle != 0) {
+                    // If image is on Android phone/MTP and ADB is available, try Root USB Mass Storage switch first!
+                    if (!ums_booted && (selected->approach == BOOT_APPROACH_MTP_IN_RAM || selected->storage_type == OS_STORAGE_MTP_ANDROID)) {
                         if (active_adb_session.is_connected) {
                             vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
                             log_info("BOOT", "Root ADB active! Attaching '%s' to USB Mass Storage (Profile: '%s')...",
                                      selected->filename, prof_path[0] ? prof->filename : "Clean Session");
                             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                             disk_log_flush();
+                            phone_save_boot_log(&active_adb_session, &active_mtp_session);
+
                             int trg = adb_trigger_mass_storage(&active_adb_session, selected->filename, prof_path[0] ? prof_path : NULL);
                             disk_log_flush();
+                            phone_save_boot_log(&active_adb_session, &active_mtp_session);
 
                             // Try to reprobe as MSC regardless of trigger result.
-                            // The phone's background job runs independently — even if the ADB
-                            // response was garbled by USB bus disruption, the switch may succeed.
                             if (trg != -2) { // -2 = kernel doesn't have UMS support at all
                                 if (trg != 0) {
                                     log_info("BOOT", "Trigger returned %d, but phone may still switch. Waiting 4 sec...", trg);
@@ -1282,6 +1326,7 @@ void c_main(boot_info_t *boot_info) {
                                 } else {
                                     log_info("BOOT", "MSC re-enumeration timed out. Phone did not switch to block device.");
                                     disk_log_flush();
+                                    phone_save_boot_log(&active_adb_session, &active_mtp_session);
                                 }
                             }
                         }
@@ -1296,6 +1341,7 @@ void c_main(boot_info_t *boot_info) {
                             if (ans == 'n' || ans == 'N' || ans == 27) {
                                 log_info("BOOT", "MTP RAM boot cancelled by user. Returning to menu...");
                                 disk_log_flush();
+                                phone_save_boot_log(&active_adb_session, &active_mtp_session);
                                 for (int w = 0; w < 1000000; w++) io_wait();
                                 continue;
                             }
@@ -1309,7 +1355,7 @@ void c_main(boot_info_t *boot_info) {
                             } else if (selected->storage_type == OS_STORAGE_BLOCK_SD) {
                                 boot_from_sd_fat(selected, boot_info);
                             }
-                        } else if (selected->approach == BOOT_APPROACH_MTP_IN_RAM) {
+                        } else if (selected->approach == BOOT_APPROACH_MTP_IN_RAM || selected->storage_type == OS_STORAGE_MTP_ANDROID) {
                             if (active_mtp_session.session_active) {
                                 boot_from_android_mtp(selected, boot_info, prof);
                             } else if (selected->storage_type == OS_STORAGE_MTP_ANDROID && selected->mtp_handle == 0 && selected->file_size > 0 && *(uint32_t *)LINUX_RAM_ISO_PHYS != 0) {
@@ -1319,6 +1365,7 @@ void c_main(boot_info_t *boot_info) {
                                 log_error("BOOT", "MTP session not active and image not in RAM! Press 'R' to rescan.");
                                 vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                                 disk_log_flush();
+                                phone_save_boot_log(&active_adb_session, &active_mtp_session);
                                 for (int w = 0; w < 2000000; w++) io_wait();
                                 continue;
                             }
@@ -1342,6 +1389,7 @@ void c_main(boot_info_t *boot_info) {
                 continue; // Return to menu after self-test
 
             case MENU_ACTION_VIEW_LOG:
+                phone_save_boot_log(&active_adb_session, &active_mtp_session);
                 menu_view_system_log();
                 continue; // Return to menu after viewing log
 
@@ -1355,6 +1403,7 @@ void c_main(boot_info_t *boot_info) {
     log_info("LOG", "Boot session complete: %u flushes, %u errors, %u bytes logged",
              disk_log_get_flush_count(), disk_log_get_error_count(), disk_log_get_length());
     disk_log_flush_with_feedback();
+    phone_save_boot_log(&active_adb_session, &active_mtp_session);
 
     // Main execution loop / halt
     while (1) {

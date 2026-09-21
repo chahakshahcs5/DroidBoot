@@ -1,26 +1,19 @@
 #!/usr/bin/env python3
 """
-tools/qemu_test.py - Automated Headless QEMU Verification for Bootloader
-Launches QEMU, captures COM1 serial UART output via TCP, and asserts all boot phase milestones:
-1. Baseline Phase 1-10 verification (BIOS bootstrap, E820, PCI, xHCI, USB, OS Scan, Self-Test)
-2. Multi-Profile Persistence Sub-Menu & Clean Session Test
-3. Dynamic Custom Profile Creation & Sizing (2GB, 4GB, 8GB, 16GB) & Kernel Handoff
+tools/qemu_test.py - Modular Automated QEMU Verification Test Suite
+Powered by tools/qemu_harness.py
 """
 
 import os
 import sys
 import time
-import socket
-import subprocess
 import re
 
-WORKSPACE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BUILD_DIR = os.path.join(WORKSPACE_ROOT, "build")
-BOOT_IMG = os.path.join(BUILD_DIR, "boot.img")
-SERIAL_LOG = os.path.join(BUILD_DIR, "serial.log")
+from tools.qemu_harness import QemuHarness, WORKSPACE_ROOT, BUILD_DIR, DEFAULT_BOOT_IMG
 
 DEFAULT_UBUNTU_ISO = r"C:\Users\chaha\Downloads\ubuntu-26.04.1-desktop-amd64.iso"
 DEFAULT_ALPINE_ISO = r"C:\Users\chaha\Downloads\alpine-standard-3.24.2-x86_64.iso"
+SERIAL_LOG = os.path.join(BUILD_DIR, "serial.log")
 
 REQUIRED_LOG_PATTERNS = [
     "ANDROID -> LINUX BOOTLOADER (LEGACY BIOS)",
@@ -61,63 +54,16 @@ REQUIRED_LOG_PATTERNS = [
     "Phase 10 Interactive Boot Menu Successfully Verified!"
 ]
 
-def run_headless_test(port, extra_qemu_args, trigger_input_fn, timeout_sec=25, memory="1024M"):
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", port))
-    server.listen(1)
 
-    qemu_cmd = [
-        "qemu-system-x86_64",
-        "-snapshot",
-        "-drive", f"file={BOOT_IMG},format=raw,if=ide",
-        "-device", "qemu-xhci,id=xhci",
-        "-serial", f"tcp:127.0.0.1:{port}",
-        "-display", "none",
-        "-m", memory
-    ] + extra_qemu_args
-
-    print(f"[*] Launching QEMU: {' '.join(qemu_cmd)}")
-    proc = subprocess.Popen(qemu_cmd, cwd=WORKSPACE_ROOT)
-
-    conn, _ = server.accept()
-    conn.setblocking(False)
-
-    captured_chunks = []
-    start_time = time.time()
-    state = {}
-
-    try:
-        while time.time() - start_time < timeout_sec:
-            try:
-                chunk = conn.recv(2048)
-                if chunk:
-                    text = chunk.decode("utf-8", errors="ignore")
-                    captured_chunks.append(text)
-                    current_log = "".join(captured_chunks)
-                    if trigger_input_fn(conn, current_log, state):
-                        break
-            except (BlockingIOError, OSError):
-                time.sleep(0.05)
-    finally:
-        conn.close()
-        server.close()
-        proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
-    return "".join(captured_chunks)
-
-def test_baseline_self_test(port=4444):
+def test_baseline_self_test(boot_img=DEFAULT_BOOT_IMG):
     print("\n" + "=" * 70)
     print("  TEST 1: Baseline Boot Protocol & Milestone Verification")
     print("=" * 70)
 
+    harness = QemuHarness(boot_img=boot_img, memory="1024M")
     extra_args = ["-device", "usb-tablet,bus=xhci.0"]
 
-    def trigger(conn, current_log, state):
+    def trigger(conn, current_log, state, qmp):
         if not state.get("sent_choice") and "[MENU] Select option" in current_log:
             print("[*] Detected dynamic boot menu prompt! Sending selection 't' via COM1 serial...")
             time.sleep(0.1)
@@ -129,7 +75,7 @@ def test_baseline_self_test(port=4444):
             return True
         return False
 
-    captured_log = run_headless_test(port, extra_args, trigger, timeout_sec=25)
+    captured_log = harness.run(extra_args=extra_args, interaction_fn=trigger, timeout_sec=25)
 
     with open(SERIAL_LOG, "w", encoding="utf-8", errors="ignore") as f:
         f.write(captured_log)
@@ -144,7 +90,8 @@ def test_baseline_self_test(port=4444):
 
     return all_passed
 
-def test_multiprofile_persistence(port=4445):
+
+def test_multiprofile_persistence(boot_img=DEFAULT_BOOT_IMG):
     if not os.path.exists(DEFAULT_UBUNTU_ISO):
         print(f"[*] Skipping Multi-Profile test (ISO not present at {DEFAULT_UBUNTU_ISO})")
         return True
@@ -153,12 +100,13 @@ def test_multiprofile_persistence(port=4445):
     print("  TEST 2: Multi-Profile Persistence Sub-Menu & Clean Session Test")
     print("=" * 70)
 
+    harness = QemuHarness(boot_img=boot_img, memory="1024M")
     extra_args = [
         "-drive", f"id=phone_disk,file={DEFAULT_UBUNTU_ISO},format=raw,if=none,readonly=on",
         "-device", "usb-storage,bus=xhci.0,drive=phone_disk"
     ]
 
-    def trigger(conn, current_log, state):
+    def trigger(conn, current_log, state, qmp):
         if not state.get("sent_os") and "[MENU] Select option" in current_log:
             print("[*] Main boot menu detected! Selecting OS [1] (Ubuntu)...")
             time.sleep(0.1)
@@ -172,14 +120,13 @@ def test_multiprofile_persistence(port=4445):
             time.sleep(0.1)
             conn.sendall(f"{clean_opt}\n".encode("ascii"))
             state["sent_prof"] = True
-            state["clean_opt"] = clean_opt
 
         if "HANDING OFF EXECUTION TO LINUX" in current_log:
             time.sleep(0.3)
             return True
         return False
 
-    captured_log = run_headless_test(port, extra_args, trigger, timeout_sec=30)
+    captured_log = harness.run(extra_args=extra_args, interaction_fn=trigger, timeout_sec=30)
 
     checks = [
         ("PERSISTENCE PROFILE SELECTOR", "Sub-menu banner rendered"),
@@ -199,7 +146,8 @@ def test_multiprofile_persistence(port=4445):
 
     return all_passed
 
-def test_custom_capacity_selection(port=4446):
+
+def test_custom_capacity_selection(boot_img=DEFAULT_BOOT_IMG):
     if not os.path.exists(DEFAULT_UBUNTU_ISO):
         print(f"[*] Skipping Custom Capacity test (ISO not present at {DEFAULT_UBUNTU_ISO})")
         return True
@@ -208,12 +156,13 @@ def test_custom_capacity_selection(port=4446):
     print("  TEST 3: Dynamic Profile Creation & Capacity Sizing Test")
     print("=" * 70)
 
+    harness = QemuHarness(boot_img=boot_img, memory="1024M")
     extra_args = [
         "-drive", f"id=phone_disk,file={DEFAULT_UBUNTU_ISO},format=raw,if=none,readonly=on",
         "-device", "usb-storage,bus=xhci.0,drive=phone_disk"
     ]
 
-    def trigger(conn, current_log, state):
+    def trigger(conn, current_log, state, qmp):
         if not state.get("sent_os") and "[MENU] Select option" in current_log:
             print("[*] Main boot menu detected! Selecting OS [1] (Ubuntu)...")
             time.sleep(0.1)
@@ -245,7 +194,7 @@ def test_custom_capacity_selection(port=4446):
             return True
         return False
 
-    captured_log = run_headless_test(port, extra_args, trigger, timeout_sec=30)
+    captured_log = harness.run(extra_args=extra_args, interaction_fn=trigger, timeout_sec=30)
 
     checks = [
         ("PERSISTENCE OVERLAY CAPACITY SELECTOR", "Capacity selector rendered"),
@@ -269,7 +218,8 @@ def test_custom_capacity_selection(port=4446):
 
     return all_passed
 
-def test_in_ram_iso_boot(port=4447):
+
+def test_in_ram_iso_boot(boot_img=DEFAULT_BOOT_IMG):
     if not os.path.exists(DEFAULT_ALPINE_ISO):
         print(f"[*] Skipping In-RAM ISO test (ISO not present at {DEFAULT_ALPINE_ISO})")
         return True
@@ -278,11 +228,12 @@ def test_in_ram_iso_boot(port=4447):
     print("  TEST 4: In-RAM ISO Detection & Persistence Handoff Test (Alpine)")
     print("=" * 70)
 
+    harness = QemuHarness(boot_img=boot_img, memory="2048M")
     extra_args = [
         "-device", f"loader,file={DEFAULT_ALPINE_ISO},addr=0x10000000,force-raw=on"
     ]
 
-    def trigger(conn, current_log, state):
+    def trigger(conn, current_log, state, qmp):
         if not state.get("sent_os") and "[MENU] Select option" in current_log:
             print("[*] Main boot menu detected! Selecting OS [1] (Alpine Linux Standard)...")
             time.sleep(0.1)
@@ -314,7 +265,7 @@ def test_in_ram_iso_boot(port=4447):
             return True
         return False
 
-    captured_log = run_headless_test(port, extra_args, trigger, timeout_sec=30, memory="2048M")
+    captured_log = harness.run(extra_args=extra_args, interaction_fn=trigger, timeout_sec=30)
 
     checks = [
         ("Preloaded In-RAM ISO detected at 0x10000000", "In-RAM ISO detected at 0x10000000"),
@@ -337,35 +288,187 @@ def test_in_ram_iso_boot(port=4447):
 
     return all_passed
 
-def main():
-    if not os.path.exists(BOOT_IMG):
-        sys.exit(f"[-] Boot image {BOOT_IMG} not found! Run build first.")
 
-    t1_pass = test_baseline_self_test(port=4444)
-    t2_pass = test_multiprofile_persistence(port=4445)
-    t3_pass = test_custom_capacity_selection(port=4446)
-    t4_pass = test_in_ram_iso_boot(port=4447)
+def test_dynamic_gadget_switch(boot_img=DEFAULT_BOOT_IMG):
+    if not os.path.exists(DEFAULT_ALPINE_ISO):
+        print(f"[*] Skipping Dynamic Gadget Switch test (ISO not present at {DEFAULT_ALPINE_ISO})")
+        return True
 
-    if t1_pass and t2_pass and t3_pass and t4_pass:
-        print("\n" + "=" * 70)
-        print("[+] ALL AUTOMATED QEMU VERIFICATION ASSERTIONS PASSED!")
-        print("[+] Phase 1 Legacy BIOS Bootstrap: VERIFIED")
-        print("[+] Phase 2 E820 Memory Map: VERIFIED")
-        print("[+] Phase 3 xHCI Host Controller: VERIFIED")
-        print("[+] Phase 4 USB Enumeration & ADB Interface Detection: VERIFIED")
-        print("[+] Phase 8 Image Detection: VERIFIED")
-        print("[+] Phase 9 Linux 32-bit Boot Protocol: VERIFIED")
-        print("[+] Phase 10 Dynamic Multi-OS Boot Menu: VERIFIED")
-        print("[+] Multi-Profile Persistence Sub-Menu (/BootManager/persistence/): VERIFIED")
-        print("[+] Dynamic Custom Profile Creation (2GB, 4GB, 8GB, 16GB): VERIFIED")
-        print("[+] Clean Disposable Session (100% In-RAM): VERIFIED")
-        print("[+] In-RAM ISO Detection & Boot Handoff (--mode ram): VERIFIED")
-        print("[+] Zero auto-selection: Menus waited indefinitely for user choice!")
-        print("=" * 70 + "\n")
-        sys.exit(0)
+    print("\n" + "=" * 70)
+    print("  TEST 5: Dynamic Phone Gadget Mode-Switching (MTP -> UMS via QMP)")
+    print("=" * 70)
+
+    harness = QemuHarness(boot_img=boot_img, memory="2048M", enable_qmp=True)
+    extra_args = ["-device", "usb-tablet,bus=xhci.0,id=initial_phone"]
+
+    def trigger(conn, current_log, state, qmp):
+        # Step 1: Wait for initial boot menu (phone in MTP / non-storage mode)
+        if not state.get("phone_switched") and "[MENU] Select option" in current_log:
+            print("[+] Initial boot menu rendered (Phone in MTP mode).")
+            print("[*] Simulating phone root switch: Unlinking MTP -> Enrolling USB Mass Storage gadget...")
+            time.sleep(0.5)
+
+            # Disconnect initial phone device
+            qmp.execute("device_del", {"id": "initial_phone"})
+            time.sleep(0.5)
+
+            # Re-attach as USB Mass Storage
+            qmp.execute("human-monitor-command", {
+                "command-line": f"drive_add 0 file={DEFAULT_ALPINE_ISO},format=raw,if=none,id=phone_ums_drive,readonly=on"
+            })
+            qmp.execute("device_add", {
+                "driver": "usb-storage",
+                "bus": "xhci.0",
+                "drive": "phone_ums_drive",
+                "id": "phone_ums"
+            })
+            print("[+] Phone re-attached as USB Mass Storage device!")
+            state["phone_switched"] = True
+
+        # Step 2: Trigger bootloader rescan
+        if state.get("phone_switched") and not state.get("sent_rescan"):
+            print("[*] Triggering bootloader 'R' to rescan for newly attached Mass Storage...")
+            time.sleep(0.5)
+            conn.sendall(b"R\n")
+            state["sent_rescan"] = True
+
+        # Step 3: Select detected OS
+        if state.get("sent_rescan") and not state.get("sent_os") and ("Alpine" in current_log or "Linux" in current_log):
+            print("[+] Bootloader dynamically detected converted Phone as USB Block Storage! Selecting [1]...")
+            time.sleep(0.5)
+            conn.sendall(b"1\n")
+            state["sent_os"] = True
+
+        # Step 4: Profile selection
+        if state.get("sent_os") and not state.get("sent_prof") and "[PROFILE] Select persistence profile" in current_log:
+            print("[+] Profile menu appeared! Selecting [1] (Clean Session)...")
+            time.sleep(0.1)
+            conn.sendall(b"1\n")
+            state["sent_prof"] = True
+
+        if "HANDING OFF EXECUTION TO LINUX" in current_log:
+            time.sleep(0.3)
+            return True
+        return False
+
+    captured_log = harness.run(extra_args=extra_args, interaction_fn=trigger, timeout_sec=35)
+
+    gadget_log_path = os.path.join(BUILD_DIR, "gadget_test.log")
+    with open(gadget_log_path, "w", encoding="utf-8", errors="ignore") as f:
+        f.write(captured_log)
+
+    checks = [
+        ("Rescanning", "Bootloader storage rescan triggered"),
+        ("HANDING OFF EXECUTION TO LINUX", "Kernel handoff reached after dynamic switch")
+    ]
+
+    all_passed = True
+    for needle, desc in checks:
+        if needle in captured_log:
+            print(f"[PASS] {desc}: '{needle}'")
+        else:
+            print(f"[FAIL] Missing {desc}: '{needle}'")
+            all_passed = False
+
+    return all_passed
+
+
+def test_sd_card_persistence(boot_img=None):
+    import shutil
+    from tools.read_bootlog import list_and_extract_fat_logs, read_raw_log
+
+    print("\n" + "=" * 70)
+    print("  TEST 6: SD Card Live Logging Persistence (FAT32 & Raw Sectors)")
+    print("=" * 70)
+
+    debug_img = os.path.join(BUILD_DIR, "boot-debug.img")
+    target_img = boot_img or debug_img
+    if "debug" not in os.path.basename(target_img):
+        print(f"[*] Note: '{os.path.basename(target_img)}' is Release build (disk logging disabled by design).")
+        print(f"[*] Automatically testing SD Card Live Persistence against '{os.path.basename(debug_img)}'...")
+        target_img = debug_img
+
+    test_img = os.path.join(BUILD_DIR, "test_sd_persist.img")
+    shutil.copyfile(target_img, test_img)
+
+    harness = QemuHarness(boot_img=test_img, memory="1024M", snapshot=False)
+
+    def trigger(conn, current_log, state, qmp):
+        if "[MENU] Select option" in current_log:
+            time.sleep(1.0)
+            return True
+        return False
+
+    harness.run(extra_args=["-device", "usb-tablet,bus=xhci.0"], interaction_fn=trigger, timeout_sec=25)
+
+    fat_info = list_and_extract_fat_logs(test_img)
+    if not fat_info or not fat_info[0]:
+        print("[-] FAILED: Could not parse FAT32 partition on SD card.")
+        if os.path.exists(test_img): os.remove(test_img)
+        return False
+
+    files = {fname: sz for fname, cl, sz in fat_info[0]}
+    fat_bootlog = list_and_extract_fat_logs(test_img, target_boot="BOOTLOG.TXT")
+    content = fat_bootlog[1].decode("ascii", errors="replace") if fat_bootlog and fat_bootlog[1] else ""
+
+    checks = [
+        ("BOOTLOG.TXT" in files and files["BOOTLOG.TXT"] > 500, "FAT32 BOOTLOG.TXT populated on SD card"),
+        ("BOOT0001.LOG" in files and files["BOOT0001.LOG"] > 500, "FAT32 BOOT0001.LOG session log created on SD card"),
+        ("Stage 1 MBR Boot Sector" in content, "Stage 1 MBR milestone verified in SD card log"),
+        ("CPU Mode: 32-bit Flat Protected Mode" in content, "Protected mode milestone verified in SD card log"),
+        ("E820 System Memory Map Probed" in content, "E820 memory map verified in SD card log"),
+        ("Primary xHCI Host Controller selected" in content, "xHCI discovery verified in SD card log")
+    ]
+
+    all_passed = True
+    for condition, desc in checks:
+        if condition:
+            print(f"[PASS] {desc}")
+        else:
+            print(f"[FAIL] {desc}")
+            all_passed = False
+
+    raw_res = read_raw_log(test_img)
+    if raw_res and raw_res.get("log_length", 0) > 0 and raw_res.get("magic1") == 0x544F4F42:
+        print(f"[PASS] Raw backup sectors verified! Total written: {raw_res['total_written']:,} bytes")
     else:
-        print("\n[-] Automated QEMU test verification FAILED!")
-        sys.exit(1)
+        print(f"[FAIL] Raw backup sectors at LBA 1024 missing or invalid")
+        all_passed = False
+
+    if os.path.exists(test_img):
+        os.remove(test_img)
+
+    return all_passed
+
+
+def run_all_tests(boot_img=DEFAULT_BOOT_IMG):
+    print("=" * 70)
+    print("  BOOTLOADER AUTOMATED REGRESSION SUITE")
+    print(f"  Target Image: {boot_img}")
+    print("=" * 70)
+
+    results = []
+    results.append(("Baseline Boot Protocol & Self-Test", test_baseline_self_test(boot_img)))
+    results.append(("Multi-Profile Persistence Sub-Menu", test_multiprofile_persistence(boot_img)))
+    results.append(("Dynamic Custom Profile Sizing", test_custom_capacity_selection(boot_img)))
+    results.append(("In-RAM ISO Detection & Handoff", test_in_ram_iso_boot(boot_img)))
+    results.append(("Dynamic Phone Gadget Mode-Switch (QMP)", test_dynamic_gadget_switch(boot_img)))
+    results.append(("SD Card Live Logging Persistence", test_sd_card_persistence(boot_img)))
+
+    print("\n" + "=" * 70)
+    print("  FINAL REGRESSION TEST RESULTS:")
+    print("=" * 70)
+    all_passed = True
+    for name, ok in results:
+        status = "[PASS]" if ok else "[FAIL]"
+        print(f"  {status} {name}")
+        if not ok:
+            all_passed = False
+
+    print("=" * 70)
+    return all_passed
+
 
 if __name__ == "__main__":
-    main()
+    success = run_all_tests()
+    sys.exit(0 if success else 1)

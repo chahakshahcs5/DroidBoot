@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include "../../include/boot.h"
 
-#define DISK_LOG_BUFFER_SIZE    65536   // 64 KiB
+#define DISK_LOG_BUFFER_SIZE    131072  // 128 KiB
 #define RAW_LOG_MAGIC_1         0x544F4F42  // "BOOT"
 #define RAW_LOG_MAGIC_2         0x21474F4C  // "LOG!"
 #define RAW_LOG_LBA             1024
@@ -34,6 +34,9 @@ typedef struct disk_log_header {
 
 // Initialize disk logging subsystem and resolve FAT32 BOOTLOG.TXT & per-boot session file
 void disk_log_init(boot_info_t *boot_info);
+
+// Record Stage 1 and Stage 2 boot parameters into log buffer
+void disk_log_record_early_boot(boot_info_t *boot_info);
 
 // Character sink called by printf
 void disk_log_putc(char c);
@@ -65,8 +68,14 @@ const char *disk_log_get_session_filename(void);
 
 // Get current log buffer stats
 uint32_t disk_log_get_length(void);
+uint32_t disk_log_get_total_written(void);
 const char *disk_log_get_buffer(void);
 void     disk_log_copy_linear(char *dst, uint32_t max_len, uint32_t *actual_len);
+
+// Phone sync hook for immediate log delivery upon errors and checkpoints
+typedef void (*disk_log_phone_sync_fn)(void);
+void disk_log_set_phone_sync_hook(disk_log_phone_sync_fn fn);
+void disk_log_trigger_phone_sync(void);
 
 // Diagnostic stats
 uint32_t disk_log_get_flush_count(void);

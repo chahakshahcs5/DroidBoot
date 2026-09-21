@@ -249,6 +249,12 @@ int linux_prepare_boot_params(const void *kernel_image, uint32_t kernel_size,
     }
 
     log_info("LINUX", "Prepared Linux boot_params at 0x%08X", (uint32_t)out_params);
+#if IS_DEBUG_BUILD
+    log_debug("LINUX", "Boot Params Dump: Proto=0x%04X Loader=0x%02X LoadFlags=0x%02X Code32=0x%08X",
+              out_params->hdr.version, out_params->hdr.type_of_loader, out_params->hdr.loadflags, out_params->hdr.code32_start);
+    log_debug("LINUX", "CmdlinePtr=0x%08X RamdiskPtr=0x%08X RamdiskSize=%u B AltMem=%u KB",
+              out_params->hdr.cmd_line_ptr, out_params->hdr.ramdisk_image, out_params->hdr.ramdisk_size, out_params->alt_mem_k);
+#endif
     return 0;
 }
 

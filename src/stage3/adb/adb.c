@@ -1,9 +1,15 @@
 #include "adb.h"
 #include "../core/printf.h"
+#include "../core/rtc.h"
 #include "../debug/vga.h"
 #include "../debug/disk_log.h"
 #include "../../include/io.h"
 #include "../image/os_scanner.h"
+
+static bool adb_str_contains(const char *haystack, const char *needle);
+static bool adb_str_ends_with_nocase(const char *str, const char *suffix);
+static bool adb_str_eq_nocase(const char *s1, const char *s2);
+static bool adb_str_starts_with_nocase(const char *str, const char *prefix);
 
 static void adb_k_memset(void *dst, uint8_t val, size_t n) {
     uint8_t *d = (uint8_t *)dst;
@@ -40,12 +46,12 @@ static int adb_send_msg(adb_session_t *s, uint32_t cmd, uint32_t arg0, uint32_t 
     msg.magic = cmd ^ 0xFFFFFFFF;
 
     uint32_t sent = 0;
-    int res = usb_bulk_transfer(s->usb_dev, ep, &msg, sizeof(msg), &sent);
+    int res = usb_bulk_transfer_wait(s->usb_dev, ep, &msg, sizeof(msg), &sent, 4);
     if (res != 0) return res;
 
     if (data && data_len > 0) {
         sent = 0;
-        res = usb_bulk_transfer(s->usb_dev, ep, (void *)data, data_len, &sent);
+        res = usb_bulk_transfer_wait(s->usb_dev, ep, (void *)data, data_len, &sent, 4);
         if (res != 0) return res;
     }
     return 0;
@@ -75,7 +81,11 @@ static int adb_recv_msg(adb_session_t *s, adb_message_t *out_msg, void *out_data
 
     if (out_msg->data_length > 0) {
         uint32_t to_read = out_msg->data_length;
-        if (to_read > max_data_len) to_read = max_data_len;
+        uint32_t excess = 0;
+        if (to_read > max_data_len) {
+            excess = to_read - max_data_len;
+            to_read = max_data_len;
+        }
 
         uint32_t total_read = 0;
         while (total_read < to_read) {
@@ -85,6 +95,18 @@ static int adb_recv_msg(adb_session_t *s, adb_message_t *out_msg, void *out_data
             total_read += chunk_rec;
         }
         if (out_data_len) *out_data_len = total_read;
+
+        if (excess > 0) {
+            static uint8_t drain_buf[512];
+            uint32_t drained = 0;
+            while (drained < excess) {
+                uint32_t d_rec = 0;
+                uint32_t d_want = (excess - drained > 512) ? 512 : (excess - drained);
+                res = usb_bulk_transfer(s->usb_dev, ep, drain_buf, d_want, &d_rec);
+                if (res != 0 || d_rec == 0) break;
+                drained += d_rec;
+            }
+        }
     }
 
     return 0;
@@ -114,7 +136,11 @@ static int adb_recv_msg_wait(adb_session_t *s, adb_message_t *out_msg, void *out
 
     if (out_msg->data_length > 0) {
         uint32_t to_read = out_msg->data_length;
-        if (to_read > max_data_len) to_read = max_data_len;
+        uint32_t excess = 0;
+        if (to_read > max_data_len) {
+            excess = to_read - max_data_len;
+            to_read = max_data_len;
+        }
 
         uint32_t total_read = 0;
         while (total_read < to_read) {
@@ -124,6 +150,18 @@ static int adb_recv_msg_wait(adb_session_t *s, adb_message_t *out_msg, void *out
             total_read += chunk_rec;
         }
         if (out_data_len) *out_data_len = total_read;
+
+        if (excess > 0) {
+            static uint8_t drain_buf[512];
+            uint32_t drained = 0;
+            while (drained < excess) {
+                uint32_t d_rec = 0;
+                uint32_t d_want = (excess - drained > 512) ? 512 : (excess - drained);
+                res = usb_bulk_transfer_wait(s->usb_dev, ep, drain_buf, d_want, &d_rec, 2);
+                if (res != 0 || d_rec == 0) break;
+                drained += d_rec;
+            }
+        }
     }
 
     return 0;
@@ -163,11 +201,19 @@ int adb_init_session(usb_device_t *dev, adb_session_t *session) {
     session->local_id = 1;
     session->max_data = A_MAXDATA;
 
-    log_info("ADB", "Configuring USB endpoints for ADB communication...");
-    int res = usb_configure_adb_endpoints(dev);
-    if (res != 0) {
-        log_error("ADB", "Failed to configure ADB endpoints (code %d)!", res);
-        return res;
+    int res = 0;
+    uint8_t adb_in_idx = ((dev->adb_bulk_in_ep & 0x0F) * 2) + 1;
+    uint8_t adb_out_idx = ((dev->adb_bulk_out_ep & 0x0F) * 2);
+    if (!dev->ep_rings[adb_in_idx] || !dev->ep_rings[adb_out_idx]) {
+        log_info("ADB", "Configuring USB endpoints for ADB communication...");
+        res = usb_configure_adb_endpoints(dev);
+        if (res != 0) {
+            log_error("ADB", "Failed to configure ADB endpoints (code %d)!", res);
+            return res;
+        }
+    } else {
+        log_info("ADB", "ADB endpoints already active (IN: 0x%02X, OUT: 0x%02X).",
+                 dev->adb_bulk_in_ep, dev->adb_bulk_out_ep);
     }
 
     // Send A_CNXN packet to adbd
@@ -246,6 +292,11 @@ int adb_init_session(usb_device_t *dev, adb_session_t *session) {
 int adb_execute_shell(adb_session_t *session, const char *cmd, char *out_buf, uint32_t max_len) {
     if (!session || !session->is_connected || !cmd) return -1;
 
+    bool is_b64_log_chunk = adb_str_starts_with_nocase(cmd, "echo ") && adb_str_contains(cmd, "base64 -d");
+    if (!is_b64_log_chunk) {
+        log_debug("ADB", "Executing Shell: '%s'", cmd);
+    }
+
     static char open_dest[4096];
     snprintf(open_dest, sizeof(open_dest), "shell:%s", cmd);
     uint32_t dest_len = 0;
@@ -254,7 +305,10 @@ int adb_execute_shell(adb_session_t *session, const char *cmd, char *out_buf, ui
 
     uint32_t my_id = session->local_id++;
     int res = adb_send_msg(session, A_OPEN, my_id, 0, open_dest, dest_len);
-    if (res != 0) return res;
+    if (res != 0) {
+        if (!is_b64_log_chunk) log_error("ADB", "Failed to send A_OPEN for shell (code %d)", res);
+        return res;
+    }
 
     adb_message_t resp;
     static char chunk_buf[4096];
@@ -297,6 +351,20 @@ int adb_execute_shell(adb_session_t *session, const char *cmd, char *out_buf, ui
     if (out_buf && max_len > 0) {
         out_buf[total_out < max_len ? total_out : max_len - 1] = '\0';
     }
+
+    if (!is_b64_log_chunk) {
+        char preview[128] = {0};
+        if (out_buf && out_buf[0]) {
+            int p = 0;
+            while (out_buf[p] && p < 120 && out_buf[p] != '\r' && out_buf[p] != '\n') {
+                preview[p] = out_buf[p];
+                p++;
+            }
+            preview[p] = '\0';
+        }
+        log_debug("ADB", "Shell Result (bytes: %u, res: %d): '%s'", total_out, res, preview[0] ? preview : "(empty)");
+    }
+
     if (total_out == 0 && res != 0) {
         return res;
     }
@@ -769,21 +837,29 @@ int adb_create_sparse_overlay(adb_session_t *session, const char *overlay_path, 
     char cmd[512];
     // Universal Android sparse allocation:
     // 1. mkdir & touch .nomedia (unprivileged works on /sdcard/)
-    // 2. dd with seek (standard on 100% Android toybox/toolbox builds) or fallback to truncate
-    // 3. optional ext4 format if mkfs tool exists
-    // 4. verify file exists on phone storage
+    // 2. dd with bs=1048576 count=1 seek=(mb-1) -> takes 0.003s, writes 1 block at (mb-1)MB, creates exact MB sparse file!
+    // 3. verify file exists on phone storage
     snprintf(cmd, sizeof(cmd),
              "mkdir -p /sdcard/BootManager/persistence 2>/dev/null; "
              "touch /sdcard/BootManager/persistence/.nomedia 2>/dev/null; "
-             "(dd if=/dev/zero of=\"%s\" bs=1M count=0 seek=%u 2>/dev/null || truncate -s %uG \"%s\" 2>/dev/null); "
-             "(mkfs.ext4 -F \"%s\" 2>/dev/null || mke2fs -F \"%s\" 2>/dev/null || make_ext4fs -l %uM \"%s\" 2>/dev/null || true); "
-             "if [ -f \"%s\" ]; then echo OK_CREATED; else echo ERR_NOT_CREATED; fi",
-             overlay_path, mb, size_gb, overlay_path,
-             overlay_path, overlay_path, mb, overlay_path,
+             "(dd if=/dev/zero of=%s bs=1048576 count=1 seek=%u 2>/dev/null || truncate -s %uM %s 2>/dev/null); "
+             "[ -f %s ] && echo OK_CREATED || echo ERR_NOT_CREATED",
+             overlay_path, mb - 1, mb, overlay_path,
              overlay_path);
 
     char out[256] = {0};
     int res = adb_execute_shell(session, cmd, out, sizeof(out));
+    if (res != 0 || !adb_str_contains(out, "OK_CREATED")) {
+        // Fallback with su -c
+        snprintf(cmd, sizeof(cmd),
+                 "su -c 'mkdir -p /sdcard/BootManager/persistence; "
+                 "dd if=/dev/zero of=%s bs=1048576 count=1 seek=%u 2>/dev/null; "
+                 "[ -f %s ] && echo OK_CREATED'",
+                 overlay_path, mb - 1, overlay_path);
+        out[0] = '\0';
+        res = adb_execute_shell(session, cmd, out, sizeof(out));
+    }
+
     if (res == 0 && adb_str_contains(out, "OK_CREATED")) {
         log_info("ADB", "Sparse %u GB persistence overlay created and verified on phone storage!", size_gb);
         return 0;
@@ -791,6 +867,24 @@ int adb_create_sparse_overlay(adb_session_t *session, const char *overlay_path, 
 
     log_error("ADB", "Failed to create sparse overlay over ADB! (resp: '%s')", out[0] ? out : "none");
     return -1;
+}
+
+static const char g_b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static void adb_base64_encode(const uint8_t *src, size_t len, char *out) {
+    size_t i = 0, j = 0;
+    while (i < len) {
+        uint32_t a = src[i++];
+        uint32_t b = (i < len) ? src[i++] : 0;
+        uint32_t c = (i < len) ? src[i++] : 0;
+        uint32_t triple = (a << 16) | (b << 8) | c;
+
+        out[j++] = g_b64_table[(triple >> 18) & 0x3F];
+        out[j++] = g_b64_table[(triple >> 12) & 0x3F];
+        out[j++] = (i > len + 1) ? '=' : g_b64_table[(triple >> 6) & 0x3F];
+        out[j++] = (i > len) ? '=' : g_b64_table[triple & 0x3F];
+    }
+    out[j] = '\0';
 }
 
 int adb_save_log_to_phone(adb_session_t *session) {
@@ -801,62 +895,92 @@ int adb_save_log_to_phone(adb_session_t *session) {
     disk_log_copy_linear(log_buf, sizeof(log_buf), &total_len);
     if (total_len == 0) return 0;
 
-    log_info("ADB", "Syncing %u bytes of boot log to phone (/sdcard/BootManager/boot.log)...", total_len);
-
-    char out[128] = {0};
-    adb_execute_shell(session, "mkdir -p /sdcard/BootManager", out, sizeof(out));
-
-    // Open shell:cat > /sdcard/BootManager/boot.log
-    uint32_t my_id = session->local_id++;
-    const char *open_dest = "shell:cat > /sdcard/BootManager/boot.log";
-    uint32_t dest_len = 0;
-    while (open_dest[dest_len]) dest_len++;
-    dest_len++; // null terminator
-
-    int res = adb_send_msg(session, A_OPEN, my_id, 0, open_dest, dest_len);
-    if (res != 0) {
-        log_error("ADB", "Failed to open cat stream on phone (%d)", res);
-        return res;
+    // Dedicated per-boot session filename (preserved across flushes of the same boot)
+    static char s_boot_session_file[64] = {0};
+    if (s_boot_session_file[0] == '\0') {
+        char ts[32] = {0};
+        rtc_get_timestamp_str(ts, sizeof(ts));
+        if (ts[0] && !adb_str_starts_with_nocase(ts, "session_")) {
+            snprintf(s_boot_session_file, sizeof(s_boot_session_file), "boot_%s.log", ts);
+        } else {
+            const char *fat_sess = disk_log_get_session_filename();
+            if (fat_sess && fat_sess[0]) {
+                snprintf(s_boot_session_file, sizeof(s_boot_session_file), "%s", fat_sess);
+            } else {
+                snprintf(s_boot_session_file, sizeof(s_boot_session_file), "boot_%u.log", disk_log_get_session_id());
+            }
+        }
     }
 
-    adb_message_t resp;
-    static char ack_buf[512];
-    uint32_t ack_len = 0;
+    // 1. Prepare target directories on Android storage and truncate temp log
+    char prep_cmd[512];
+    snprintf(prep_cmd, sizeof(prep_cmd),
+             "rm -f /data/local/tmp/boot.log 2>/dev/null; "
+             "mkdir -p /sdcard/BootManager/logs /storage/emulated/0/BootManager/logs /data/local/tmp 2>/dev/null; "
+             "chmod 777 /sdcard/BootManager /sdcard/BootManager/logs /storage/emulated/0/BootManager 2>/dev/null");
+    adb_execute_shell(session, prep_cmd, NULL, 0);
 
-    // Wait for A_OKAY
-    res = adb_recv_msg_wait(session, &resp, ack_buf, sizeof(ack_buf) - 1, &ack_len, 4);
-    if (res != 0 || resp.command != A_OKAY) {
-        log_error("ADB", "Did not receive A_OKAY for cat stream (cmd=0x%08X)", resp.command);
-        return -2;
-    }
-    session->remote_id = resp.arg0;
-
-    // Write log data in chunks of up to 2048 bytes
+    // 2. Stream log data in atomic base64 chunks via adb_execute_shell
+    // Chunk size 1024 bytes -> 1368 base64 bytes -> ~1420 bytes command
+    static char b64_chunk[2048];
+    static char cmd_buf[2500];
     uint32_t offset = 0;
+    bool write_failed = false;
+
     while (offset < total_len) {
         uint32_t chunk = total_len - offset;
-        if (chunk > 2048) chunk = 2048;
+        if (chunk > 1024) chunk = 1024;
 
-        res = adb_send_msg(session, A_WRTE, my_id, session->remote_id, log_buf + offset, chunk);
-        if (res != 0) break;
+        adb_base64_encode((const uint8_t *)(log_buf + offset), chunk, b64_chunk);
+        snprintf(cmd_buf, sizeof(cmd_buf), "echo %s | base64 -d >> /data/local/tmp/boot.log", b64_chunk);
 
-        // Acknowledge WRTE
-        res = adb_recv_msg_wait(session, &resp, ack_buf, sizeof(ack_buf) - 1, &ack_len, 4);
-        if (res != 0 || resp.command != A_OKAY) break;
+        int res = adb_execute_shell(session, cmd_buf, NULL, 0);
+        if (res != 0) {
+            log_error("ADB", "Failed to write base64 chunk at offset %u (code %d)", offset, res);
+            write_failed = true;
+            break;
+        }
 
         offset += chunk;
     }
 
-    // Close stream (EOF)
-    adb_send_msg(session, A_CLSE, my_id, session->remote_id, NULL, 0);
+    if (!write_failed) {
+        // Copy to internal storage: /sdcard/BootManager/boot.log & logs/<session_file>
+        // AND any removable MicroSD card mounted on phone (/storage/XXXX-XXXX)
+        char copy_cmd[640];
+        snprintf(copy_cmd, sizeof(copy_cmd),
+                 "cp /data/local/tmp/boot.log /sdcard/BootManager/boot.log 2>/dev/null; "
+                 "cp /data/local/tmp/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; "
+                 "for SD in /storage/*; do "
+                 "  if [ -d \"$SD\" ] && [ \"$SD\" != \"/storage/emulated\" ] && [ \"$SD\" != \"/storage/self\" ]; then "
+                 "    mkdir -p \"$SD/BootManager/logs\" 2>/dev/null; "
+                 "    cp /data/local/tmp/boot.log \"$SD/BootManager/boot.log\" 2>/dev/null; "
+                 "    cp /data/local/tmp/boot.log \"$SD/BootManager/logs/%s\" 2>/dev/null; "
+                 "  fi; "
+                 "done; "
+                 "su -c 'cp /data/local/tmp/boot.log /sdcard/BootManager/boot.log 2>/dev/null; "
+                 "cp /data/local/tmp/boot.log /sdcard/BootManager/logs/%s 2>/dev/null' 2>/dev/null; "
+                 "chmod 666 /data/local/tmp/boot.log /sdcard/BootManager/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; sync",
+                 s_boot_session_file, s_boot_session_file, s_boot_session_file, s_boot_session_file);
+        adb_execute_shell(session, copy_cmd, NULL, 0);
+    }
 
-    if (offset >= total_len) {
+    // 3. Post-write verification
+    char verify_cmd[256];
+    snprintf(verify_cmd, sizeof(verify_cmd),
+             "ls -l /sdcard/BootManager/logs/%s /sdcard/BootManager/boot.log 2>/dev/null",
+             s_boot_session_file);
+    char verify_out[384] = {0};
+    adb_execute_shell(session, verify_cmd, verify_out, sizeof(verify_out));
+
+    if (adb_str_contains(verify_out, "boot.log") || adb_str_contains(verify_out, s_boot_session_file)) {
         vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-        log_info("ADB", "SUCCESS: Boot log saved to phone storage: /sdcard/BootManager/boot.log (%u bytes)!", total_len);
+        log_info("ADB", "SUCCESS: Boot log saved to /sdcard/BootManager/logs/%s", s_boot_session_file);
         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
         return 0;
     }
 
-    log_error("ADB", "Incomplete log sync (%u/%u bytes sent)", offset, total_len);
-    return -3;
+    log_error("ADB", "Failed to sync boot log to phone storage (resp: '%s')", verify_out[0] ? verify_out : "none");
+    return -1;
 }
+

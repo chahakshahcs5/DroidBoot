@@ -9,6 +9,7 @@
 #define SCSI_TEST_UNIT_READY    0x00
 #define SCSI_REQUEST_SENSE      0x03
 #define SCSI_INQUIRY            0x12
+#define SCSI_MODE_SENSE         0x1A
 #define SCSI_READ_CAPACITY_10   0x25
 #define SCSI_READ_10            0x28
 #define SCSI_WRITE_10           0x2A

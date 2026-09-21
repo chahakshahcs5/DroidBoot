@@ -47,4 +47,7 @@ int  xhci_enable_slot(xhci_controller_t *ctrl, uint8_t *slot_id_out);
 int  xhci_disable_slot(xhci_controller_t *ctrl, uint8_t slot_id);
 void xhci_stop(xhci_controller_t *ctrl);
 
+const char *xhci_cc_to_string(uint8_t cc);
+const char *xhci_pls_to_string(uint8_t pls);
+
 #endif // XHCI_H

@@ -191,6 +191,17 @@ void log_error(const char *tag, const char *fmt, ...) {
     disk_log_flush();
 }
 
+#if IS_DEBUG_BUILD
+void log_debug(const char *tag, const char *fmt, ...) {
+    printk("[%s DEBUG] ", tag);
+    va_list args;
+    va_start(args, fmt);
+    vprintk(fmt, args);
+    va_end(args);
+    printk("\n");
+}
+#endif
+
 int vsnprintf(char *str, size_t size, const char *fmt, va_list args) {
     if (!str || size == 0) return 0;
 

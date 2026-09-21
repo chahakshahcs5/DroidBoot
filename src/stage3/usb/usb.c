@@ -96,7 +96,12 @@ int usb_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *dat
                     xhci_write64(intr0 + XHCI_INTR_ERDP, erdp | XHCI_ERDP_EHB);
 
                     uint8_t cc = (uint8_t)((evt->status >> 24) & 0xFF);
-                    return (cc == TRB_COMPL_SUCCESS || cc == TRB_COMPL_SHORT_TX) ? 0 : (int)cc;
+                    if (cc != TRB_COMPL_SUCCESS && cc != TRB_COMPL_SHORT_TX) {
+                        log_error("USB", "Control transfer failed: bmReq=0x%02X bReq=0x%02X wVal=0x%04X wIdx=0x%04X CC=%u (%s)",
+                                  setup->bmRequestType, setup->bRequest, setup->wValue, setup->wIndex, cc, xhci_cc_to_string(cc));
+                        return (int)cc;
+                    }
+                    return 0;
                 }
             }
 
@@ -421,8 +426,11 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
         log_info("USB", "Set Configuration 1 status: %d (device already active). Continuing...", set_cfg_res);
     }
 
-    if (out_dev->has_mtp) {
-        usb_configure_mtp_endpoints(out_dev);
+    if (out_dev->has_msc && out_dev->has_adb) {
+        log_info("USB", "Composite device detected (MSC + ADB). Configuring all endpoints concurrently...");
+        if (usb_configure_composite_msc_adb(out_dev) == 0) {
+            usb_msc_init_device(out_dev);
+        }
     } else if (out_dev->has_msc) {
         int msc_cfg = usb_configure_bulk_endpoints(out_dev,
                                                    out_dev->msc_bulk_in_ep, out_dev->msc_bulk_in_max_packet,
@@ -430,12 +438,10 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
         if (msc_cfg == 0) {
             usb_msc_init_device(out_dev);
         }
-        if (out_dev->has_adb) {
-            log_info("USB", "Composite device: configuring concurrent ADB endpoints...");
-            usb_configure_adb_endpoints(out_dev);
-        }
     } else if (out_dev->has_adb) {
         usb_configure_adb_endpoints(out_dev);
+    } else if (out_dev->has_mtp) {
+        usb_configure_mtp_endpoints(out_dev);
     }
 
     return 0;
@@ -544,6 +550,137 @@ int usb_configure_bulk_endpoints(usb_device_t *dev, uint8_t in_ep, uint16_t in_m
         log_info("USB", "Bulk Endpoints successfully configured on xHCI (Slot %u)!", slot_id);
     } else {
         log_error("USB", "Failed to configure bulk endpoints on Slot %u (code %d)!", slot_id, res);
+    }
+    return res;
+}
+
+int usb_configure_composite_msc_adb(usb_device_t *dev) {
+    if (!dev) return -1;
+
+    xhci_controller_t *ctrl = dev->ctrl;
+    uint8_t slot_id = dev->slot_id;
+
+    uint8_t msc_in_num = dev->msc_bulk_in_ep & 0x0F;
+    uint8_t msc_out_num = dev->msc_bulk_out_ep & 0x0F;
+    uint8_t adb_in_num = dev->adb_bulk_in_ep & 0x0F;
+    uint8_t adb_out_num = dev->adb_bulk_out_ep & 0x0F;
+
+    uint8_t msc_in_ctx_idx = (msc_in_num * 2) + 1;
+    uint8_t msc_out_ctx_idx = (msc_out_num * 2);
+    uint8_t adb_in_ctx_idx = (adb_in_num * 2) + 1;
+    uint8_t adb_out_ctx_idx = (adb_out_num * 2);
+
+    uint8_t max_ep_idx = msc_in_ctx_idx;
+    if (msc_out_ctx_idx > max_ep_idx) max_ep_idx = msc_out_ctx_idx;
+    if (adb_in_ctx_idx > max_ep_idx) max_ep_idx = adb_in_ctx_idx;
+    if (adb_out_ctx_idx > max_ep_idx) max_ep_idx = adb_out_ctx_idx;
+
+    uint16_t msc_in_pkt = dev->msc_bulk_in_max_packet ? dev->msc_bulk_in_max_packet : 512;
+    uint16_t msc_out_pkt = dev->msc_bulk_out_max_packet ? dev->msc_bulk_out_max_packet : 512;
+    uint16_t adb_in_pkt = dev->adb_bulk_in_max_packet ? dev->adb_bulk_in_max_packet : 512;
+    uint16_t adb_out_pkt = dev->adb_bulk_out_max_packet ? dev->adb_bulk_out_max_packet : 512;
+
+    uint8_t *input_ctx = (uint8_t *)kmalloc_aligned(4096, 64);
+    for (int i = 0; i < 4096; i++) input_ctx[i] = 0;
+
+    uint8_t ctx_sz = ctrl->context_size ? ctrl->context_size : 32;
+
+    // Add flags: Slot (bit 0) + all 4 endpoints!
+    *(uint32_t *)(input_ctx + 0) = 0;
+    *(uint32_t *)(input_ctx + 4) = (1U << 0) |
+                                   (1U << msc_in_ctx_idx) | (1U << msc_out_ctx_idx) |
+                                   (1U << adb_in_ctx_idx) | (1U << adb_out_ctx_idx);
+
+    // Slot Context
+    void *dev_ctx = (void *)(uintptr_t)ctrl->dcbaa[slot_id];
+    uint8_t *slot_ctx_bytes = input_ctx + ctx_sz;
+    if (dev_ctx) {
+        for (uint32_t b = 0; b < ctx_sz; b++) {
+            slot_ctx_bytes[b] = ((uint8_t *)dev_ctx)[b];
+        }
+    }
+    uint32_t *slot_ctx = (uint32_t *)slot_ctx_bytes;
+    slot_ctx[0] = (slot_ctx[0] & ~(0x1FU << 27)) | ((uint32_t)max_ep_idx << 27);
+
+    // 1. MSC Bulk IN
+    uint32_t *ep1 = (uint32_t *)(input_ctx + (msc_in_ctx_idx + 1) * ctx_sz);
+    ep1[0] = 0;
+    ep1[1] = (3U << 1) | (6U << 3) | ((uint32_t)msc_in_pkt << 16);
+    dev->bulk_in_ring = (xhci_trb_t *)kmalloc_aligned(64 * sizeof(xhci_trb_t), 64);
+    for (int i = 0; i < 64; i++) { dev->bulk_in_ring[i].parameter = 0; dev->bulk_in_ring[i].status = 0; dev->bulk_in_ring[i].control = 0; }
+    dev->bulk_in_ring[63].parameter = (uintptr_t)dev->bulk_in_ring;
+    dev->bulk_in_ring[63].control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE_CYCLE;
+    dev->bulk_in_enqueue_idx = 0;
+    dev->bulk_in_cycle_state = 1;
+    *(uint64_t *)(&ep1[2]) = (uintptr_t)dev->bulk_in_ring | 1U;
+    ep1[4] = msc_in_pkt;
+    if (msc_in_ctx_idx < 32) {
+        dev->ep_rings[msc_in_ctx_idx] = dev->bulk_in_ring;
+        dev->ep_enqueue_idx[msc_in_ctx_idx] = 0;
+        dev->ep_cycle_state[msc_in_ctx_idx] = 1;
+    }
+
+    // 2. MSC Bulk OUT
+    uint32_t *ep2 = (uint32_t *)(input_ctx + (msc_out_ctx_idx + 1) * ctx_sz);
+    ep2[0] = 0;
+    ep2[1] = (3U << 1) | (2U << 3) | ((uint32_t)msc_out_pkt << 16);
+    dev->bulk_out_ring = (xhci_trb_t *)kmalloc_aligned(64 * sizeof(xhci_trb_t), 64);
+    for (int i = 0; i < 64; i++) { dev->bulk_out_ring[i].parameter = 0; dev->bulk_out_ring[i].status = 0; dev->bulk_out_ring[i].control = 0; }
+    dev->bulk_out_ring[63].parameter = (uintptr_t)dev->bulk_out_ring;
+    dev->bulk_out_ring[63].control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE_CYCLE;
+    dev->bulk_out_enqueue_idx = 0;
+    dev->bulk_out_cycle_state = 1;
+    *(uint64_t *)(&ep2[2]) = (uintptr_t)dev->bulk_out_ring | 1U;
+    ep2[4] = msc_out_pkt;
+    if (msc_out_ctx_idx < 32) {
+        dev->ep_rings[msc_out_ctx_idx] = dev->bulk_out_ring;
+        dev->ep_enqueue_idx[msc_out_ctx_idx] = 0;
+        dev->ep_cycle_state[msc_out_ctx_idx] = 1;
+    }
+
+    // 3. ADB Bulk IN
+    uint32_t *ep3 = (uint32_t *)(input_ctx + (adb_in_ctx_idx + 1) * ctx_sz);
+    ep3[0] = 0;
+    ep3[1] = (3U << 1) | (6U << 3) | ((uint32_t)adb_in_pkt << 16);
+    xhci_trb_t *adb_in_r = (xhci_trb_t *)kmalloc_aligned(64 * sizeof(xhci_trb_t), 64);
+    for (int i = 0; i < 64; i++) { adb_in_r[i].parameter = 0; adb_in_r[i].status = 0; adb_in_r[i].control = 0; }
+    adb_in_r[63].parameter = (uintptr_t)adb_in_r;
+    adb_in_r[63].control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE_CYCLE;
+    *(uint64_t *)(&ep3[2]) = (uintptr_t)adb_in_r | 1U;
+    ep3[4] = adb_in_pkt;
+    if (adb_in_ctx_idx < 32) {
+        dev->ep_rings[adb_in_ctx_idx] = adb_in_r;
+        dev->ep_enqueue_idx[adb_in_ctx_idx] = 0;
+        dev->ep_cycle_state[adb_in_ctx_idx] = 1;
+    }
+
+    // 4. ADB Bulk OUT
+    uint32_t *ep4 = (uint32_t *)(input_ctx + (adb_out_ctx_idx + 1) * ctx_sz);
+    ep4[0] = 0;
+    ep4[1] = (3U << 1) | (2U << 3) | ((uint32_t)adb_out_pkt << 16);
+    xhci_trb_t *adb_out_r = (xhci_trb_t *)kmalloc_aligned(64 * sizeof(xhci_trb_t), 64);
+    for (int i = 0; i < 64; i++) { adb_out_r[i].parameter = 0; adb_out_r[i].status = 0; adb_out_r[i].control = 0; }
+    adb_out_r[63].parameter = (uintptr_t)adb_out_r;
+    adb_out_r[63].control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE_CYCLE;
+    *(uint64_t *)(&ep4[2]) = (uintptr_t)adb_out_r | 1U;
+    ep4[4] = adb_out_pkt;
+    if (adb_out_ctx_idx < 32) {
+        dev->ep_rings[adb_out_ctx_idx] = adb_out_r;
+        dev->ep_enqueue_idx[adb_out_ctx_idx] = 0;
+        dev->ep_cycle_state[adb_out_ctx_idx] = 1;
+    }
+
+    xhci_trb_t cfg_cmd;
+    cfg_cmd.parameter = (uintptr_t)input_ctx;
+    cfg_cmd.status = 0;
+    cfg_cmd.control = TRB_TYPE(TRB_CONFIG_EP_CMD) | ((uint32_t)slot_id << 24);
+
+    xhci_trb_t cfg_evt;
+    int res = xhci_send_command(ctrl, &cfg_cmd, &cfg_evt);
+    if (res == 0) {
+        log_info("USB", "Composite MSC+ADB endpoints successfully configured on xHCI (Slot %u)!", slot_id);
+    } else {
+        log_error("USB", "Failed to configure composite endpoints on Slot %u (code %d)!", slot_id, res);
     }
     return res;
 }
@@ -684,10 +821,16 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
                         *transferred_out = len - rem;
                     }
                     if (cc == TRB_COMPL_STALL_ERR || cc == TRB_COMPL_BABBLE_ERR) {
+                        log_error("USB", "Bulk transfer STALL/BABBLE on EP 0x%02X (CC=%u: %s)", ep_addr, cc, xhci_cc_to_string(cc));
                         usb_clear_endpoint_halt(dev, ep_addr);
                         return (int)cc;
                     }
-                    return (cc == TRB_COMPL_SUCCESS || cc == TRB_COMPL_SHORT_TX) ? 0 : (int)cc;
+                    if (cc != TRB_COMPL_SUCCESS && cc != TRB_COMPL_SHORT_TX) {
+                        log_error("USB", "Bulk transfer failed on EP 0x%02X: CC=%u (%s), transferred %u / %u B",
+                                  ep_addr, cc, xhci_cc_to_string(cc), transferred_out ? *transferred_out : 0, len);
+                        return (int)cc;
+                    }
+                    return 0;
                 }
             }
 
@@ -790,7 +933,12 @@ int usb_bulk_transfer_wait(usb_device_t *dev, uint8_t ep_addr, void *data, uint3
                         if (transferred_out) {
                             *transferred_out = len - rem;
                         }
-                        return (cc == TRB_COMPL_SUCCESS || cc == TRB_COMPL_SHORT_TX) ? 0 : (int)cc;
+                        if (cc != TRB_COMPL_SUCCESS && cc != TRB_COMPL_SHORT_TX) {
+                            log_error("USB", "Bulk transfer wait failed on EP 0x%02X: CC=%u (%s), transferred %u / %u B",
+                                      ep_addr, cc, xhci_cc_to_string(cc), transferred_out ? *transferred_out : 0, len);
+                            return (int)cc;
+                        }
+                        return 0;
                     }
                 }
 

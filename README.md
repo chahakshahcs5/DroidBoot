@@ -92,17 +92,13 @@ bootmanager/
 │   │   ├── ui/           # Interactive TUI with arrow keys, live badges, and cmdline editor (menu.c)
 │   │   └── debug/        # Dual SD disk logger (disk_log.c), serial (0x3F8), PC speaker
 │   └── include/          # Shared bootloader header files (boot.h, boot_source.h, io.h, usb_defs.h)
+├── test.py               # Unified master test orchestrator (6 regression test suites)
 ├── tools/
-│   ├── mkimage.py                  # Automated boot.img builder with FAT32 partition & logs
-│   ├── qemu_test.py                # Automated headless test runner with assertion checking
+│   ├── mkimage.py                  # Automated boot.img & boot-debug.img builder with FAT32 & raw logs
+│   ├── qemu_harness.py             # Reusable QEMU test harness (ephemeral ports, QMP hotplug, serial capture)
+│   ├── qemu_test.py                # 6-phase automated test suites (baseline, persistence, sizing, ram, gadget, sdlog)
 │   ├── run_qemu.py                 # Interactive QEMU launcher with display & serial
-│   ├── test_alpine_msc.py          # Automated test for Alpine Linux Direct Block Boot
-│   ├── test_ubuntu_msc.py          # Automated test for Ubuntu Casper Direct Block Boot
-│   ├── test_dynamic_msc_switch.py  # Test for runtime USB disconnect/reconnect & UMS switch
-│   ├── test_phone_switch.py        # Automated ADB trigger & re-enumeration test
-│   ├── test_physical_phone_qemu.py # Passthrough physical Android phone via USB to QEMU
-│   ├── read_log.py                 # Extractor for BOOTLOG.TXT and raw LBA 1024 backup logs
-│   ├── read_bootlog.py             # Formatted parser for persistent boot logs
+│   ├── read_bootlog.py             # Parser for persistent boot logs (phone ADB/MTP, SD FAT32 & raw LBA 1024)
 │   ├── phone_ums_enable.sh         # On-phone shell script to configure mass_storage gadget
 │   └── phone_restore_mtp.sh        # On-phone shell script to restore MTP USB configuration
 ├── Makefile              # Native GNU Makefile (WSL / Linux)

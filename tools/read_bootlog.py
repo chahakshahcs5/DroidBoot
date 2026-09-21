@@ -15,6 +15,7 @@ Supports:
 import sys
 import struct
 import os
+import subprocess
 
 RAW_LOG_MAGIC_1 = 0x544F4F42  # "BOOT"
 RAW_LOG_MAGIC_2 = 0x21474F4C  # "LOG!"
@@ -22,6 +23,108 @@ RAW_LOG_LBA = 1024
 RAW_LOG_SECTORS = 128  # 64 KiB
 SECTOR_SIZE = 512
 HEADER_SIZE = 512
+
+
+def list_phone_logs():
+    """List all available boot logs stored on connected Android phone."""
+    print("[*] Querying boot logs catalog on Android phone via ADB...")
+    cmd = ['adb', 'shell', 'ls -1 -t /sdcard/BootManager/logs 2>/dev/null']
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        logs = [line.strip() for line in res.stdout.splitlines() if line.strip().endswith('.log') or line.strip().endswith('.LOG')]
+        print()
+        print("=" * 72)
+        print("  BOOTMANAGER PHONE LOG CATALOG (/sdcard/BootManager/)")
+        print("=" * 72)
+        print(f"  {'Filename':<40} {'Type'}")
+        print("  " + "-" * 68)
+        print(f"  {'boot.log':<40} Current Active / Latest Boot Log")
+        for f in logs:
+            print(f"  {f:<40} Historical Per-Boot Archive (logs/{f})")
+        print("=" * 72)
+        print()
+        print("To view a specific log:")
+        print("  python tools/read_bootlog.py --phone --file <filename>")
+        print()
+        return logs
+    except Exception as e:
+        print(f"[-] Failed to query logs on phone: {e}")
+        return []
+
+
+def read_phone_log(target_file=None):
+    """Retrieve boot log directly from connected Android phone via ADB."""
+    if target_file:
+        phone_path = f"/sdcard/BootManager/logs/{target_file}" if not target_file.startswith('/') else target_file
+        print(f"[*] Attempting to retrieve '{phone_path}' from Android phone via ADB...")
+    else:
+        phone_path = "/sdcard/BootManager/boot.log"
+        print("[*] Attempting to retrieve latest boot log from Android phone via ADB...")
+
+    # Try su cat first
+    cmd1 = ['adb', 'shell', 'su', '-c', f'cat {phone_path}']
+    try:
+        res = subprocess.run(cmd1, capture_output=True, timeout=10)
+        if res.returncode == 0 and len(res.stdout) > 0 and b'No such file' not in res.stdout and b'Permission denied' not in res.stdout:
+            print(f"[+] Successfully fetched {phone_path} (root)")
+            return {
+                'log_length': len(res.stdout),
+                'flush_count': 0,
+                'boot_drive': 0,
+                'error_count': 0,
+                'log_start': 0,
+                'total_written': len(res.stdout),
+                'boot_count': 0,
+                'session_name': f"{phone_path} (phone)",
+                'text': res.stdout,
+            }
+    except Exception:
+        pass
+
+    # Try unprivileged cat
+    cmd2 = ['adb', 'shell', 'cat', phone_path]
+    try:
+        res = subprocess.run(cmd2, capture_output=True, timeout=10)
+        if res.returncode == 0 and len(res.stdout) > 0 and b'No such file' not in res.stdout and b'Permission denied' not in res.stdout:
+            print(f"[+] Successfully fetched {phone_path}")
+            return {
+                'log_length': len(res.stdout),
+                'flush_count': 0,
+                'boot_drive': 0,
+                'error_count': 0,
+                'log_start': 0,
+                'total_written': len(res.stdout),
+                'boot_count': 0,
+                'session_name': f"{phone_path} (phone)",
+                'text': res.stdout,
+            }
+    except Exception:
+        pass
+
+    # Try /data/local/tmp/boot.log as fallback if latest requested
+    if not target_file:
+        cmd3 = ['adb', 'shell', 'cat', '/data/local/tmp/boot.log']
+        try:
+            res = subprocess.run(cmd3, capture_output=True, timeout=10)
+            if res.returncode == 0 and len(res.stdout) > 0 and b'No such file' not in res.stdout and b'Permission denied' not in res.stdout:
+                print("[+] Successfully fetched /data/local/tmp/boot.log")
+                return {
+                    'log_length': len(res.stdout),
+                    'flush_count': 0,
+                    'boot_drive': 0,
+                    'error_count': 0,
+                    'log_start': 0,
+                    'total_written': len(res.stdout),
+                    'boot_count': 0,
+                    'session_name': '/data/local/tmp/boot.log (phone fallback)',
+                    'text': res.stdout,
+                }
+        except Exception:
+            pass
+
+    print(f"[-] Failed to read boot log '{phone_path}' from phone.")
+    print("    Ensure phone is connected via USB with USB Debugging enabled (run 'adb devices').")
+    sys.exit(1)
 
 
 def read_raw_log(device_path):
@@ -72,6 +175,8 @@ def read_raw_log(device_path):
         log_text = text_data[:log_length]
 
     return {
+        'magic1': magic1,
+        'magic2': magic2,
         'log_length': log_length,
         'flush_count': flush_count,
         'boot_drive': boot_drive,
@@ -163,7 +268,13 @@ def list_and_extract_fat_logs(device_path, target_boot=None):
                     logs.append((clean_name, first_cl, size))
 
                     # Check if this matches requested target_boot
-                    target_name = f"BOOT{target_boot:04d}.LOG" if target_boot else None
+                    if isinstance(target_boot, int):
+                        target_name = f"BOOT{target_boot:04d}.LOG"
+                    elif target_boot:
+                        target_name = str(target_boot).upper()
+                    else:
+                        target_name = None
+
                     if target_name and clean_name == target_name:
                         # Extract this file
                         file_lba = data_start + (first_cl - 2) * spc
@@ -177,9 +288,10 @@ def list_and_extract_fat_logs(device_path, target_boot=None):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python read_bootlog.py [OPTIONS] <device_or_file>")
+        print("Usage: python read_bootlog.py [OPTIONS] [device_or_file]")
         print()
         print("Options:")
+        print("  --phone      Fetch and display boot log directly from connected phone via ADB")
         print("  --list       List all available boot logs found on device/image")
         print("  --boot N     Extract and display boot log for session N (e.g. --boot 1)")
         print("  --raw        Force raw device mode (LBA 1024)")
@@ -187,12 +299,14 @@ def main():
         print("  --save OUT   Save extracted log to file")
         print()
         print("Examples:")
+        print("  python read_bootlog.py --phone")
         print("  python read_bootlog.py build/boot.img")
         print("  python read_bootlog.py --list build/boot.img")
         print("  python read_bootlog.py --boot 2 build/boot.img")
         print("  python read_bootlog.py BOOTLOG.TXT")
         sys.exit(1)
 
+    do_phone = '--phone' in sys.argv
     do_list = '--list' in sys.argv
     boot_num = None
     if '--boot' in sys.argv:
@@ -212,24 +326,37 @@ def main():
     force_raw = '--raw' in sys.argv
     force_file = '--file' in sys.argv
 
-    # Find target path (first argument not starting with -- and not argument value)
-    args = sys.argv[1:]
-    target = None
-    skip = False
-    for a in args:
-        if skip:
-            skip = False
-            continue
-        if a in ('--boot', '--save'):
-            skip = True
-            continue
-        if not a.startswith('--'):
-            target = a
-            break
+    if do_phone:
+        if do_list:
+            list_phone_logs()
+            sys.exit(0)
+        target_phone_file = None
+        if '--file' in sys.argv:
+            idx = sys.argv.index('--file')
+            if idx + 1 < len(sys.argv):
+                target_phone_file = sys.argv[idx + 1]
+        result = read_phone_log(target_phone_file)
+        # Jump directly to log display
+        target = None
+    else:
+        # Find target path (first argument not starting with -- and not argument value)
+        args = sys.argv[1:]
+        target = None
+        skip = False
+        for a in args:
+            if skip:
+                skip = False
+                continue
+            if a in ('--boot', '--save'):
+                skip = True
+                continue
+            if not a.startswith('--'):
+                target = a
+                break
 
-    if not target:
-        print("ERROR: No device or file path provided.")
-        sys.exit(1)
+        if not target:
+            print("ERROR: No device or file path provided.")
+            sys.exit(1)
 
     # If --list requested:
     if do_list:
@@ -269,7 +396,7 @@ def main():
         else:
             print(f"[-] Boot session {boot_num} not found or empty in '{target}'.")
             sys.exit(1)
-    else:
+    elif not do_phone:
         # Default read
         is_raw = force_raw
         if not force_raw and not force_file:

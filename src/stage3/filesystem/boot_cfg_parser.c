@@ -220,6 +220,8 @@ int boot_cfg_parse(const char *cfg_data, uint32_t len, const char *iso_filename,
 
     if (cur && cur->kernel_path[0]) {
         cur->valid = true;
+        log_debug("BOOTCFG", "  [%u] Title: '%s' | Kernel: '%s' | Initrd: '%s'",
+                  out_cfg->count, cur->title, cur->kernel_path, cur->initrd_path);
         out_cfg->count++;
     }
 

@@ -54,57 +54,67 @@ This document outlines the testing workflow across emulator (QEMU) and physical 
 
 ---
 
-## 2. Test Runner Suite
+## 2. Unified Test Runner (`python test.py`)
 
-The repository contains an automated test suite under `tools/`:
+The repository provides a single master test orchestrator at the root of the project:
 
-### 2.1 Headless Bootloader Assertion Test
+### 2.1 Complete Automated Regression Suite (Default)
 ```bash
-python tools/qemu_test.py
+python test.py                 # Runs complete automated regression suite (all 6 suites)
+python test.py --debug         # Runs complete regression suite against Debug build image
 ```
-* Boots QEMU headlessly (`-display none -serial stdio`).
-* Asserts expected sequence: `[STAGE1] OK` → `[STAGE2] OK` → `[STAGE3] Initialized` → `[PCI] xHCI Controller`.
+* Runs all 6 headless automated test suites in sequence.
+* Emulates xHCI, USB mass storage, dynamic gadget switching, and SD card live block writeback in pure software.
+* Tests all boot phases: Stage 1 MBR → Stage 2 A20 → Stage 3 Protected Mode → E820 RAM → PCI scan → xHCI initialization → USB enumeration → TUI menu → Linux kernel handoff → SD card persistence.
 
-### 2.2 Alpine Linux Direct Block Boot Test
+### 2.2 Running Individual Test Suites
 ```bash
-python tools/test_alpine_msc.py
+python test.py --suite baseline     # Phase 1-10 bootstrap, memory map, PCI, xHCI, TUI menu, self-test
+python test.py --suite persistence  # Multi-profile persistence selector and clean disposable session
+python test.py --suite sizing       # Dynamic custom persistence overlay capacity sizing (2GB, 4GB, 8GB, 16GB)
+python test.py --suite ram          # In-RAM ISO streaming and phram parameter kernel handoff
+python test.py --suite gadget       # Dynamic phone mode-switch simulation (MTP -> UMS via QMP hotplug)
+python test.py --suite sdlog        # Live SD card writeback persistence (FAT32 BOOTLOG.TXT, BOOT0001.LOG, LBA 1024)
 ```
-* Attaches an emulated USB Mass Storage device containing an Alpine Linux ISO.
-* Verifies SCSI inquiry, kernel/initrd extraction into RAM, `boot_params` generation, and kernel handoff.
 
-### 2.3 Ubuntu Casper Live Direct Block Boot Test
+### 2.3 Interactive Visual Debugging
 ```bash
-python tools/test_ubuntu_msc.py
+python test.py --interactive
 ```
-* Attaches an emulated 4–6 GB Ubuntu Casper live ISO as a USB block device.
-* Verifies that the bootloader consumes **0 MB in RAM** for the root filesystem and passes `boot=casper` command line arguments.
+* Launches QEMU with a graphical window and live COM1 serial UART output connected to your terminal.
+* Allows manual arrow-key navigation, in-place kernel command-line editing (`'e'`), and manual OS selection.
 
-### 2.4 Dynamic USB Disconnect / Reconnect & Switch Test
+### 2.4 Testing Debug vs. Release Images
+* **Release (`build/boot.img`)**: Maximum speed, clean console, persistent disk logging disabled by design (`IS_DEBUG_BUILD = 0`).
+* **Debug (`build/boot-debug.img`)**: Deep hardware diagnostics, verbose xHCI/USB packet logging, and simultaneous live logging to SD card (`BOOTLOG.TXT`, `BOOT0001.LOG`, LBA 1024) and Android phone (`/sdcard/BootManager/...`).
 ```bash
-python tools/test_dynamic_msc_switch.py
+python test.py                 # Tests Release image (build/boot.img)
+python test.py --debug         # Tests Debug image (build/boot-debug.img)
 ```
-* Simulates dynamic phone attachment and runtime gadget switching from MTP/charge mode to USB Mass Storage.
-
-### 2.5 Physical Android Phone Passthrough Test
-```bash
-python tools/test_physical_phone_qemu.py
-```
-* Connect your physical Android phone to your PC via USB.
-* Runs QEMU with native USB passthrough (`-device usb-host,vendorid=...,productid=...`) to test real Android MTP and ADB communication in the emulator.
 
 ---
 
-## 3. Persistent Log Extraction (`tools/read_log.py`)
+## 3. Persistent Log Extraction (`tools/read_bootlog.py`)
 
-Even if the screen is black or the target machine freezes, logs are written to the boot SD card:
+Even if the screen is black or the target machine freezes, logs are written simultaneously to both the boot SD card / USB drive and the Android phone:
+
 ```bash
-# Read logs from a disk image:
-python tools/read_log.py build/boot.img
+# 1. Read directly from connected Android phone via ADB:
+python tools/read_bootlog.py --phone
 
-# Read logs directly from a physical SD card drive (e.g., \\.\PhysicalDrive2 on Windows or /dev/sdX on Linux):
-python tools/read_log.py \\.\PhysicalDrive2
+# 2. List all historical boot logs stored on Android phone:
+python tools/read_bootlog.py --phone --list
+
+# 3. Read specific historical log from phone:
+python tools/read_bootlog.py --phone --file boot_20260921_191021.log
+
+# 4. Read from physical boot SD card / USB drive (e.g., E:\ on Windows):
+python tools/read_bootlog.py E:\BOOTLOG.TXT
+
+# 5. List all rotating boot sessions on SD card:
+python tools/read_bootlog.py --list E:\
 ```
-* Decodes both the FAT32 `BOOTLOG.TXT` file and the raw backup header at LBA 256.
+* Decodes both the FAT32 cluster chain (`BOOTLOG.TXT`, `BOOT0001.LOG`..`BOOT0010.LOG`) and raw backup sectors (LBA 1024..1151).
 
 ---
 

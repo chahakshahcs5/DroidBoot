@@ -7,6 +7,19 @@
 
 static uint32_t msc_tag_counter = 0x88000001;
 
+static const char *scsi_opcode_name(uint8_t opcode) {
+    switch (opcode) {
+        case SCSI_TEST_UNIT_READY:   return "TEST_UNIT_READY (0x00)";
+        case SCSI_REQUEST_SENSE:     return "REQUEST_SENSE (0x03)";
+        case SCSI_INQUIRY:           return "INQUIRY (0x12)";
+        case SCSI_MODE_SENSE:        return "MODE_SENSE (0x1A)";
+        case SCSI_READ_CAPACITY_10:  return "READ_CAPACITY_10 (0x25)";
+        case SCSI_READ_10:           return "READ_10 (0x28)";
+        case SCSI_WRITE_10:          return "WRITE_10 (0x2A)";
+        default:                     return "SCSI_COMMAND";
+    }
+}
+
 static int usb_msc_send_cbw_lun(usb_device_t *dev, uint8_t lun, uint32_t tag, uint32_t length,
                                 uint8_t flags, uint8_t cb_len, const uint8_t *cb) {
     if (!dev || !dev->has_msc) return -1;
@@ -23,12 +36,17 @@ static int usb_msc_send_cbw_lun(usb_device_t *dev, uint8_t lun, uint32_t tag, ui
         cbw.CBWCB[i] = (i < cb_len) ? cb[i] : 0;
     }
 
+    if (cb[0] != SCSI_READ_10 && cb[0] != SCSI_WRITE_10) {
+        log_debug("MSC", "CBW: Tag=0x%08X LUN=%u Op=%s Len=%u Dir=%s",
+                  tag, lun, scsi_opcode_name(cb[0]), length, (flags & 0x80) ? "IN" : "OUT");
+    }
+
     uint32_t sent = 0;
     int res = usb_bulk_transfer(dev, dev->msc_bulk_out_ep, &cbw, sizeof(cbw), &sent);
     if (res != 0) {
         usb_clear_endpoint_halt(dev, dev->msc_bulk_out_ep);
         usb_clear_endpoint_halt(dev, dev->msc_bulk_in_ep);
-        log_error("MSC", "Failed to send CBW (error %d, LUN %u)", res, lun);
+        log_error("MSC", "Failed to send CBW (error %d, LUN %u, Opcode %s)", res, lun, scsi_opcode_name(cb[0]));
     }
     return res;
 }
@@ -46,7 +64,7 @@ static int usb_msc_recv_csw(usb_device_t *dev, uint32_t expected_tag) {
     }
 
     if (csw.dCSWSignature != 0x53425355) { // "USBS"
-        log_error("MSC", "Invalid CSW signature: 0x%08X", csw.dCSWSignature);
+        log_error("MSC", "Invalid CSW signature: 0x%08X (expected 0x53425355)", csw.dCSWSignature);
         return -2;
     }
 
@@ -56,10 +74,15 @@ static int usb_msc_recv_csw(usb_device_t *dev, uint32_t expected_tag) {
     }
 
     if (csw.bCSWStatus != 0) {
-        log_error("MSC", "CSW Status returned error %u (residue %u)", csw.bCSWStatus, csw.dCSWDataResidue);
+        const char *csw_stat_str = (csw.bCSWStatus == 1) ? "Command Failed" : (csw.bCSWStatus == 2 ? "Phase Error" : "Reserved Error");
+        log_error("MSC", "CSW Status returned %u (%s), residue %u B",
+                  csw.bCSWStatus, csw_stat_str, csw.dCSWDataResidue);
         return -4;
     }
 
+    if (csw.dCSWDataResidue > 0) {
+        log_debug("MSC", "CSW: Tag=0x%08X Status=0 Residue=%u", csw.dCSWTag, csw.dCSWDataResidue);
+    }
     return 0;
 }
 
@@ -250,7 +273,7 @@ static uint32_t msc_src_read(boot_source_t *src, void *buf, uint32_t size) {
 
         if (sec_offset == 0 && (size - bytes_read) >= bsz) {
             uint32_t sectors_to_read = (size - bytes_read) / bsz;
-            if (sectors_to_read > 64) sectors_to_read = 64; // Max transfer chunk
+            if (sectors_to_read > 128) sectors_to_read = 128; // Max 64 KB transfer chunk
             int res = usb_msc_read_sectors_lun(priv->dev, priv->lun, lba, (uint16_t)sectors_to_read, bsz, dst + bytes_read);
             if (res != 0) {
                 log_error("MSC", "Read failed at LBA %u (error %d, read %u / %u bytes)", lba, res, bytes_read, size);

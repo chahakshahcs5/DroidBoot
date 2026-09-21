@@ -71,6 +71,7 @@ int  usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out
 int  usb_reprobe_as_msc(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_msc_dev, int max_wait_sec);
 int  usb_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *data, uint16_t len);
 int  usb_configure_bulk_endpoints(usb_device_t *dev, uint8_t in_ep, uint16_t in_max_packet, uint8_t out_ep, uint16_t out_max_packet);
+int  usb_configure_composite_msc_adb(usb_device_t *dev);
 int  usb_configure_mtp_endpoints(usb_device_t *dev);
 int  usb_configure_adb_endpoints(usb_device_t *dev);
 int  usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t len, uint32_t *transferred_out);
