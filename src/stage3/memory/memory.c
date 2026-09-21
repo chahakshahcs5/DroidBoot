@@ -1,10 +1,10 @@
 #include "memory.h"
+#include "heap.h"
 #include "../core/printf.h"
 
 #define HEAP_START 0x00800000       // 8 MiB mark
-#define HEAP_END   0x02000000       // 32 MiB mark (24 MiB total heap)
+#define HEAP_SIZE  (24 * 1024 * 1024) // 24 MiB total heap up to 32 MiB
 
-static uintptr_t heap_curr = HEAP_START;
 static uint64_t total_usable_ram = 0;
 
 static const char *get_e820_type_name(uint32_t type) {
@@ -20,7 +20,6 @@ static const char *get_e820_type_name(uint32_t type) {
 
 void memory_init(boot_info_t *boot_info) {
     total_usable_ram = 0;
-    heap_curr = HEAP_START;
 
     if (!boot_info || boot_info->e820_count == 0) {
         log_error("MEMORY", "No E820 memory map entries provided by Stage 2!");
@@ -52,29 +51,39 @@ void memory_init(boot_info_t *boot_info) {
 
     uint32_t ram_mb = (uint32_t)(total_usable_ram / (1024 * 1024));
     log_info("MEMORY", "Total Usable RAM: %u MiB", ram_mb);
-    log_info("MEMORY", "Dynamic Heap initialized: 0x%08X - 0x%08X (24 MiB)", HEAP_START, HEAP_END);
+
+    // Initialize the freestanding heap allocator
+    heap_init(HEAP_START, HEAP_SIZE);
 }
 
 void *kmalloc_aligned(size_t size, size_t alignment) {
-    if (alignment == 0) alignment = 16;
-    uintptr_t aligned = (heap_curr + (alignment - 1)) & ~(alignment - 1);
-    if (aligned + size > HEAP_END) {
-        log_error("MEMORY", "Out of heap memory! (requested %u bytes, available %u bytes)",
-                  (uint32_t)size, (uint32_t)(HEAP_END - heap_curr));
-        return NULL;
-    }
-    heap_curr = aligned + size;
-    return (void *)aligned;
+    return heap_malloc_aligned(size, alignment);
 }
 
 void *kmalloc(size_t size) {
-    return kmalloc_aligned(size, 16);
+    return heap_malloc(size);
+}
+
+void *kcalloc(size_t num, size_t size) {
+    return heap_calloc(num, size);
+}
+
+void *krealloc(void *ptr, size_t new_size) {
+    return heap_realloc(ptr, new_size);
 }
 
 void kfree(void *ptr) {
-    (void)ptr; // Bump allocator does not free individual chunks during early boot
+    heap_free(ptr);
 }
 
 uint64_t memory_get_total_usable(void) {
     return total_usable_ram;
+}
+
+size_t memory_get_free_heap(void) {
+    return heap_get_free_bytes();
+}
+
+size_t memory_get_used_heap(void) {
+    return heap_get_used_bytes();
 }

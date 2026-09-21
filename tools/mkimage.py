@@ -13,7 +13,7 @@ import argparse
 
 SECTOR_SIZE = 512
 STAGE2_MAX_SECTORS = 8          # 4 KiB allocated for Stage 2
-RAW_LOG_LBA = 256               # Raw backup log header sector
+RAW_LOG_LBA = 1024              # Raw backup log header sector
 PARTITION_START_LBA = 2048      # 1 MiB alignment for partition 1
 
 INITIAL_BOOTLOG_TEXT = (

@@ -166,7 +166,10 @@ static void scan_usb_msc_device(usb_device_t *msc_dev, os_registry_t *reg) {
         os_entry_t *entry = &reg->entries[reg->count];
         k_memset(entry, 0, sizeof(os_entry_t));
 
-        if (files.is_casper) {
+        if (files.title[0] != '\0') {
+            copy_str(entry->title, files.title, sizeof(entry->title));
+            copy_str(entry->filename, "live.iso", sizeof(entry->filename));
+        } else if (files.is_casper) {
             copy_str(entry->title, "Ubuntu Desktop Live (6.2 GB)", sizeof(entry->title));
             copy_str(entry->filename, "ubuntu-26.04.1-desktop-amd64.iso", sizeof(entry->filename));
         } else {
@@ -334,6 +337,43 @@ static int sd_read_sectors(void *priv, uint32_t lba, uint32_t count, void *buf) 
     return bios_disk_read(drive, lba, (uint16_t)count, buf);
 }
 
+typedef struct {
+    os_registry_t *reg;
+    uint32_t       part1_lba;
+    const char    *sub_dir;
+} sd_scan_ctx_t;
+
+static void sd_fat_scan_cb(const char *filename, uint64_t size, bool is_dir, void *user_data) {
+    sd_scan_ctx_t *ctx = (sd_scan_ctx_t *)user_data;
+    if (!ctx || !filename || is_dir) return;
+    if (ctx->reg->count >= MAX_OS_ENTRIES) return;
+
+    if (!is_boot_image(filename)) return;
+
+    for (uint32_t i = 0; i < ctx->reg->count; i++) {
+        if (str_eq_nocase(ctx->reg->entries[i].filename, filename)) return;
+    }
+
+    os_entry_t *entry = &ctx->reg->entries[ctx->reg->count];
+    k_memset(entry, 0, sizeof(os_entry_t));
+
+    guess_distro_title(filename, entry->title, sizeof(entry->title));
+    copy_str(entry->filename, filename, sizeof(entry->filename));
+    copy_str(entry->storage_desc, "SD Card FAT32 Partition", sizeof(entry->storage_desc));
+    entry->file_size = size;
+    entry->storage_type = OS_STORAGE_BLOCK_SD;
+    entry->approach = BOOT_APPROACH_BLOCK_ON_DEMAND;
+    entry->partition_lba = ctx->part1_lba;
+
+    populate_os_persistence_profiles(entry);
+
+    log_info("SCAN", "[+] Registered OS #%u: '%s' (%s on SD Card, %u MB)",
+             ctx->reg->count + 1, entry->title, entry->filename, (uint32_t)(size / 1024 / 1024));
+    log_info("SCAN", "    * Profiles: %u data profiles in /BootManager/persistence/",
+             entry->profile_count);
+    ctx->reg->count++;
+}
+
 static void scan_sd_storage(uint8_t boot_drive, os_registry_t *reg) {
     if (reg->count >= MAX_OS_ENTRIES) return;
 
@@ -355,37 +395,48 @@ static void scan_sd_storage(uint8_t boot_drive, os_registry_t *reg) {
 
     log_info("SCAN", "Scanning SD Card FAT32 partition (LBA %u) for boot images...", part1_lba);
 
-    const char *candidate_images[] = {
-        "alpine.iso",
-        "ubuntu.iso",
-        "rescue.iso",
-        "linux.iso",
-        "vmlinuz"
-    };
+    sd_scan_ctx_t ctx;
+    ctx.reg = reg;
+    ctx.part1_lba = part1_lba;
+    ctx.sub_dir = "";
 
-    for (int i = 0; i < 5 && reg->count < MAX_OS_ENTRIES; i++) {
-        if (fat_src->open(fat_src, candidate_images[i]) == 0) {
-            uint64_t fsize = fat_src->size(fat_src);
-            fat_src->close(fat_src);
+    // 1. Dynamic scan of root and common image folders
+    boot_source_fat_scan_dir(fat_src, "/", sd_fat_scan_cb, &ctx);
+    const char *extra_dirs[] = { "ISO", "ISOs", "boot" };
+    for (int d = 0; d < 3 && reg->count < MAX_OS_ENTRIES; d++) {
+        ctx.sub_dir = extra_dirs[d];
+        boot_source_fat_scan_dir(fat_src, extra_dirs[d], sd_fat_scan_cb, &ctx);
+    }
 
-            os_entry_t *entry = &reg->entries[reg->count];
-            k_memset(entry, 0, sizeof(os_entry_t));
+    // 2. Fallback probe for standard candidate images
+    if (reg->count == 0) {
+        const char *candidate_images[] = {
+            "alpine.iso", "ubuntu.iso", "rescue.iso", "linux.iso", "vmlinuz"
+        };
+        for (int i = 0; i < 5 && reg->count < MAX_OS_ENTRIES; i++) {
+            if (fat_src->open(fat_src, candidate_images[i]) == 0) {
+                uint64_t fsize = fat_src->size(fat_src);
+                fat_src->close(fat_src);
 
-            guess_distro_title(candidate_images[i], entry->title, sizeof(entry->title));
-            copy_str(entry->filename, candidate_images[i], sizeof(entry->filename));
-            copy_str(entry->storage_desc, "SD Card FAT32 Partition", sizeof(entry->storage_desc));
-            entry->file_size = fsize;
-            entry->storage_type = OS_STORAGE_BLOCK_SD;
-            entry->approach = BOOT_APPROACH_BLOCK_ON_DEMAND;
-            entry->partition_lba = part1_lba;
+                os_entry_t *entry = &reg->entries[reg->count];
+                k_memset(entry, 0, sizeof(os_entry_t));
 
-            populate_os_persistence_profiles(entry);
+                guess_distro_title(candidate_images[i], entry->title, sizeof(entry->title));
+                copy_str(entry->filename, candidate_images[i], sizeof(entry->filename));
+                copy_str(entry->storage_desc, "SD Card FAT32 Partition", sizeof(entry->storage_desc));
+                entry->file_size = fsize;
+                entry->storage_type = OS_STORAGE_BLOCK_SD;
+                entry->approach = BOOT_APPROACH_BLOCK_ON_DEMAND;
+                entry->partition_lba = part1_lba;
 
-            log_info("SCAN", "[+] Registered OS #%u: '%s' (%s on SD Card, %u MB)",
-                     reg->count + 1, entry->title, entry->filename, (uint32_t)(fsize / 1024 / 1024));
-            log_info("SCAN", "    * Profiles: %u data profiles in /BootManager/persistence/",
-                     entry->profile_count);
-            reg->count++;
+                populate_os_persistence_profiles(entry);
+
+                log_info("SCAN", "[+] Registered OS #%u: '%s' (%s on SD Card, %u MB)",
+                         reg->count + 1, entry->title, entry->filename, (uint32_t)(fsize / 1024 / 1024));
+                log_info("SCAN", "    * Profiles: %u data profiles in /BootManager/persistence/",
+                         entry->profile_count);
+                reg->count++;
+            }
         }
     }
 
@@ -474,12 +525,22 @@ static void scan_ram_storage(os_registry_t *reg) {
             os_entry_t *entry = &reg->entries[reg->count];
             k_memset(entry, 0, sizeof(os_entry_t));
 
-            if (iso_files.is_casper) {
+            char vol_id[33];
+            for (int v = 0; v < 32; v++) vol_id[v] = pvd[40 + v];
+            vol_id[32] = '\0';
+
+            if (iso_files.is_casper || str_contains_nocase(iso_files.title, "ubuntu") || str_contains_nocase(vol_id, "ubuntu")) {
                 copy_str(entry->title, "Ubuntu Desktop Live (In-RAM)", sizeof(entry->title));
                 copy_str(entry->filename, "ubuntu-desktop.iso (In-RAM)", sizeof(entry->filename));
-            } else {
+            } else if (str_contains_nocase(vol_id, "alpine") || str_contains_nocase(iso_files.title, "alpine") || str_contains_nocase(iso_files.title, "lts") || !iso_files.is_casper) {
                 copy_str(entry->title, "Alpine Linux Standard", sizeof(entry->title));
                 copy_str(entry->filename, "alpine-standard.iso (In-RAM)", sizeof(entry->filename));
+            } else if (iso_files.title[0] != '\0') {
+                copy_str(entry->title, iso_files.title, sizeof(entry->title));
+                copy_str(entry->filename, "bootable.iso (In-RAM)", sizeof(entry->filename));
+            } else {
+                copy_str(entry->title, "Linux Live OS (In-RAM)", sizeof(entry->title));
+                copy_str(entry->filename, "bootable.iso (In-RAM)", sizeof(entry->filename));
             }
             copy_str(entry->storage_desc, "Phone MTP Streamed / In-RAM Cache", sizeof(entry->storage_desc));
             entry->file_size = total_bytes;
@@ -508,7 +569,7 @@ static void scan_adb_storage(adb_session_t *session, os_registry_t *reg) {
 
     static char adb_out[1024];
     adb_out[0] = '\0';
-    const char *cmd = "su -c 'ls -1 /sdcard/Download/*.iso /sdcard/Download/*.img /sdcard/ISO/*.iso /sdcard/ISO/*.img /sdcard/ISOs/*.iso /sdcard/ISOs/*.img /sdcard/Ventoy/*.iso /sdcard/Ventoy/*.img /sdcard/*.iso /sdcard/*.img 2>/dev/null'";
+    const char *cmd = "su -c 'ls -1 /sdcard/Download/*.iso /sdcard/Download/*.img /sdcard/ISO/*.iso /sdcard/ISO/*.img /sdcard/ISOs/*.iso /sdcard/ISOs/*.img /sdcard/Ventoy/*.iso /sdcard/Ventoy/*.img /sdcard/*.iso /sdcard/*.img /mnt/media_rw/*/*.iso /mnt/media_rw/*/*.img 2>/dev/null'";
     if (adb_execute_shell(session, cmd, adb_out, sizeof(adb_out)) != 0 || adb_out[0] == '\0') {
         return;
     }

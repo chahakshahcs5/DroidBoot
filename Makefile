@@ -12,25 +12,31 @@ TOOLS_DIR   := tools
 CFLAGS      := -m32 -ffreestanding -nostdlib -fno-pie -fno-stack-protector \
                -fno-builtin -Wall -Wextra -O2 -I$(SRC_DIR)/include
 LDFLAGS     := -m elf_i386 -T $(SRC_DIR)/stage3/linker.ld -nostdlib
+LIBGCC      := $(shell $(CC) -m32 -print-libgcc-file-name 2>/dev/null)
 
 STAGE3_SRCS_C := $(SRC_DIR)/stage3/core/main.c \
                  $(SRC_DIR)/stage3/core/printf.c \
+                 $(SRC_DIR)/stage3/core/timer.c \
                  $(SRC_DIR)/stage3/debug/serial.c \
                  $(SRC_DIR)/stage3/debug/vga.c \
                  $(SRC_DIR)/stage3/debug/disk_log.c \
                  $(SRC_DIR)/stage3/bios/bios_disk.c \
                  $(SRC_DIR)/stage3/bios/vbe.c \
+                 $(SRC_DIR)/stage3/memory/heap.c \
                  $(SRC_DIR)/stage3/memory/memory.c \
                  $(SRC_DIR)/stage3/pci/pci.c \
                  $(SRC_DIR)/stage3/xhci/xhci.c \
                  $(SRC_DIR)/stage3/usb/usb.c \
                  $(SRC_DIR)/stage3/usb/usb_msc.c \
                  $(SRC_DIR)/stage3/mtp/mtp.c \
+                 $(SRC_DIR)/stage3/filesystem/ff.c \
+                 $(SRC_DIR)/stage3/filesystem/diskio.c \
                  $(SRC_DIR)/stage3/filesystem/fat_source.c \
                  $(SRC_DIR)/stage3/mtp/mtp_source.c \
                  $(SRC_DIR)/stage3/linux/linux_boot.c \
                  $(SRC_DIR)/stage3/image/image_detect.c \
                  $(SRC_DIR)/stage3/filesystem/iso_reader.c \
+                 $(SRC_DIR)/stage3/filesystem/boot_cfg_parser.c \
                  $(SRC_DIR)/stage3/image/os_scanner.c \
                  $(SRC_DIR)/stage3/adb/adb.c \
                  $(SRC_DIR)/stage3/ui/menu.c
@@ -66,7 +72,7 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.S | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/stage3.elf: $(STAGE3_OBJS)
-	$(LD) $(LDFLAGS) $^ -o $@
+	$(LD) $(LDFLAGS) $^ $(LIBGCC) -o $@
 
 $(BUILD_DIR)/stage3.bin: $(BUILD_DIR)/stage3.elf
 	$(OBJCOPY) -O binary $< $@

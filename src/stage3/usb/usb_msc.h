@@ -21,7 +21,7 @@ typedef struct {
     uint32_t dCBWTag;                // Command identifier tag
     uint32_t dCBWDataTransferLength; // Number of bytes to transfer
     uint8_t  bmCBWFlags;             // 0x00 = Host-to-Device, 0x80 = Device-to-Host
-    uint8_t  bCBWLUN;                // Logical Unit Number (0)
+    uint8_t  bCBWLUN;                // Logical Unit Number (0 or 1)
     uint8_t  bCBWCBLength;           // Length of SCSI CDB (e.g. 6 or 10)
     uint8_t  CBWCB[16];              // SCSI Command Descriptor Block
 } usb_msc_cbw_t;
@@ -38,18 +38,23 @@ typedef struct {
 
 // Initialize and test USB Mass Storage device
 int usb_msc_init_device(usb_device_t *dev);
+int usb_msc_init_lun(usb_device_t *dev, uint8_t lun);
 
-// Read 512-byte sectors from USB Mass Storage device
+// Read sectors from USB Mass Storage device (default LUN 0)
 int usb_msc_read_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, void *buf);
+int usb_msc_read_sectors_lun(usb_device_t *dev, uint8_t lun, uint32_t lba, uint16_t count, uint32_t block_size, void *buf);
 
-// Write 512-byte sectors to USB Mass Storage device
+// Write sectors to USB Mass Storage device (default LUN 0)
 int usb_msc_write_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, const void *buf);
+int usb_msc_write_sectors_lun(usb_device_t *dev, uint8_t lun, uint32_t lba, uint16_t count, uint32_t block_size, const void *buf);
 
 // Read capacity (10) from USB Mass Storage device
 int usb_msc_read_capacity(usb_device_t *dev, uint32_t *out_last_lba, uint32_t *out_block_size);
+int usb_msc_read_capacity_lun(usb_device_t *dev, uint8_t lun, uint32_t *out_last_lba, uint32_t *out_block_size);
 
 // Create a generic boot_source_t wrapping a USB Mass Storage device
 #include "../../include/boot_source.h"
 boot_source_t *boot_source_msc_create(usb_device_t *dev);
+boot_source_t *boot_source_msc_create_lun(usb_device_t *dev, uint8_t lun);
 
 #endif // USB_MSC_H

@@ -6,18 +6,16 @@
 #include "../memory/memory.h"
 #include <stddef.h>
 
+#include "../core/timer.h"
+
 #define EP_RING_TRBS 64
 
-static void udelay(uint32_t us) {
-    for (uint32_t i = 0; i < us * 2; i++) {
-        io_wait();
-    }
+static inline void udelay(uint32_t us) {
+    timer_udelay(us);
 }
 
-static void __attribute__((unused)) mdelay(uint32_t ms) {
-    for (uint32_t i = 0; i < ms; i++) {
-        udelay(1000);
-    }
+static inline void mdelay(uint32_t ms) {
+    timer_mdelay(ms);
 }
 
 
@@ -546,6 +544,48 @@ int usb_configure_adb_endpoints(usb_device_t *dev) {
                                         dev->adb_bulk_out_ep, dev->adb_bulk_out_max_packet);
 }
 
+int usb_clear_endpoint_halt(usb_device_t *dev, uint8_t ep_addr) {
+    if (!dev) return -1;
+    log_info("USB", "Clearing stall/halt condition on EP 0x%02X...", ep_addr);
+
+    // 1. Send CLEAR_FEATURE(ENDPOINT_HALT) control transfer to device
+    usb_setup_packet_t req;
+    req.bmRequestType = 0x02; // Endpoint recipient
+    req.bRequest = USB_REQ_CLEAR_FEATURE;
+    req.wValue = 0; // ENDPOINT_HALT
+    req.wIndex = ep_addr;
+    req.wLength = 0;
+    int res = usb_control_transfer(dev, &req, NULL, 0);
+
+    // 2. Send Reset Endpoint Command to xHCI
+    uint8_t ep_num = ep_addr & 0x0F;
+    bool is_in = (ep_addr & 0x80) != 0;
+    uint8_t ep_ctx_idx = (ep_num * 2) + (is_in ? 1 : 0);
+
+    xhci_trb_t cmd;
+    cmd.parameter = 0;
+    cmd.status = 0;
+    cmd.control = TRB_TYPE(TRB_RESET_EP_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
+    xhci_trb_t evt;
+    xhci_send_command(dev->ctrl, &cmd, &evt);
+
+    // 3. Set TR Dequeue Pointer Command to restore ring pointer
+    xhci_trb_t *ring = (ep_ctx_idx < 32 && dev->ep_rings[ep_ctx_idx]) ? dev->ep_rings[ep_ctx_idx] : (is_in ? dev->bulk_in_ring : dev->bulk_out_ring);
+    uint32_t deq_idx = (ep_ctx_idx < 32) ? dev->ep_enqueue_idx[ep_ctx_idx] : (is_in ? dev->bulk_in_enqueue_idx : dev->bulk_out_enqueue_idx);
+    uint8_t cycle = (ep_ctx_idx < 32) ? dev->ep_cycle_state[ep_ctx_idx] : (is_in ? dev->bulk_in_cycle_state : dev->bulk_out_cycle_state);
+
+    if (ring) {
+        xhci_trb_t deq_cmd;
+        deq_cmd.parameter = (uintptr_t)&ring[deq_idx] | (cycle ? 1U : 0U);
+        deq_cmd.status = 0;
+        deq_cmd.control = TRB_TYPE(TRB_SET_TR_DEQ_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
+        xhci_send_command(dev->ctrl, &deq_cmd, &evt);
+    }
+
+    log_info("USB", "EP 0x%02X stall cleared, endpoint reset.", ep_addr);
+    return res;
+}
+
 int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t len, uint32_t *transferred_out) {
     if (!dev || !data || len == 0) return -1;
 
@@ -622,6 +662,10 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
                     uint32_t rem = evt->status & 0xFFFFFF;
                     if (transferred_out) {
                         *transferred_out = len - rem;
+                    }
+                    if (cc == TRB_COMPL_STALL_ERR || cc == TRB_COMPL_BABBLE_ERR) {
+                        usb_clear_endpoint_halt(dev, ep_addr);
+                        return (int)cc;
                     }
                     return (cc == TRB_COMPL_SUCCESS || cc == TRB_COMPL_SHORT_TX) ? 0 : (int)cc;
                 }

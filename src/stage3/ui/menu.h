@@ -27,7 +27,15 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
                  usb_device_t *usb_dev, mtp_session_t *mtp_session,
                  const os_registry_t *registry);
 
-menu_selection_t menu_wait_selection(const os_registry_t *registry);
+#define KEY_UP        0x101
+#define KEY_DOWN      0x102
+#define KEY_LEFT      0x103
+#define KEY_RIGHT     0x104
+#define KEY_ENTER     '\n'
+#define KEY_ESC       0x1B
+#define KEY_BACKSPACE 0x08
+
+menu_selection_t menu_wait_selection(os_registry_t *registry);
 
 int      menu_select_phone_image(const os_registry_t *registry);
 int      menu_select_persistence_profile(os_entry_t *entry, adb_session_t *adb);

@@ -3,6 +3,7 @@
 #include "../debug/serial.h"
 #include "../debug/vga.h"
 #include "printf.h"
+#include "timer.h"
 #include "../memory/memory.h"
 #include "../pci/pci.h"
 #include "../xhci/xhci.h"
@@ -41,6 +42,13 @@ static int k_memcmp(const void *s1, const void *s2, size_t n) {
         if (p1[i] != p2[i]) return (int)p1[i] - (int)p2[i];
     }
     return 0;
+}
+
+static size_t k_strlen(const char *s) {
+    size_t len = 0;
+    if (!s) return 0;
+    while (s[len]) len++;
+    return len;
 }
 
 static bool is_boot_drive_msc(usb_device_t *dev) {
@@ -233,7 +241,16 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
 
     // Determine kernel command line:
     char cmdline[512];
-    if (iso_files.is_casper) {
+    if (iso_files.cmdline[0] != '\0') {
+        snprintf(cmdline, sizeof(cmdline), "%s", iso_files.cmdline);
+        if (prof && !prof->is_clean_session && iso_files.is_casper) {
+            size_t clen = k_strlen(cmdline);
+            if (clen + 64 < sizeof(cmdline)) {
+                snprintf(cmdline + clen, sizeof(cmdline) - clen,
+                         " persistent persistent-path=/BootManager/persistence/");
+            }
+        }
+    } else if (iso_files.is_casper) {
         if (prof && prof->is_clean_session) {
             snprintf(cmdline, sizeof(cmdline),
                      "boot=casper modprobe.blacklist=floppy nosplash console=tty1");
@@ -327,7 +344,18 @@ static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_fil
     linux_setup_mbft(LINUX_RAM_ISO_PHYS, total_iso_bytes);
 
     char alpine_cmdline[512];
-    if (prof && prof->is_clean_session) {
+    if (iso_files && iso_files->cmdline[0] != '\0') {
+        snprintf(alpine_cmdline, sizeof(alpine_cmdline),
+                 "%s phram=iso,0x%08X,0x%08X memdisk=yes",
+                 iso_files->cmdline, LINUX_RAM_ISO_PHYS, total_iso_bytes);
+        if (prof && !prof->is_clean_session) {
+            size_t clen = k_strlen(alpine_cmdline);
+            if (clen + 48 < sizeof(alpine_cmdline)) {
+                snprintf(alpine_cmdline + clen, sizeof(alpine_cmdline) - clen,
+                         " apkovl=LABEL=BOOTLOADER:apkovl.tgz");
+            }
+        }
+    } else if (prof && prof->is_clean_session) {
         snprintf(alpine_cmdline, sizeof(alpine_cmdline),
                  "console=tty0 console=tty1 modprobe.blacklist=floppy noapic modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes debug_init quiet",
                  LINUX_RAM_ISO_PHYS, total_iso_bytes);
@@ -586,10 +614,11 @@ static void load_dynamic_adb_key(uint8_t boot_drive) {
 }
 
 void c_main(boot_info_t *boot_info) {
-    // 1. Initialize Serial Port & VGA Console
+    // 1. Initialize Serial Port, VGA Console, Sound & Hardware Timer
     serial_init();
     vga_init();
     sound_boot_tone();
+    timer_init();
 
     // 2. Initialize Persistent SD Disk Logging EARLY
     disk_log_init(boot_info);

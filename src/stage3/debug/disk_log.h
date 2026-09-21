@@ -9,7 +9,7 @@
 #define DISK_LOG_BUFFER_SIZE    65536   // 64 KiB
 #define RAW_LOG_MAGIC_1         0x544F4F42  // "BOOT"
 #define RAW_LOG_MAGIC_2         0x21474F4C  // "LOG!"
-#define RAW_LOG_LBA             256
+#define RAW_LOG_LBA             1024
 #define RAW_LOG_SECTORS         128     // 64 KiB
 
 typedef struct disk_log_header {

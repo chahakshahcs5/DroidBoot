@@ -13,8 +13,14 @@ typedef struct iso_boot_files {
     bool     found_kernel;
     bool     found_initrd;
     bool     is_casper;
+    char     title[96];
+    char     cmdline[384];
 } iso_boot_files_t;
 
+// Find arbitrary file by path (case-insensitive, Rock Ridge aware)
+int iso_find_file(boot_source_t *iso_src, const char *path, uint32_t *out_lba, uint32_t *out_size);
+
+// Universal boot discovery: tries grub.cfg / isolinux.cfg first, then heuristic fallback
 int iso_find_boot_files(boot_source_t *iso_src, iso_boot_files_t *out_files);
 
 #endif // ISO_READER_H

@@ -12,7 +12,7 @@ import argparse
 import time
 
 SECTOR_SIZE = 512
-RAW_LOG_LBA = 256
+RAW_LOG_LBA = 1024
 PARTITION_START_LBA = 2048
 
 def read_raw_log(f) -> tuple[dict, str]:

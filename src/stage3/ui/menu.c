@@ -22,23 +22,65 @@ static bool str_eq_nocase(const char *a, const char *b) {
     return (a[i] == '\0' && b[i] == '\0');
 }
 
+static void copy_str(char *dst, const char *src, uint32_t max_len) {
+    if (!dst || max_len == 0) return;
+    uint32_t i = 0;
+    if (src) {
+        while (src[i] && i < max_len - 1) {
+            dst[i] = src[i];
+            i++;
+        }
+    }
+    dst[i] = '\0';
+}
+
 static int poll_input_char(void) {
     // 1. Poll BIOS INT 16h Keyboard Service (universal for laptop built-in and USB keyboards)
     uint16_t k = bios_int16_call(0x01);
     if (k != 0) {
         uint8_t ascii = (uint8_t)(k & 0xFF);
         uint8_t sc = (uint8_t)(k >> 8);
-        if (ascii != 0) return (int)ascii;
+        if (ascii != 0) {
+            if (ascii == '\r') return '\n';
+            return (int)ascii;
+        }
         // Extended keys without ASCII
-        if (sc == 0x4F) return '1';
-        if (sc == 0x50) return '2';
-        if (sc == 0x51) return '3';
+        if (sc == 0x48) return KEY_UP;
+        if (sc == 0x50) return KEY_DOWN;
+        if (sc == 0x4B) return KEY_LEFT;
+        if (sc == 0x4D) return KEY_RIGHT;
         if (sc == 0x1C) return '\n';
+        if (sc == 0x01) return KEY_ESC;
+        if (sc == 0x0E) return KEY_BACKSPACE;
+        if (sc == 0x4F) return '1';
+        if (sc == 0x51) return '3';
     }
 
     // 2. Poll COM1 Serial UART (only if physical UART is actually present)
     if (serial_is_present() && (inb(0x3F8 + 5) & 0x01)) {
-        return inb(0x3F8);
+        int ch = inb(0x3F8);
+        if (ch == 0x1B) {
+            // Check for ANSI escape sequences: \x1b[A, \x1b[B, \x1b[C, \x1b[D
+            int to = 3000;
+            while (!(inb(0x3F8 + 5) & 0x01) && --to > 0) io_wait();
+            if (to > 0 && (inb(0x3F8 + 5) & 0x01)) {
+                int ch2 = inb(0x3F8);
+                if (ch2 == '[') {
+                    to = 3000;
+                    while (!(inb(0x3F8 + 5) & 0x01) && --to > 0) io_wait();
+                    if (to > 0 && (inb(0x3F8 + 5) & 0x01)) {
+                        int ch3 = inb(0x3F8);
+                        if (ch3 == 'A') return KEY_UP;
+                        if (ch3 == 'B') return KEY_DOWN;
+                        if (ch3 == 'C') return KEY_RIGHT;
+                        if (ch3 == 'D') return KEY_LEFT;
+                    }
+                }
+            }
+            return KEY_ESC;
+        }
+        if (ch == '\r') return '\n';
+        return ch;
     }
 
     // 3. Fallback: Poll PS/2 Keyboard Controller (Status Port 0x64 bit 0 = Output Buffer Full)
@@ -46,21 +88,22 @@ static int poll_input_char(void) {
         uint8_t sc = inb(0x60);
         // Ignore break codes (key release has bit 7 set)
         if (!(sc & 0x80)) {
-            if (sc == 0x02 || sc == 0x4F) return '1';
-            if (sc == 0x03 || sc == 0x50) return '2';
-            if (sc == 0x04 || sc == 0x51) return '3';
-            if (sc == 0x05 || sc == 0x4B) return '4';
-            if (sc == 0x06 || sc == 0x4C) return '5';
-            if (sc == 0x07 || sc == 0x4D) return '6';
-            if (sc == 0x08 || sc == 0x47) return '7';
-            if (sc == 0x09 || sc == 0x48) return '8';
-            if (sc == 0x0A || sc == 0x49) return '9';
-            if (sc == 0x0B || sc == 0x52) return '0';
-            if (sc == 0x0E) return 0x08; // Backspace
-            if (sc == 0x20) return 'd'; // 'D'
-            if (sc == 0x14) return 't'; // 'T'
-            if (sc == 0x1C) return '\n'; // Enter
+            if (sc == 0x48) return KEY_UP;
+            if (sc == 0x50) return KEY_DOWN;
+            if (sc == 0x4B) return KEY_LEFT;
+            if (sc == 0x4D) return KEY_RIGHT;
+            if (sc == 0x01) return KEY_ESC;
+            if (sc == 0x1C) return '\n';
+            if (sc == 0x0E) return KEY_BACKSPACE;
+            if (sc == 0x12) return 'e';
+            if (sc == 0x16) return 'u';
+            if (sc == 0x13) return 'r';
+            if (sc == 0x20) return 'd';
+            if (sc == 0x14) return 't';
+            if (sc == 0x19) return 'p';
             if (sc == 0x39) return ' ';
+            if (sc >= 0x02 && sc <= 0x0A) return '1' + (sc - 0x02);
+            if (sc == 0x0B) return '0';
         }
     }
 
@@ -75,9 +118,10 @@ int menu_get_char(void) {
     }
 }
 
-static int menu_read_line(char *buf, uint32_t max_len, uint32_t timeout_sec, const char *default_val) {
+static int menu_read_line_or_key(char *buf, uint32_t max_len, uint32_t timeout_sec, const char *default_val, int *special_key) {
     uint32_t pos = 0;
     buf[0] = '\0';
+    if (special_key) *special_key = 0;
 
     uint32_t remaining = timeout_sec;
     uint32_t slice_count = 0;
@@ -87,9 +131,20 @@ static int menu_read_line(char *buf, uint32_t max_len, uint32_t timeout_sec, con
         if (ch != -1) {
             remaining = 0; // Disable countdown immediately on user keystroke
 
+            // If a special navigation key is pressed at start of line
+            if (pos == 0 && special_key != NULL &&
+                (ch == KEY_UP || ch == KEY_DOWN || ch == KEY_LEFT || ch == KEY_RIGHT || ch == KEY_ESC)) {
+                *special_key = ch;
+                return 0;
+            }
+
             // Enter key: carriage return (\r) or line feed (\n)
             if (ch == '\r' || ch == '\n') {
                 if (pos == 0) {
+                    if (special_key) {
+                        *special_key = KEY_ENTER;
+                        return 0;
+                    }
                     if (default_val && default_val[0]) {
                         for (int i = 0; default_val[i] && pos + 1 < max_len; i++) {
                             buf[pos++] = default_val[i];
@@ -149,6 +204,10 @@ static int menu_read_line(char *buf, uint32_t max_len, uint32_t timeout_sec, con
 
         for (int w = 0; w < 10000; w++) io_wait();
     }
+}
+
+static int menu_read_line(char *buf, uint32_t max_len, uint32_t timeout_sec, const char *default_val) {
+    return menu_read_line_or_key(buf, max_len, timeout_sec, default_val, NULL);
 }
 
 void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
@@ -231,6 +290,9 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
         printk("|  [U] Switch Phone to Root USB Mass Storage (UMS) (or press 'U')          |\n");
         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     }
+    if (registry && registry->count > 0) {
+        printk("|  [E] Edit Kernel Boot Parameters                 (or press 'E')          |\n");
+    }
     printk("|  [R] Rescan USB Devices & Storage               (or press 'R')          |\n");
     printk("|  [%u] Hardware Diagnostics & System Inspection   (or press 'D')          |\n", diag_num);
     printk("|  [%u] Linux 32-bit Boot Protocol Simulation      (or press 'T')          |\n", test_num);
@@ -239,10 +301,37 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 }
 
-menu_selection_t menu_wait_selection(const os_registry_t *registry) {
+static void menu_edit_cmdline(os_entry_t *entry) {
+    if (!entry) return;
+    vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+    printk("\n+------------------------------------------------------------------------+\n");
+    printk("|              KERNEL BOOT COMMAND LINE EDITOR                           |\n");
+    printk("+------------------------------------------------------------------------+\n");
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    printk("OS: %s\n", entry->title);
+    vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
+    printk("Current: %s\n", entry->iso_files.cmdline[0] ? entry->iso_files.cmdline : "(default auto-generated)");
+    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    printk("Enter new kernel command line (press ENTER to keep, or type new parameters):\n> ");
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+
+    char new_cmd[384];
+    int len = menu_read_line(new_cmd, sizeof(new_cmd), 0, entry->iso_files.cmdline);
+    if (len > 0) {
+        copy_str(entry->iso_files.cmdline, new_cmd, sizeof(entry->iso_files.cmdline));
+        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        printk("[CMDLINE] Saved parameters: %s\n", entry->iso_files.cmdline);
+    } else {
+        printk("[CMDLINE] Kept existing parameters.\n");
+    }
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+}
+
+menu_selection_t menu_wait_selection(os_registry_t *registry) {
     uint32_t os_count = registry ? registry->count : 0;
     uint32_t diag_num = os_count > 0 ? os_count + 1 : 1;
     uint32_t test_num = os_count > 0 ? os_count + 2 : 2;
+    uint32_t current_sel = 1;
 
     while (1) {
         vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
@@ -254,13 +343,64 @@ menu_selection_t menu_wait_selection(const os_registry_t *registry) {
         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
         char line[16];
-        if (os_count > 0) {
-            menu_read_line(line, sizeof(line), 0, "1");
-        } else {
-            menu_read_line(line, sizeof(line), 0, "R");
+        int special_key = 0;
+        menu_read_line_or_key(line, sizeof(line), 0, (os_count > 0) ? "1" : "R", &special_key);
+
+        if (special_key == KEY_UP) {
+            if (current_sel > 1) current_sel--;
+            else current_sel = test_num;
+            vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+            if (current_sel <= os_count) {
+                printk("\r[NAV] Highlighted [%u]: %s (Press ENTER to boot, 'E' to edit cmdline)   ",
+                       current_sel, registry->entries[current_sel - 1].title);
+            } else if (current_sel == diag_num) {
+                printk("\r[NAV] Highlighted [%u]: Hardware Diagnostics (Press ENTER to run)          ", current_sel);
+            } else {
+                printk("\r[NAV] Highlighted [%u]: Linux Simulation Test (Press ENTER to run)         ", current_sel);
+            }
+            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+            continue;
+        }
+
+        if (special_key == KEY_DOWN) {
+            if (current_sel < test_num) current_sel++;
+            else current_sel = 1;
+            vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+            if (current_sel <= os_count) {
+                printk("\r[NAV] Highlighted [%u]: %s (Press ENTER to boot, 'E' to edit cmdline)   ",
+                       current_sel, registry->entries[current_sel - 1].title);
+            } else if (current_sel == diag_num) {
+                printk("\r[NAV] Highlighted [%u]: Hardware Diagnostics (Press ENTER to run)          ", current_sel);
+            } else {
+                printk("\r[NAV] Highlighted [%u]: Linux Simulation Test (Press ENTER to run)         ", current_sel);
+            }
+            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+            continue;
+        }
+
+        if (special_key == KEY_ENTER) {
+            if (current_sel <= os_count) {
+                uint32_t idx = current_sel - 1;
+                printk("[MENU] User selected [%u]: Boot %s\n", current_sel, registry->entries[idx].title);
+                return (menu_selection_t){ .type = MENU_ACTION_BOOT_OS, .os_index = idx };
+            } else if (current_sel == diag_num) {
+                printk("[MENU] User selected [%u]: Hardware Diagnostics\n", current_sel);
+                return (menu_selection_t){ .type = MENU_ACTION_DIAGNOSTICS, .os_index = 0 };
+            } else if (current_sel == test_num) {
+                printk("[MENU] User selected [%u]: Linux Boot Protocol Simulation\n", current_sel);
+                return (menu_selection_t){ .type = MENU_ACTION_SELF_TEST, .os_index = 0 };
+            }
         }
 
         // Direct letter shortcuts (case-insensitive)
+        if ((line[0] == 'e' || line[0] == 'E') && line[1] == '\0') {
+            if (current_sel <= os_count && os_count > 0) {
+                menu_edit_cmdline(&registry->entries[current_sel - 1]);
+            } else {
+                printk("[MENU] No OS selected to edit command line.\n");
+            }
+            continue;
+        }
         if ((line[0] == 'u' || line[0] == 'U' || line[0] == 'm' || line[0] == 'M') && line[1] == '\0') {
             printk("[MENU] Switching rooted Android phone to USB Mass Storage (UMS)...\n");
             return (menu_selection_t){ .type = MENU_ACTION_SWITCH_UMS, .os_index = 0 };

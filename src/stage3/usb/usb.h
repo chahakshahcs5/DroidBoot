@@ -75,6 +75,7 @@ int  usb_configure_mtp_endpoints(usb_device_t *dev);
 int  usb_configure_adb_endpoints(usb_device_t *dev);
 int  usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t len, uint32_t *transferred_out);
 int  usb_bulk_transfer_wait(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t len, uint32_t *transferred_out, int max_seconds);
+int  usb_clear_endpoint_halt(usb_device_t *dev, uint8_t ep_addr);
 int  usb_get_string_descriptor(usb_device_t *dev, uint8_t index, char *out_str, uint16_t max_len);
 
 #endif // USB_H

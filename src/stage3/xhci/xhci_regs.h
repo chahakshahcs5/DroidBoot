@@ -92,6 +92,7 @@ static inline void xhci_write64(uintptr_t addr, uint64_t val) {
 #define TRB_CONFIG_EP_CMD       12
 #define TRB_EVAL_CTX_CMD        13
 #define TRB_RESET_EP_CMD        14
+#define TRB_SET_TR_DEQ_CMD      16
 #define TRB_NOOP_CMD            23
 #define TRB_TRANSFER_EVENT      32
 #define TRB_COMMAND_COMPL       33

@@ -18,6 +18,11 @@ typedef enum {
 #define STA_NODISK      0x02
 #define STA_PROTECT     0x04
 
+// Driver registration
+void diskio_set_bios_drive(uint8_t drive);
+struct usb_device;
+void diskio_set_usb_msc_device(struct usb_device *dev);
+
 // Functions
 DSTATUS disk_initialize(uint8_t pdrv);
 DSTATUS disk_status(uint8_t pdrv);

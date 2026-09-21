@@ -1,12 +1,14 @@
 #include "usb_msc.h"
 #include "../../include/io.h"
 #include "../core/printf.h"
+#include "../core/timer.h"
 #include "../memory/memory.h"
 #include <stddef.h>
 
 static uint32_t msc_tag_counter = 0x88000001;
 
-static int usb_msc_send_cbw(usb_device_t *dev, uint32_t tag, uint32_t length, uint8_t flags, uint8_t cb_len, const uint8_t *cb) {
+static int usb_msc_send_cbw_lun(usb_device_t *dev, uint8_t lun, uint32_t tag, uint32_t length,
+                                uint8_t flags, uint8_t cb_len, const uint8_t *cb) {
     if (!dev || !dev->has_msc) return -1;
 
     usb_msc_cbw_t cbw;
@@ -14,7 +16,7 @@ static int usb_msc_send_cbw(usb_device_t *dev, uint32_t tag, uint32_t length, ui
     cbw.dCBWTag = tag;
     cbw.dCBWDataTransferLength = length;
     cbw.bmCBWFlags = flags;
-    cbw.bCBWLUN = 0;
+    cbw.bCBWLUN = lun;
     cbw.bCBWCBLength = cb_len;
 
     for (int i = 0; i < 16; i++) {
@@ -24,7 +26,7 @@ static int usb_msc_send_cbw(usb_device_t *dev, uint32_t tag, uint32_t length, ui
     uint32_t sent = 0;
     int res = usb_bulk_transfer(dev, dev->msc_bulk_out_ep, &cbw, sizeof(cbw), &sent);
     if (res != 0) {
-        log_error("MSC", "Failed to send CBW (error %d)", res);
+        log_error("MSC", "Failed to send CBW (error %d, LUN %u)", res, lun);
     }
     return res;
 }
@@ -58,32 +60,34 @@ static int usb_msc_recv_csw(usb_device_t *dev, uint32_t expected_tag) {
     return 0;
 }
 
-int usb_msc_init_device(usb_device_t *dev) {
+int usb_msc_init_lun(usb_device_t *dev, uint8_t lun) {
     if (!dev || !dev->has_msc) return -1;
 
-    // Retry TEST UNIT READY up to 5 times to clear Unit Attention after USB port reset
     int res = -1;
     for (int retry = 0; retry < 5; retry++) {
         uint32_t tag = ++msc_tag_counter;
         uint8_t cdb[6] = { SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0 };
 
-        if (usb_msc_send_cbw(dev, tag, 0, 0x00, 6, cdb) == 0) {
+        if (usb_msc_send_cbw_lun(dev, lun, tag, 0, 0x00, 6, cdb) == 0) {
             res = usb_msc_recv_csw(dev, tag);
             if (res == 0) {
-                log_info("MSC", "USB Mass Storage device is READY on Port %u.", dev->port_num);
+                log_info("MSC", "USB Mass Storage device LUN %u is READY on Port %u.", lun, dev->port_num);
                 return 0;
             }
         }
-        // Unit Attention or Busy: wait 20ms and retry
-        for (int d = 0; d < 20000; d++) io_wait();
+        timer_mdelay(20);
     }
 
-    log_info("MSC", "USB Mass Storage Test Unit Ready status: %d. Ready for I/O.", res);
-    return 0;
+    return res;
 }
 
-int usb_msc_read_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, void *buf) {
+int usb_msc_init_device(usb_device_t *dev) {
+    return usb_msc_init_lun(dev, 0);
+}
+
+int usb_msc_read_sectors_lun(usb_device_t *dev, uint8_t lun, uint32_t lba, uint16_t count, uint32_t block_size, void *buf) {
     if (!dev || !dev->has_msc || !buf || count == 0) return -1;
+    if (block_size == 0) block_size = 512;
 
     uint8_t *ptr = (uint8_t *)buf;
     uint32_t cur_lba = lba;
@@ -91,7 +95,7 @@ int usb_msc_read_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, void *
 
     while (remaining > 0) {
         uint16_t chunk = (remaining > 16) ? 16 : remaining;
-        uint32_t chunk_bytes = (uint32_t)chunk * 512;
+        uint32_t chunk_bytes = (uint32_t)chunk * block_size;
         uint32_t tag = ++msc_tag_counter;
 
         uint8_t cdb[10];
@@ -106,7 +110,7 @@ int usb_msc_read_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, void *
         cdb[8] = (uint8_t)(chunk & 0xFF);
         cdb[9] = 0;
 
-        int res = usb_msc_send_cbw(dev, tag, chunk_bytes, 0x80, 10, cdb);
+        int res = usb_msc_send_cbw_lun(dev, lun, tag, chunk_bytes, 0x80, 10, cdb);
         if (res != 0) return res;
 
         uint32_t transferred = 0;
@@ -124,8 +128,13 @@ int usb_msc_read_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, void *
     return 0;
 }
 
-int usb_msc_write_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, const void *buf) {
+int usb_msc_read_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, void *buf) {
+    return usb_msc_read_sectors_lun(dev, 0, lba, count, 512, buf);
+}
+
+int usb_msc_write_sectors_lun(usb_device_t *dev, uint8_t lun, uint32_t lba, uint16_t count, uint32_t block_size, const void *buf) {
     if (!dev || !dev->has_msc || !buf || count == 0) return -1;
+    if (block_size == 0) block_size = 512;
 
     const uint8_t *ptr = (const uint8_t *)buf;
     uint32_t cur_lba = lba;
@@ -133,7 +142,7 @@ int usb_msc_write_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, const
 
     while (remaining > 0) {
         uint16_t chunk = (remaining > 16) ? 16 : remaining;
-        uint32_t chunk_bytes = (uint32_t)chunk * 512;
+        uint32_t chunk_bytes = (uint32_t)chunk * block_size;
         uint32_t tag = ++msc_tag_counter;
 
         uint8_t cdb[10];
@@ -148,7 +157,7 @@ int usb_msc_write_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, const
         cdb[8] = (uint8_t)(chunk & 0xFF);
         cdb[9] = 0;
 
-        int res = usb_msc_send_cbw(dev, tag, chunk_bytes, 0x00, 10, cdb);
+        int res = usb_msc_send_cbw_lun(dev, lun, tag, chunk_bytes, 0x00, 10, cdb);
         if (res != 0) return res;
 
         uint32_t transferred = 0;
@@ -166,13 +175,17 @@ int usb_msc_write_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, const
     return 0;
 }
 
-int usb_msc_read_capacity(usb_device_t *dev, uint32_t *out_last_lba, uint32_t *out_block_size) {
+int usb_msc_write_sectors(usb_device_t *dev, uint32_t lba, uint16_t count, const void *buf) {
+    return usb_msc_write_sectors_lun(dev, 0, lba, count, 512, buf);
+}
+
+int usb_msc_read_capacity_lun(usb_device_t *dev, uint8_t lun, uint32_t *out_last_lba, uint32_t *out_block_size) {
     if (!dev || !dev->has_msc) return -1;
 
     uint32_t tag = ++msc_tag_counter;
     uint8_t cdb[10] = { SCSI_READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
-    int res = usb_msc_send_cbw(dev, tag, 8, 0x80, 10, cdb);
+    int res = usb_msc_send_cbw_lun(dev, lun, tag, 8, 0x80, 10, cdb);
     if (res != 0) return res;
 
     uint8_t cap_data[8];
@@ -198,8 +211,14 @@ int usb_msc_read_capacity(usb_device_t *dev, uint32_t *out_last_lba, uint32_t *o
     return 0;
 }
 
+int usb_msc_read_capacity(usb_device_t *dev, uint32_t *out_last_lba, uint32_t *out_block_size) {
+    return usb_msc_read_capacity_lun(dev, 0, out_last_lba, out_block_size);
+}
+
 typedef struct msc_source_priv {
     usb_device_t *dev;
+    uint8_t       lun;
+    uint32_t      block_size;
     uint64_t      offset;
     uint64_t      total_size;
 } msc_source_priv_t;
@@ -216,29 +235,30 @@ static uint32_t msc_src_read(boot_source_t *src, void *buf, uint32_t size) {
 
     uint32_t bytes_read = 0;
     uint8_t *dst = (uint8_t *)buf;
+    uint32_t bsz = priv->block_size ? priv->block_size : 512;
 
     while (bytes_read < size) {
         uint64_t cur_pos = priv->offset + bytes_read;
-        uint32_t lba = (uint32_t)(cur_pos >> 9);
-        uint32_t sec_offset = (uint32_t)(cur_pos & 511);
+        uint32_t lba = (uint32_t)(cur_pos / bsz);
+        uint32_t sec_offset = (uint32_t)(cur_pos % bsz);
 
-        if (sec_offset == 0 && (size - bytes_read) >= 512) {
-            uint32_t sectors_to_read = (size - bytes_read) >> 9;
-            if (sectors_to_read > 64) sectors_to_read = 64; // Max 32KB per bulk transfer
-            int res = usb_msc_read_sectors(priv->dev, lba, (uint16_t)sectors_to_read, dst + bytes_read);
+        if (sec_offset == 0 && (size - bytes_read) >= bsz) {
+            uint32_t sectors_to_read = (size - bytes_read) / bsz;
+            if (sectors_to_read > 64) sectors_to_read = 64; // Max transfer chunk
+            int res = usb_msc_read_sectors_lun(priv->dev, priv->lun, lba, (uint16_t)sectors_to_read, bsz, dst + bytes_read);
             if (res != 0) {
                 log_error("MSC", "Read failed at LBA %u (error %d, read %u / %u bytes)", lba, res, bytes_read, size);
                 break;
             }
-            bytes_read += sectors_to_read * 512;
+            bytes_read += sectors_to_read * bsz;
         } else {
-            static uint8_t bounce[512];
-            int res = usb_msc_read_sectors(priv->dev, lba, 1, bounce);
+            static uint8_t bounce[4096];
+            int res = usb_msc_read_sectors_lun(priv->dev, priv->lun, lba, 1, bsz, bounce);
             if (res != 0) {
                 log_error("MSC", "Read bounce failed at LBA %u (error %d, read %u / %u bytes)", lba, res, bytes_read, size);
                 break;
             }
-            uint32_t chunk = 512 - sec_offset;
+            uint32_t chunk = bsz - sec_offset;
             if (chunk > (size - bytes_read)) chunk = size - bytes_read;
             for (uint32_t i = 0; i < chunk; i++) {
                 dst[bytes_read + i] = bounce[sec_offset + i];
@@ -272,24 +292,25 @@ static void msc_src_close(boot_source_t *src) {
     (void)src;
 }
 
-boot_source_t *boot_source_msc_create(usb_device_t *dev) {
+boot_source_t *boot_source_msc_create_lun(usb_device_t *dev, uint8_t lun) {
     if (!dev || !dev->has_msc) return NULL;
 
     msc_source_priv_t *priv = (msc_source_priv_t *)kmalloc(sizeof(msc_source_priv_t));
     if (!priv) return NULL;
 
     priv->dev = dev;
+    priv->lun = lun;
     priv->offset = 0;
     priv->total_size = 0;
+    priv->block_size = 512;
 
     uint32_t last_lba = 0;
     uint32_t block_size = 512;
-    if (usb_msc_read_capacity(dev, &last_lba, &block_size) == 0 && block_size > 0) {
+    if (usb_msc_read_capacity_lun(dev, lun, &last_lba, &block_size) == 0 && block_size > 0) {
+        priv->block_size = block_size;
         priv->total_size = (uint64_t)(last_lba + 1) * block_size;
-        log_info("MSC", "USB MSC Capacity: %u MB (%u sectors of %u B)",
-                 (uint32_t)(priv->total_size >> 20), last_lba + 1, block_size);
-    } else {
-        log_info("MSC", "Could not read capacity, defaulting to unconstrained block access.");
+        log_info("MSC", "USB MSC LUN %u Capacity: %u MB (%u sectors of %u B)",
+                 lun, (uint32_t)(priv->total_size >> 20), last_lba + 1, block_size);
     }
 
     boot_source_t *src = (boot_source_t *)kmalloc(sizeof(boot_source_t));
@@ -298,7 +319,7 @@ boot_source_t *boot_source_msc_create(usb_device_t *dev) {
         return NULL;
     }
 
-    src->name = "USB-MSC";
+    src->name = (lun == 0) ? "USB-MSC-LUN0" : "USB-MSC-LUN1";
     src->open = msc_src_open;
     src->read = msc_src_read;
     src->seek = msc_src_seek;
@@ -310,3 +331,6 @@ boot_source_t *boot_source_msc_create(usb_device_t *dev) {
     return src;
 }
 
+boot_source_t *boot_source_msc_create(usb_device_t *dev) {
+    return boot_source_msc_create_lun(dev, 0);
+}
