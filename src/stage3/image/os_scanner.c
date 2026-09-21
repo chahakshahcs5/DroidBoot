@@ -85,6 +85,10 @@ static void guess_distro_title(const char *filename, char *out_title, uint32_t m
         copy_str(out_title, "Fedora Workstation Live", max_len);
     } else if (str_contains_nocase(filename, "kali")) {
         copy_str(out_title, "Kali Linux Live", max_len);
+    } else if (str_contains_nocase(filename, "corepure") || str_contains_nocase(filename, "tinycore")) {
+        copy_str(out_title, "Tiny Core Linux (CorePure64)", max_len);
+    } else if (str_contains_nocase(filename, "slitaz")) {
+        copy_str(out_title, "SliTaz GNU/Linux Live", max_len);
     } else if (str_contains_nocase(filename, "rescue")) {
         copy_str(out_title, "Rescue / Diagnostic Linux", max_len);
     } else {

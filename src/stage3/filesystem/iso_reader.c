@@ -41,8 +41,9 @@ static void search_directory_for_boot(boot_source_t *iso_src, uint32_t dir_lba, 
                 out_files->found_kernel = true;
                 log_info("ISO", "  Found Kernel    : LBA %u, Size %u bytes (%u MB)",
                          lba, size, size / 1024 / 1024);
-            } else if (!out_files->found_initrd && nlen >= 6 &&
-                       (prefix_match(name, "INITRAMFS") || prefix_match(name, "INITRD"))) {
+            } else if (!out_files->found_initrd && nlen >= 4 &&
+                       (prefix_match(name, "INITRAMFS") || prefix_match(name, "INITRD") ||
+                        prefix_match(name, "CORE") || prefix_match(name, "ROOTFS"))) {
                 out_files->initrd_lba = lba;
                 out_files->initrd_size = size;
                 out_files->found_initrd = true;
