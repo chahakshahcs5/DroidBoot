@@ -627,9 +627,17 @@ int menu_select_persistence_profile(os_entry_t *entry, adb_session_t *adb) {
 
             char prof_title[80];
             if (iso_stem[0]) {
-                snprintf(prof_title, sizeof(prof_title), "[%s] %s (%u MB)", iso_stem, label, mb);
+                if (collision) {
+                    snprintf(prof_title, sizeof(prof_title), "[%s] %s_%s (%u MB)", iso_stem, label, ts, mb);
+                } else {
+                    snprintf(prof_title, sizeof(prof_title), "[%s] %s (%u MB)", iso_stem, label, mb);
+                }
             } else {
-                snprintf(prof_title, sizeof(prof_title), "%s (%u MB)", label, mb);
+                if (collision) {
+                    snprintf(prof_title, sizeof(prof_title), "%s_%s (%u MB)", label, ts, mb);
+                } else {
+                    snprintf(prof_title, sizeof(prof_title), "%s (%u MB)", label, mb);
+                }
             }
 
             // Create sparse file on phone via ADB if active
