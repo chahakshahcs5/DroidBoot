@@ -25,24 +25,25 @@ typedef struct xhci_controller {
     uint32_t  max_scratchpad_bufs;
 
     // Device Context Base Address Array (DCBAA)
-    uint64_t *dcbaa;
+    volatile uint64_t *dcbaa;
 
     // Command Ring
-    xhci_trb_t *cmd_ring;
-    uint32_t   cmd_enqueue_idx;
-    uint8_t    cmd_cycle_state;
+    volatile xhci_trb_t *cmd_ring;
+    uint32_t            cmd_enqueue_idx;
+    uint8_t             cmd_cycle_state;
 
     // Event Ring & ERST
-    xhci_trb_t        *event_ring;
-    uint32_t          event_dequeue_idx;
-    uint8_t           event_cycle_state;
-    xhci_erst_entry_t *erst;
+    volatile xhci_trb_t *event_ring;
+    uint32_t            event_dequeue_idx;
+    uint8_t             event_cycle_state;
+    xhci_erst_entry_t   *erst;
 } xhci_controller_t;
 
 int  xhci_init(pci_device_t *pci_dev, xhci_controller_t *ctrl);
 void xhci_poll_ports(xhci_controller_t *ctrl);
 int  xhci_reset_port(xhci_controller_t *ctrl, uint8_t port_id);
 int  xhci_send_command(xhci_controller_t *ctrl, xhci_trb_t *cmd, xhci_trb_t *event_out);
+void xhci_abort_command_ring(xhci_controller_t *ctrl);
 int  xhci_enable_slot(xhci_controller_t *ctrl, uint8_t *slot_id_out);
 int  xhci_disable_slot(xhci_controller_t *ctrl, uint8_t slot_id);
 void xhci_stop(xhci_controller_t *ctrl);

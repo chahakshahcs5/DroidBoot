@@ -45,31 +45,92 @@ static void extract_quoted_text(const char *src, char *out, uint32_t max_len) {
     out[idx] = '\0';
 }
 
+static bool is_block_device_target(const char *name) {
+    if (!name) return false;
+    if (str_starts_with_nocase(name, "USB-MSC") ||
+        str_starts_with_nocase(name, "sd") ||
+        str_starts_with_nocase(name, "hd") ||
+        str_starts_with_nocase(name, "/dev/")) {
+        return true;
+    }
+    bool has_ext = false;
+    for (int i = 0; name[i]; i++) {
+        if (str_starts_with_nocase(&name[i], ".iso") || str_starts_with_nocase(&name[i], ".img")) {
+            has_ext = true;
+            break;
+        }
+    }
+    return !has_ext;
+}
+
 /* Substitute template variables in kernel command line */
 static void substitute_cmdline_vars(char *cmdline, uint32_t max_len, const char *iso_filename) {
     if (!cmdline || !iso_filename) return;
 
+    bool is_block = is_block_device_target(iso_filename);
     char buf[384];
     uint32_t b_idx = 0;
     const char *p = cmdline;
 
     while (*p && b_idx + 1 < sizeof(buf)) {
+        if (is_block && (str_starts_with_nocase(p, "iso-scan/filename=${iso_path}") ||
+                         str_starts_with_nocase(p, "iso-scan/filename=\"${iso_path}\""))) {
+            p += 29;
+            if (*p == '"') p++;
+            while (*p && is_space(*p)) p++;
+            continue;
+        }
+        if (is_block && (str_starts_with_nocase(p, "findiso=${iso_path}") ||
+                         str_starts_with_nocase(p, "findiso=\"${iso_path}\""))) {
+            p += 19;
+            if (*p == '"') p++;
+            while (*p && is_space(*p)) p++;
+            continue;
+        }
+
         if (str_starts_with_nocase(p, "${iso_path}")) {
             p += 11;
-            if (iso_filename[0] != '/') buf[b_idx++] = '/';
-            for (int i = 0; iso_filename[i] && b_idx + 1 < sizeof(buf); i++) {
-                buf[b_idx++] = iso_filename[i];
+            if (!is_block) {
+                if (iso_filename[0] != '/') buf[b_idx++] = '/';
+                for (int i = 0; iso_filename[i] && b_idx + 1 < sizeof(buf); i++) {
+                    buf[b_idx++] = iso_filename[i];
+                }
             }
         } else if (str_starts_with_nocase(p, "@ISO_NAME@")) {
             p += 10;
-            for (int i = 0; iso_filename[i] && b_idx + 1 < sizeof(buf); i++) {
-                buf[b_idx++] = iso_filename[i];
+            if (!is_block) {
+                for (int i = 0; iso_filename[i] && b_idx + 1 < sizeof(buf); i++) {
+                    buf[b_idx++] = iso_filename[i];
+                }
             }
         } else {
             buf[b_idx++] = *p++;
         }
     }
     buf[b_idx] = '\0';
+
+    if (is_block) {
+        bool has_casper = false;
+        for (int i = 0; buf[i]; i++) {
+            if (str_starts_with_nocase(&buf[i], "casper")) {
+                has_casper = true;
+                break;
+            }
+        }
+        bool has_boot_casper = false;
+        for (int i = 0; buf[i]; i++) {
+            if (str_starts_with_nocase(&buf[i], "boot=casper")) {
+                has_boot_casper = true;
+                break;
+            }
+        }
+        if (has_casper && !has_boot_casper && b_idx + 13 < sizeof(buf)) {
+            char temp[384];
+            copy_string(temp, buf, sizeof(temp));
+            snprintf(buf, sizeof(buf), "boot=casper %s", temp);
+        }
+    }
+
     copy_string(cmdline, buf, max_len);
 }
 
@@ -231,15 +292,24 @@ int boot_cfg_parse(const char *cfg_data, uint32_t len, const char *iso_filename,
 int boot_cfg_find_and_parse(boot_source_t *iso_src, const char *iso_filename, parsed_boot_config_t *out_cfg) {
     if (!iso_src || !out_cfg) return -1;
 
-    const char *candidate_configs[] = {
-        "/boot/grub/loopback.cfg",
-        "/boot/grub/grub.cfg",
-        "/EFI/BOOT/grub.cfg",
-        "/isolinux/isolinux.cfg",
-        "/syslinux/syslinux.cfg",
-        "/isolinux.cfg",
-        "/boot/syslinux/syslinux.cfg"
-    };
+    const char *candidate_configs[7];
+    if (is_block_device_target(iso_filename)) {
+        candidate_configs[0] = "/boot/grub/grub.cfg";
+        candidate_configs[1] = "/EFI/BOOT/grub.cfg";
+        candidate_configs[2] = "/boot/grub/loopback.cfg";
+        candidate_configs[3] = "/isolinux/isolinux.cfg";
+        candidate_configs[4] = "/syslinux/syslinux.cfg";
+        candidate_configs[5] = "/isolinux.cfg";
+        candidate_configs[6] = "/boot/syslinux/syslinux.cfg";
+    } else {
+        candidate_configs[0] = "/boot/grub/loopback.cfg";
+        candidate_configs[1] = "/boot/grub/grub.cfg";
+        candidate_configs[2] = "/EFI/BOOT/grub.cfg";
+        candidate_configs[3] = "/isolinux/isolinux.cfg";
+        candidate_configs[4] = "/syslinux/syslinux.cfg";
+        candidate_configs[5] = "/isolinux.cfg";
+        candidate_configs[6] = "/boot/syslinux/syslinux.cfg";
+    }
 
     for (int i = 0; i < 7; i++) {
         uint32_t cfg_lba = 0, cfg_size = 0;

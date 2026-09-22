@@ -8,6 +8,11 @@ static inline int to_lower(int c) {
     return c;
 }
 
+static void k_memset(void *dst, int val, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    for (size_t i = 0; i < n; i++) d[i] = (uint8_t)val;
+}
+
 static bool str_eq_nocase_len(const char *a, const char *b, uint32_t b_len) {
     if (!a || !b) return false;
     uint32_t i = 0;
@@ -209,7 +214,8 @@ int iso_find_boot_files(boot_source_t *iso_src, iso_boot_files_t *out_files) {
     out_files->cmdline[0] = '\0';
 
     // Step 1: Attempt to dynamically discover and parse bootloader config from ISO
-    parsed_boot_config_t cfg;
+    static parsed_boot_config_t cfg;
+    k_memset(&cfg, 0, sizeof(cfg));
     if (boot_cfg_find_and_parse(iso_src, iso_src->name, &cfg) == 0 && cfg.count > 0) {
         parsed_boot_entry_t *entry = &cfg.entries[cfg.default_index];
         log_info("ISO", "Applying boot configuration from '%s': '%s'", cfg.config_source, entry->title);

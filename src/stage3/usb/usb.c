@@ -50,7 +50,7 @@ void usb_abort_control_endpoint(usb_device_t *dev) {
 
     // 2. Drain any pending transfer events for this slot/EP0 from the event ring
     for (int i = 0; i < XHCI_EVENT_RING_TRBS; i++) {
-        xhci_trb_t *ev = &dev->ctrl->event_ring[dev->ctrl->event_dequeue_idx];
+        volatile xhci_trb_t *ev = &dev->ctrl->event_ring[dev->ctrl->event_dequeue_idx];
         if ((ev->control & 1U) == dev->ctrl->event_cycle_state) {
             uint32_t type = (ev->control >> TRB_TYPE_SHIFT) & 0x3F;
             if (type == TRB_TRANSFER_EVENT) {
@@ -144,7 +144,7 @@ int usb_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *dat
     // Poll Event Ring for Transfer Event (up to 200ms: 4000 * 50us)
     int timeout = 4000;
     while (--timeout > 0) {
-        xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
+        volatile xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
         uint32_t cycle = evt->control & 1U;
 
         if (cycle == ctrl->event_cycle_state) {
@@ -212,6 +212,9 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
 
     portsc = *(volatile uint32_t *)port_reg;
     uint8_t speed = (uint8_t)((portsc & XHCI_PORT_SPEED_MASK) >> XHCI_PORT_SPEED_SHIFT);
+    if (speed < 3) {
+        mdelay(20);
+    }
     out_dev->ctrl = ctrl;
     out_dev->port_num = port_num;
     out_dev->speed = speed;
@@ -293,6 +296,8 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
     }
     if (addr_res != 0) {
         log_error("USB", "Address Device command failed (code %d)!", addr_res);
+        xhci_disable_slot(ctrl, slot_id);
+        ctrl->dcbaa[slot_id] = 0;
         return -4;
     }
     log_info("USB", "Device on Port %u Addressed Successfully (Slot %u)!", port_num, slot_id);
@@ -312,6 +317,8 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
         int res8 = usb_control_transfer(out_dev, &req_dev, &out_dev->dev_desc, 8);
         if (res8 != 0) {
             log_error("USB", "Failed initial 8-byte Device Descriptor on Port %u (error %d)!", port_num, res8);
+            xhci_disable_slot(ctrl, slot_id);
+            ctrl->dcbaa[slot_id] = 0;
             return -5;
         }
         uint16_t dev_ep0_max = out_dev->dev_desc.bMaxPacketSize0;
@@ -333,6 +340,8 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
     int get_desc_res = usb_control_transfer(out_dev, &req_dev, &out_dev->dev_desc, sizeof(usb_device_desc_t));
     if (get_desc_res != 0) {
         log_error("USB", "Failed to retrieve Device Descriptor (error %d)!", get_desc_res);
+        xhci_disable_slot(ctrl, slot_id);
+        ctrl->dcbaa[slot_id] = 0;
         return -5;
     }
 
@@ -383,20 +392,24 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
     req_cfg.wIndex = 0;
     req_cfg.wLength = 9;
 
-    usb_config_desc_t cfg_hdr;
-    int cfg_res = usb_control_transfer(out_dev, &req_cfg, &cfg_hdr, 9);
+    static usb_config_desc_t g_cfg_hdr __attribute__((aligned(64)));
+    int cfg_res = usb_control_transfer(out_dev, &req_cfg, &g_cfg_hdr, 9);
     if (cfg_res != 0) {
         log_error("USB", "Failed to retrieve Configuration Header (error %d)!", cfg_res);
+        xhci_disable_slot(ctrl, slot_id);
+        ctrl->dcbaa[slot_id] = 0;
         return -6;
     }
 
-    uint16_t total_len = cfg_hdr.wTotalLength;
+    uint16_t total_len = g_cfg_hdr.wTotalLength;
     if (total_len > sizeof(out_dev->config_buf)) total_len = sizeof(out_dev->config_buf);
     req_cfg.wLength = total_len;
 
     cfg_res = usb_control_transfer(out_dev, &req_cfg, out_dev->config_buf, total_len);
     if (cfg_res != 0) {
         log_error("USB", "Failed to retrieve full Configuration Descriptor (error %d)!", cfg_res);
+        xhci_disable_slot(ctrl, slot_id);
+        ctrl->dcbaa[slot_id] = 0;
         return -7;
     }
     out_dev->config_len = total_len;
@@ -907,7 +920,7 @@ int usb_abort_bulk_endpoint(usb_device_t *dev, uint8_t ep_addr) {
 
     // 2. Drain any pending transfer events for this device/endpoint from the event ring
     for (int i = 0; i < XHCI_EVENT_RING_TRBS; i++) {
-        xhci_trb_t *ev = &dev->ctrl->event_ring[dev->ctrl->event_dequeue_idx];
+        volatile xhci_trb_t *ev = &dev->ctrl->event_ring[dev->ctrl->event_dequeue_idx];
         if ((ev->control & 1U) == dev->ctrl->event_cycle_state) {
             uint32_t type = (ev->control >> TRB_TYPE_SHIFT) & 0x3F;
             if (type == TRB_TRANSFER_EVENT) {
@@ -1032,7 +1045,7 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
     // Poll Event Ring for Transfer Event
     int timeout = 100000;
     while (--timeout > 0) {
-        xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
+        volatile xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
         uint32_t cycle = evt->control & 1U;
 
         if (cycle == ctrl->event_cycle_state) {
@@ -1146,7 +1159,7 @@ int usb_bulk_transfer_wait(usb_device_t *dev, uint8_t ep_addr, void *data, uint3
 
         // 100 slices of 10,000 io_waits = ~1 second total per second iteration
         for (int slice = 0; slice < 100; slice++) {
-            xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
+            volatile xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
             uint32_t cycle = evt->control & 1U;
 
             if (cycle == ctrl->event_cycle_state) {
@@ -1294,6 +1307,8 @@ static void usb_local_memset(void *dst, uint8_t val, size_t n) {
 }
 
 static usb_msc_callback_fn g_hub_msc_callback = NULL;
+static uint8_t g_hub_desc_buf[64] __attribute__((aligned(64)));
+static uint32_t g_hub_port_st __attribute__((aligned(64)));
 
 void usb_set_hub_msc_callback(usb_msc_callback_fn cb) {
     g_hub_msc_callback = cb;
@@ -1305,9 +1320,9 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
 
     bool found_any_msc = false;
 
-    // 1. Retrieve Hub Descriptor
-    uint8_t hub_desc_buf[16];
-    usb_local_memset(hub_desc_buf, 0, sizeof(hub_desc_buf));
+    // 1. Retrieve Hub Descriptor (using 64-byte aligned DMA buffer)
+    usb_local_memset(g_hub_desc_buf, 0, sizeof(g_hub_desc_buf));
+    uint8_t *hub_desc_buf = g_hub_desc_buf;
 
     usb_setup_packet_t req_hub;
     req_hub.bmRequestType = 0xA0; // Class-specific, Device recipient, IN
@@ -1421,16 +1436,18 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
         req_st.wValue = 0;
         req_st.wIndex = p;
         req_st.wLength = 4;
-        uint32_t port_st = 0;
-        int st_res = usb_control_transfer(hub_dev, &req_st, &port_st, 4);
+        g_hub_port_st = 0;
+        int st_res = usb_control_transfer(hub_dev, &req_st, &g_hub_port_st, 4);
         if (st_res != 0) {
             mdelay(25);
-            st_res = usb_control_transfer(hub_dev, &req_st, &port_st, 4);
+            g_hub_port_st = 0;
+            st_res = usb_control_transfer(hub_dev, &req_st, &g_hub_port_st, 4);
             if (st_res != 0) {
                 continue;
             }
         }
 
+        uint32_t port_st = g_hub_port_st;
         uint16_t status = (uint16_t)(port_st & 0xFFFF);
 
         // Bit 0: PORT_CONNECTION
@@ -1443,34 +1460,8 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
         uint8_t child_speed = 1; // Default Full-Speed
 
         if (hub_dev->speed >= 4) {
-            // SuperSpeed Hub downstream port
+            // SuperSpeed Hub downstream port: always issue Port Reset to transition device into Default State (address 0)
             child_speed = 4; // SuperSpeed (5 Gbps)
-            // If port is not yet enabled/in U0, trigger PORT_RESET
-            if (!(status & (1U << HUB_FEATURE_PORT_ENABLE))) {
-                usb_setup_packet_t req_rst;
-                req_rst.bmRequestType = 0x23;
-                req_rst.bRequest = USB_REQ_SET_FEATURE;
-                req_rst.wValue = HUB_FEATURE_PORT_RESET;
-                req_rst.wIndex = p;
-                req_rst.wLength = 0;
-                usb_control_transfer(hub_dev, &req_rst, NULL, 0);
-
-                for (int w = 0; w < 20; w++) {
-                    mdelay(5);
-                    usb_control_transfer(hub_dev, &req_st, &port_st, 4);
-                    if (port_st & (1U << HUB_FEATURE_PORT_ENABLE)) break;
-                }
-
-                usb_setup_packet_t req_clr;
-                req_clr.bmRequestType = 0x23;
-                req_clr.bRequest = USB_REQ_CLEAR_FEATURE;
-                req_clr.wValue = HUB_FEATURE_C_PORT_RESET;
-                req_clr.wIndex = p;
-                req_clr.wLength = 0;
-                usb_control_transfer(hub_dev, &req_clr, NULL, 0);
-            }
-        } else {
-            // USB 2.0 Hub downstream port: trigger Port Reset to enable & determine speed
             usb_setup_packet_t req_rst;
             req_rst.bmRequestType = 0x23;
             req_rst.bRequest = USB_REQ_SET_FEATURE;
@@ -1480,11 +1471,11 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
             usb_control_transfer(hub_dev, &req_rst, NULL, 0);
 
             // Wait for port reset to complete (PORT_RESET bit 4 clears)
-            uint32_t st2 = 0;
-            for (int w = 0; w < 20; w++) {
-                mdelay(10);
-                usb_control_transfer(hub_dev, &req_st, &st2, 4);
-                if (!(st2 & (1U << 4))) break;
+            for (int w = 0; w < 30; w++) {
+                mdelay(5);
+                g_hub_port_st = 0;
+                usb_control_transfer(hub_dev, &req_st, &g_hub_port_st, 4);
+                if (!(g_hub_port_st & (1U << 4)) && (g_hub_port_st & (1U << HUB_FEATURE_PORT_ENABLE))) break;
             }
 
             // Acknowledge reset change
@@ -1496,7 +1487,40 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
             req_clr.wLength = 0;
             usb_control_transfer(hub_dev, &req_clr, NULL, 0);
 
+            // Mandatory USB 3.0 reset recovery time (t_RSTRCY >= 20ms) before issuing commands to EP0
+            mdelay(25);
+        } else {
+            // USB 2.0 Hub downstream port: trigger Port Reset to enable & determine speed
+            usb_setup_packet_t req_rst;
+            req_rst.bmRequestType = 0x23;
+            req_rst.bRequest = USB_REQ_SET_FEATURE;
+            req_rst.wValue = HUB_FEATURE_PORT_RESET;
+            req_rst.wIndex = p;
+            req_rst.wLength = 0;
+            usb_control_transfer(hub_dev, &req_rst, NULL, 0);
+
+            // Wait for port reset to complete (PORT_RESET bit 4 clears)
+            for (int w = 0; w < 20; w++) {
+                mdelay(10);
+                g_hub_port_st = 0;
+                usb_control_transfer(hub_dev, &req_st, &g_hub_port_st, 4);
+                if (!(g_hub_port_st & (1U << 4))) break;
+            }
+
+            // Acknowledge reset change
+            usb_setup_packet_t req_clr;
+            req_clr.bmRequestType = 0x23;
+            req_clr.bRequest = USB_REQ_CLEAR_FEATURE;
+            req_clr.wValue = HUB_FEATURE_C_PORT_RESET;
+            req_clr.wIndex = p;
+            req_clr.wLength = 0;
+            usb_control_transfer(hub_dev, &req_clr, NULL, 0);
+
+            // USB 2.0 reset recovery time
+            mdelay(20);
+
             // Query speed from status
+            uint32_t st2 = g_hub_port_st;
             uint16_t status2 = (uint16_t)(st2 & 0xFFFF);
             if (status2 & (1U << 10)) {
                 child_speed = 3; // High-Speed (480 Mbps)
@@ -1577,6 +1601,10 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
 
         xhci_trb_t c_addr_evt;
         int c_addr_res = xhci_send_command(ctrl, &c_addr_cmd, &c_addr_evt);
+        if (c_addr_res != 0) {
+            mdelay(25);
+            c_addr_res = xhci_send_command(ctrl, &c_addr_cmd, &c_addr_evt);
+        }
         if (c_addr_res != 0) {
             log_error("HUB", "Address Device failed for device on Hub Port %u (code %d)!", p, c_addr_res);
             xhci_disable_slot(ctrl, child_slot);
@@ -1664,11 +1692,12 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
         c_req_cfg.wIndex = 0;
         c_req_cfg.wLength = 9;
 
-        usb_config_desc_t c_cfg_hdr;
+        static usb_config_desc_t c_cfg_hdr __attribute__((aligned(64)));
         int c_cfg_res = usb_control_transfer(&child_dev, &c_req_cfg, &c_cfg_hdr, 9);
         if (c_cfg_res != 0) {
             log_error("HUB", "Failed to retrieve Config Header on Hub Port %u (error %d)", p, c_cfg_res);
             xhci_disable_slot(ctrl, child_slot);
+            ctrl->dcbaa[child_slot] = 0;
             mdelay(20);
             continue;
         }
@@ -1680,6 +1709,7 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
         if (c_cfg_res != 0) {
             log_error("HUB", "Failed to retrieve Config Descriptor on Hub Port %u (error %d)", p, c_cfg_res);
             xhci_disable_slot(ctrl, child_slot);
+            ctrl->dcbaa[child_slot] = 0;
             mdelay(20);
             continue;
         }

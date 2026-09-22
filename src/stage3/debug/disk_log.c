@@ -445,28 +445,30 @@ void disk_log_enable_bios_fallback(void) {
     if (log_state == LOG_STATE_USB_MSC) return; // USB MSC is already active and preferred
 
     static uint8_t test_buf[512];
-    int res = bios_disk_read(disk_boot_drive, 0, 1, test_buf);
-    if (res == 0) {
+    if (bootlog_fat_resolved && bios_disk_read(disk_boot_drive, 0, 1, test_buf) == 0) {
         log_state = LOG_STATE_BIOS;
         log_info("LOG", "BIOS disk fallback active on Drive 0x%02X.", disk_boot_drive);
         disk_log_flush();
         return;
     }
 
-    // Try alternate BIOS drives (0x80..0x83)
+    // Try alternate BIOS drives (0x80..0x83) - ONLY adopt if resolve_fat_targets succeeds!
     uint8_t candidates[4] = {0x80, 0x81, 0x82, 0x83};
     for (int i = 0; i < 4; i++) {
-        if (candidates[i] != disk_boot_drive && bios_disk_read(candidates[i], 0, 1, test_buf) == 0) {
-            disk_boot_drive = candidates[i];
-            log_state = LOG_STATE_BIOS;
-            log_info("LOG", "BIOS disk fallback active on alternate Drive 0x%02X.", disk_boot_drive);
-            disk_log_flush();
-            return;
+        if (candidates[i] != disk_boot_drive) {
+            if (resolve_fat_targets(false, candidates[i])) {
+                disk_boot_drive = candidates[i];
+                log_state = LOG_STATE_BIOS;
+                log_info("LOG", "BIOS disk fallback active on alternate Drive 0x%02X.", disk_boot_drive);
+                disk_log_flush();
+                return;
+            }
         }
     }
 
-    log_info("LOG", "BIOS disk fallback unavailable after xHCI takeover (Drive 0x%02X, code %d). Log buffered in RAM.",
-             disk_boot_drive, res);
+    log_state = LOG_STATE_BUFFERED;
+    log_info("LOG", "BIOS disk fallback unavailable after xHCI takeover (Drive 0x%02X). Log buffered in RAM.",
+             disk_boot_drive);
 }
 
 void disk_log_register_usb_msc(void *usb_dev) {
@@ -546,11 +548,14 @@ void disk_log_flush(void) {
     uint8_t drive = disk_boot_drive;
 
     // A. Write Raw Backup Sectors (Header + Text at LBA 1024)
-    int rerr = block_io_write(use_msc, drive, RAW_LOG_LBA, 1, hdr_buf);
-    if (rerr == 0 && text_sectors > 0) {
-        block_io_write(use_msc, drive, RAW_LOG_LBA + 1, text_sectors, disk_linear_ptr);
-    } else if (rerr != 0) {
-        any_error = true;
+    // ONLY write raw sectors if the drive has our verified BootManager FAT filesystem
+    if (bootlog_fat_resolved) {
+        int rerr = block_io_write(use_msc, drive, RAW_LOG_LBA, 1, hdr_buf);
+        if (rerr == 0 && text_sectors > 0) {
+            block_io_write(use_msc, drive, RAW_LOG_LBA + 1, text_sectors, disk_linear_ptr);
+        } else if (rerr != 0) {
+            any_error = true;
+        }
     }
 
     // B. Write Primary FAT32 BOOTLOG.TXT (Always holds the latest log)

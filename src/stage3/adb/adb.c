@@ -891,7 +891,15 @@ int adb_create_sparse_overlay(adb_session_t *session, const char *overlay_path, 
     }
 
     if (res == 0 && adb_str_contains(out, "OK_CREATED")) {
-        log_info("ADB", "Sparse %u GB persistence overlay created and verified on phone storage!", size_gb);
+        const char *fs_lbl = (adb_str_contains(overlay_path, "ubuntu") || adb_str_contains(overlay_path, "casper")) ?
+                             "casper-rw" : "PERSISTENCE";
+        char fmt_cmd[512];
+        snprintf(fmt_cmd, sizeof(fmt_cmd),
+                 "su -c 'mke2fs -t ext4 -F -L %s %s 2>/dev/null || mkfs.ext4 -F -L %s %s 2>/dev/null'",
+                 fs_lbl, overlay_path, fs_lbl, overlay_path);
+        adb_execute_shell_timeout(session, fmt_cmd, NULL, 0, 10);
+
+        log_info("ADB", "Sparse %u GB persistence overlay created (ext4 label: '%s')!", size_gb, fs_lbl);
         return 0;
     }
 

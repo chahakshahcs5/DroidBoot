@@ -142,8 +142,10 @@ pmode_entry:
     mov gs, ax
     mov ss, ax
 
-    ; Set up 32-bit stack (0x0009FFF0, grows downwards to 0x00080000)
-    mov esp, 0x0009FFF0
+    ; Set up 32-bit stack in safe low memory (0x0007FFF0, grows downwards towards 0x00020000)
+    ; completely isolated from low-memory BIOS/boot structures (0x00000000 - 0x0001FFFF)
+    ; and completely below Linux kernel load area (0x00100000 - 0x04000000)
+    mov esp, 0x0007FFF0
 
     ; In Protected Mode, relocate Stage 3 from low memory (0x00010000)
     ; to high memory load address (0x00100000) using 32-bit flat addressing

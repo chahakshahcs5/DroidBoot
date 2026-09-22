@@ -12,6 +12,8 @@ static inline void xhci_write32(uintptr_t addr, uint32_t val) {
 }
 
 static inline void xhci_write64(uintptr_t addr, uint64_t val) {
+    // Write Low DWORD first, High DWORD second per xHCI Spec 5.1
+    // (Hardware latches 64-bit register when High DWORD is written)
     xhci_write32(addr, (uint32_t)(val & 0xFFFFFFFF));
     xhci_write32(addr + 4, (uint32_t)(val >> 32));
 }
@@ -36,6 +38,12 @@ static inline void xhci_write64(uintptr_t addr, uint64_t val) {
 #define XHCI_OP_DCBAAP          0x30
 #define XHCI_OP_CONFIG          0x38
 #define XHCI_OP_PORTS_BASE      0x400
+
+// CRCR Register Bits
+#define XHCI_CRCR_RCS           (1U << 0)   // Ring Cycle State
+#define XHCI_CRCR_CS            (1U << 1)   // Command Stop
+#define XHCI_CRCR_CA            (1U << 2)   // Command Abort
+#define XHCI_CRCR_CRR           (1U << 3)   // Command Ring Running
 
 // USBCMD Register Bits
 #define XHCI_CMD_RS             (1U << 0)   // Run/Stop

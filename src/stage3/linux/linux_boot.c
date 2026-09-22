@@ -5,7 +5,9 @@
 #include "../debug/vga.h"
 #include "../debug/disk_log.h"
 
-// 60-byte self-contained relocation trampoline for 32-bit Linux handoff
+// 66-byte self-contained relocation trampoline for 32-bit Linux handoff
+// Relocates kernel image to 0x00100000, establishes safe low-memory stack (0x0007FFF0),
+// and transfers control directly via jmp *%eax without writing to the stack or clobbering RAM.
 static const uint8_t trampoline_template[] = {
     0xFA,                               // cli
     0xFC,                               // cld
@@ -24,14 +26,14 @@ static const uint8_t trampoline_template[] = {
     0x8E, 0xE8,                         // mov gs, eax
     0x8E, 0xD0,                         // mov ss, eax
     0x89, 0xD6,                         // mov esi, edx       (ESI = params)
-    0x53,                               // push ebx           (push entry point)
-    0x31, 0xC0,                         // xor eax, eax       (EAX = 0)
+    0xBC, 0xF0, 0xFF, 0x07, 0x00,       // mov esp, 0x0007FFF0(safe low-memory stack)
+    0x89, 0xD8,                         // mov eax, ebx       (EAX = entry point)
     0x31, 0xDB,                         // xor ebx, ebx       (EBX = 0)
     0x31, 0xC9,                         // xor ecx, ecx       (ECX = 0)
     0x31, 0xD2,                         // xor edx, edx       (EDX = 0)
     0x31, 0xED,                         // xor ebp, ebp       (EBP = 0)
     0x31, 0xFF,                         // xor edi, edi       (EDI = 0)
-    0xC3                                // ret                (jump to entry point)
+    0xFF, 0xE0                          // jmp *%eax          (direct jump to kernel entry, NO STACK WRITES!)
 };
 
 static uint32_t kstrlen(const char *s) {

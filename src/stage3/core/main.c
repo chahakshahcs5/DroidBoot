@@ -152,6 +152,35 @@ static bool str_contains_nocase(const char *haystack, const char *needle) {
     return false;
 }
 
+static bool str_starts_with_nocase(const char *str, const char *prefix) {
+    if (!str || !prefix) return false;
+    while (*prefix) {
+        if (to_lower(*str) != to_lower(*prefix)) return false;
+        str++;
+        prefix++;
+    }
+    return true;
+}
+
+static void strip_cmdline_arg(char *cmdline, const char *arg_prefix) {
+    if (!cmdline || !arg_prefix) return;
+    char *pos = NULL;
+    size_t prefix_len = k_strlen(arg_prefix);
+    size_t clen = k_strlen(cmdline);
+    for (size_t i = 0; i + prefix_len <= clen; i++) {
+        if (str_starts_with_nocase(&cmdline[i], arg_prefix)) {
+            pos = &cmdline[i];
+            break;
+        }
+    }
+    if (!pos) return;
+    char *end = pos + prefix_len;
+    while (*end && *end != ' ' && *end != '\t') end++;
+    while (*end && (*end == ' ' || *end == '\t')) end++;
+    while (*end) *pos++ = *end++;
+    *pos = '\0';
+}
+
 static bool is_boot_drive_msc(usb_device_t *dev) {
     if (!dev || !dev->has_msc || dev->is_disconnected) return false;
     static uint8_t sec[512];
@@ -346,6 +375,18 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
 }
 
 static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const persistence_profile_t *prof) {
+    if (!dev) return;
+
+    // Check if device was spuriously marked disconnected by an ADB timeout while physically present
+    if (dev->is_disconnected && dev->port_num > 0 && dev->ctrl) {
+        uintptr_t port_reg = dev->ctrl->op_regs + XHCI_OP_PORTS_BASE + (dev->port_num - 1) * 0x10;
+        uint32_t portsc = *(volatile uint32_t *)port_reg;
+        if (portsc & XHCI_PORT_CCS) {
+            log_info("BOOT", "Device physically connected on Port %u. Resetting disconnected flag.", dev->port_num);
+            dev->is_disconnected = false;
+        }
+    }
+
     log_info("BOOT", "Attempting boot from USB Block Storage on Port %u...", dev->port_num);
     boot_source_t *msc_src = boot_source_msc_create(dev);
     if (!msc_src) {
@@ -415,9 +456,18 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
     char cmdline[512];
     if (iso_files.cmdline[0] != '\0') {
         snprintf(cmdline, sizeof(cmdline), "%s", iso_files.cmdline);
+        if (iso_files.is_casper) {
+            strip_cmdline_arg(cmdline, "iso-scan/filename=");
+            strip_cmdline_arg(cmdline, "findiso=");
+            if (!str_contains_nocase(cmdline, "boot=casper")) {
+                char temp[512];
+                k_memcpy(temp, cmdline, sizeof(temp));
+                snprintf(cmdline, sizeof(cmdline), "boot=casper %s", temp);
+            }
+        }
         if (prof && !prof->is_clean_session) {
             size_t clen = k_strlen(cmdline);
-            if (clen + 64 < sizeof(cmdline)) {
+            if (clen + 80 < sizeof(cmdline)) {
                 if (iso_files.is_casper) {
                     snprintf(cmdline + clen, sizeof(cmdline) - clen,
                              " persistent persistent-path=/BootManager/persistence/");
@@ -425,6 +475,9 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
                            str_ends_with_nocase(prof->filename, ".tgz")) {
                     snprintf(cmdline + clen, sizeof(cmdline) - clen,
                              " apkovl=LABEL=BOOTLOADER:%s", prof->filename);
+                } else if (str_contains_nocase(cmdline, "alpine") || str_contains_nocase(iso_files.title, "alpine")) {
+                    snprintf(cmdline + clen, sizeof(cmdline) - clen,
+                             " alpine_dev=LABEL=PERSISTENCE apkovl=LABEL=PERSISTENCE");
                 } else {
                     snprintf(cmdline + clen, sizeof(cmdline) - clen,
                              " persistent persistent-path=/BootManager/persistence/");
@@ -449,7 +502,7 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
                          prof->filename);
             } else {
                 snprintf(cmdline, sizeof(cmdline),
-                         "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 persistent persistent-path=/BootManager/persistence/ quiet");
+                         "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 alpine_dev=LABEL=PERSISTENCE apkovl=LABEL=PERSISTENCE persistent persistent-path=/BootManager/persistence/ quiet");
             }
         } else {
             snprintf(cmdline, sizeof(cmdline),
@@ -912,6 +965,9 @@ void c_main(boot_info_t *boot_info) {
             log_info("STAGE3", "Phase 3 xHCI Controller Initialization Successfully Verified!");
             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
+            // Register downstream Hub Mass Storage callback
+            usb_set_hub_msc_callback(handle_msc_device);
+
             // Initial scan of connected USB devices
             for (uint8_t p = 1; p <= xhci_ctrl.max_ports && p < 32; p++) {
                 uintptr_t port_reg = xhci_ctrl.op_regs + XHCI_OP_PORTS_BASE + (p - 1) * 0x10;
@@ -1222,8 +1278,7 @@ void c_main(boot_info_t *boot_info) {
                     if (external_usb_dev.has_adb) {
                         log_info("BOOT", "Composite phone re-enumerated with ADB! Restoring ADB session...");
                         if (adb_init_session(&external_usb_dev, &active_adb_session) == 0) {
-                            log_info("BOOT", "ADB session restored! Syncing post-switch boot logs to phone...");
-                            phone_save_boot_log(&active_adb_session, NULL);
+                            log_info("BOOT", "ADB session active. Ready for OS handoff.");
                         }
                     }
 
@@ -1359,8 +1414,7 @@ void c_main(boot_info_t *boot_info) {
                                     if (external_usb_dev.has_adb) {
                                         log_info("BOOT", "Composite phone re-enumerated with ADB! Restoring ADB session...");
                                         if (adb_init_session(&external_usb_dev, &active_adb_session) == 0) {
-                                            log_info("BOOT", "ADB session restored! Syncing post-switch boot logs to phone...");
-                                            phone_save_boot_log(&active_adb_session, NULL);
+                                            log_info("BOOT", "ADB session active. Ready for OS handoff.");
                                         }
                                     }
 

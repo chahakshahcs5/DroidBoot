@@ -388,6 +388,58 @@ int xhci_reset_port(xhci_controller_t *ctrl, uint8_t port_id) {
     return enabled ? 0 : -2;
 }
 
+void xhci_abort_command_ring(xhci_controller_t *ctrl) {
+    if (!ctrl) return;
+
+    log_warn("XHCI", "Aborting stuck Command Ring via CRCR.CA...");
+
+    // 1. Trigger Command Abort (CA bit 2 in CRCR)
+    xhci_write32(ctrl->op_regs + XHCI_OP_CRCR, XHCI_CRCR_CA);
+
+    // 2. Wait up to 200ms for Command Ring Running (CRR, bit 3) to clear
+    int timeout = 2000;
+    while ((xhci_read32(ctrl->op_regs + XHCI_OP_CRCR) & XHCI_CRCR_CRR) && --timeout > 0) {
+        udelay(100);
+    }
+    if (timeout == 0) {
+        log_error("XHCI", "Command Ring Abort timed out! Controller did not stop CRR.");
+    }
+
+    // 3. Drain and acknowledge any events currently posted to Event Ring
+    for (int i = 0; i < XHCI_EVENT_RING_TRBS; i++) {
+        volatile xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
+        uint32_t cycle = evt->control & 1U;
+        if (cycle != ctrl->event_cycle_state) break;
+
+        ctrl->event_dequeue_idx++;
+        if (ctrl->event_dequeue_idx == XHCI_EVENT_RING_TRBS) {
+            ctrl->event_dequeue_idx = 0;
+            ctrl->event_cycle_state ^= 1;
+        }
+        uintptr_t intr0 = ctrl->rt_regs + 0x20;
+        uintptr_t erdp = (uintptr_t)&ctrl->event_ring[ctrl->event_dequeue_idx];
+        xhci_write64(intr0 + XHCI_INTR_ERDP, erdp | XHCI_ERDP_EHB);
+    }
+
+    // 4. Reset Command Ring cleanly
+    for (uint32_t i = 0; i < XHCI_CMD_RING_TRBS - 1; i++) {
+        ctrl->cmd_ring[i].parameter = 0;
+        ctrl->cmd_ring[i].status = 0;
+        ctrl->cmd_ring[i].control = 0;
+    }
+    uint32_t last_trb = XHCI_CMD_RING_TRBS - 1;
+    ctrl->cmd_ring[last_trb].parameter = (uintptr_t)ctrl->cmd_ring;
+    ctrl->cmd_ring[last_trb].control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE_CYCLE;
+    ctrl->cmd_enqueue_idx = 0;
+    ctrl->cmd_cycle_state = 1;
+
+    // 5. Reprogram CRCR with fresh Command Ring base and RCS = 1
+    __asm__ volatile ("mfence" ::: "memory");
+    xhci_write64(ctrl->op_regs + XHCI_OP_CRCR, (uintptr_t)ctrl->cmd_ring | XHCI_CRCR_RCS);
+
+    log_info("XHCI", "Command Ring cleanly aborted and re-initialized.");
+}
+
 int xhci_send_command(xhci_controller_t *ctrl, xhci_trb_t *cmd, xhci_trb_t *event_out) {
     if (!ctrl || !cmd) return -1;
 
@@ -395,7 +447,7 @@ int xhci_send_command(xhci_controller_t *ctrl, xhci_trb_t *cmd, xhci_trb_t *even
 
     // Enqueue command TRB onto Command Ring
     uint32_t idx = ctrl->cmd_enqueue_idx;
-    xhci_trb_t *trb = &ctrl->cmd_ring[idx];
+    volatile xhci_trb_t *trb = &ctrl->cmd_ring[idx];
 
     trb->parameter = cmd->parameter;
     trb->status = cmd->status;
@@ -413,13 +465,16 @@ int xhci_send_command(xhci_controller_t *ctrl, xhci_trb_t *cmd, xhci_trb_t *even
         ctrl->cmd_cycle_state ^= 1;
     }
 
+    // Ensure TRB writes are flushed to RAM before doorbell
+    __asm__ volatile ("mfence" ::: "memory");
+
     // Ring Host Controller Doorbell (Target = 0 for Host Controller Command)
     xhci_write32(ctrl->db_regs, 0);
 
-    // Poll Event Ring for Command Completion Event (up to 1000ms)
-    int timeout = 10000;
+    // Poll Event Ring for Command Completion Event (up to 2000ms: 20000 * 100us)
+    int timeout = 20000;
     while (--timeout > 0) {
-        xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
+        volatile xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
         uint32_t cycle = evt->control & 1U;
 
         if (cycle == ctrl->event_cycle_state) {
@@ -427,7 +482,9 @@ int xhci_send_command(xhci_controller_t *ctrl, xhci_trb_t *cmd, xhci_trb_t *even
             if (type == TRB_COMMAND_COMPL) {
                 if (evt->parameter == trb_phys) {
                     if (event_out) {
-                        *event_out = *evt;
+                        event_out->parameter = evt->parameter;
+                        event_out->status = evt->status;
+                        event_out->control = evt->control;
                     }
                     // Advance event dequeue index
                     ctrl->event_dequeue_idx++;
@@ -467,6 +524,7 @@ int xhci_send_command(xhci_controller_t *ctrl, xhci_trb_t *cmd, xhci_trb_t *even
     }
 
     log_error("XHCI", "Command TRB Type %u timed out!", cmd_type);
+    xhci_abort_command_ring(ctrl);
     return -100;
 }
 
