@@ -163,22 +163,92 @@ static bool str_starts_with_nocase(const char *str, const char *prefix) {
 }
 
 static void strip_cmdline_arg(char *cmdline, const char *arg_prefix) {
-    if (!cmdline || !arg_prefix) return;
-    char *pos = NULL;
+    if (!cmdline || !arg_prefix || !*arg_prefix) return;
     size_t prefix_len = k_strlen(arg_prefix);
+    while (1) {
+        char *pos = NULL;
+        size_t clen = k_strlen(cmdline);
+        for (size_t i = 0; i + prefix_len <= clen; i++) {
+            if ((i == 0 || cmdline[i - 1] == ' ' || cmdline[i - 1] == '\t') &&
+                str_starts_with_nocase(&cmdline[i], arg_prefix)) {
+                char after = cmdline[i + prefix_len];
+                if (arg_prefix[prefix_len - 1] == '=' || after == '\0' || after == ' ' || after == '\t' || after == '=') {
+                    pos = &cmdline[i];
+                    break;
+                }
+            }
+        }
+        if (!pos) break;
+        char *end = pos + prefix_len;
+        while (*end && *end != ' ' && *end != '\t') end++;
+        while (*end && (*end == ' ' || *end == '\t')) end++;
+        while (*end) *pos++ = *end++;
+        *pos = '\0';
+    }
+}
+
+static void ensure_cmdline_arg(char *cmdline, size_t max_len, const char *arg) {
+    if (!cmdline || !arg || !*arg || max_len == 0) return;
+    size_t arg_len = k_strlen(arg);
     size_t clen = k_strlen(cmdline);
-    for (size_t i = 0; i + prefix_len <= clen; i++) {
-        if (str_starts_with_nocase(&cmdline[i], arg_prefix)) {
-            pos = &cmdline[i];
-            break;
+
+    for (size_t i = 0; i + arg_len <= clen; i++) {
+        if ((i == 0 || cmdline[i - 1] == ' ' || cmdline[i - 1] == '\t') &&
+            str_starts_with_nocase(&cmdline[i], arg)) {
+            char after = cmdline[i + arg_len];
+            if (after == '\0' || after == ' ' || after == '\t' || after == '=') {
+                return;
+            }
         }
     }
-    if (!pos) return;
-    char *end = pos + prefix_len;
-    while (*end && *end != ' ' && *end != '\t') end++;
-    while (*end && (*end == ' ' || *end == '\t')) end++;
-    while (*end) *pos++ = *end++;
-    *pos = '\0';
+
+    while (clen > 0 && (cmdline[clen - 1] == ' ' || cmdline[clen - 1] == '\t')) {
+        cmdline[--clen] = '\0';
+    }
+
+    if (clen > 0) {
+        if (clen + 1 + arg_len < max_len) {
+            cmdline[clen] = ' ';
+            k_memcpy(&cmdline[clen + 1], arg, arg_len + 1);
+        }
+    } else {
+        if (arg_len < max_len) {
+            k_memcpy(cmdline, arg, arg_len + 1);
+        }
+    }
+}
+
+static void finalize_kernel_cmdline(char *cmdline, size_t max_len, bool is_casper) {
+    if (!cmdline || max_len == 0) return;
+
+#if IS_DEBUG_BUILD
+    (void)is_casper;
+    // Debug Build: Full logging system directly on screen (verbose console, services, initramfs)
+    strip_cmdline_arg(cmdline, "quiet");
+    strip_cmdline_arg(cmdline, "splash");
+    ensure_cmdline_arg(cmdline, max_len, "nosplash");
+    ensure_cmdline_arg(cmdline, max_len, "console=tty1");
+    ensure_cmdline_arg(cmdline, max_len, "debug");
+    ensure_cmdline_arg(cmdline, max_len, "loglevel=7");
+    ensure_cmdline_arg(cmdline, max_len, "systemd.show_status=1");
+#else
+    // Release Build: Direct clean boot (Ubuntu logo via Plymouth without raw text console or non-fatal errors)
+    strip_cmdline_arg(cmdline, "---");
+    strip_cmdline_arg(cmdline, "nosplash");
+    strip_cmdline_arg(cmdline, "debug");
+    strip_cmdline_arg(cmdline, "console=tty1");
+    strip_cmdline_arg(cmdline, "console=tty0");
+    strip_cmdline_arg(cmdline, "loglevel=");
+    ensure_cmdline_arg(cmdline, max_len, "quiet");
+    if (is_casper) {
+        ensure_cmdline_arg(cmdline, max_len, "splash");
+        ensure_cmdline_arg(cmdline, max_len, "loglevel=3");
+        ensure_cmdline_arg(cmdline, max_len, "systemd.show_status=0");
+        ensure_cmdline_arg(cmdline, max_len, "vt.global_cursor_default=0");
+    } else {
+        ensure_cmdline_arg(cmdline, max_len, "loglevel=3");
+    }
+#endif
 }
 
 static bool is_boot_drive_msc(usb_device_t *dev) {
@@ -487,10 +557,10 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
     } else if (iso_files.is_casper) {
         if (prof && prof->is_clean_session) {
             snprintf(cmdline, sizeof(cmdline),
-                     "boot=casper modprobe.blacklist=floppy nosplash console=tty1");
+                     "boot=casper modprobe.blacklist=floppy");
         } else {
             snprintf(cmdline, sizeof(cmdline),
-                     "boot=casper persistent persistent-path=/BootManager/persistence/ modprobe.blacklist=floppy nosplash console=tty1");
+                     "boot=casper persistent persistent-path=/BootManager/persistence/ modprobe.blacklist=floppy");
         }
     } else {
         // Generic Live System / Hard Drive OS Fallback
@@ -498,17 +568,20 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
             if (str_ends_with_nocase(prof->filename, ".apkovl.tar.gz") ||
                 str_ends_with_nocase(prof->filename, ".tgz")) {
                 snprintf(cmdline, sizeof(cmdline),
-                         "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 apkovl=LABEL=BOOTLOADER:%s quiet",
+                         "modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 apkovl=LABEL=BOOTLOADER:%s",
                          prof->filename);
             } else {
                 snprintf(cmdline, sizeof(cmdline),
-                         "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 alpine_dev=LABEL=PERSISTENCE apkovl=LABEL=PERSISTENCE persistent persistent-path=/BootManager/persistence/ quiet");
+                         "modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 alpine_dev=LABEL=PERSISTENCE apkovl=LABEL=PERSISTENCE persistent persistent-path=/BootManager/persistence/");
             }
         } else {
             snprintf(cmdline, sizeof(cmdline),
-                     "console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3 quiet");
+                     "modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage,uas usbdelay=3");
         }
     }
+
+    // Apply Debug vs Release log policy
+    finalize_kernel_cmdline(cmdline, sizeof(cmdline), iso_files.is_casper);
 
     // Keep standard 80x25 VGA text mode for maximum compatibility across distributions
     linux_boot_params_t *params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
@@ -608,11 +681,11 @@ static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_fil
     } else if (iso_files && iso_files->is_casper) {
         if (prof && prof->is_clean_session) {
             snprintf(kernel_cmdline, sizeof(kernel_cmdline),
-                     "boot=casper console=tty0 console=tty1 modprobe.blacklist=floppy phram=iso,0x%08X,0x%08X memdisk=yes quiet",
+                     "boot=casper modprobe.blacklist=floppy phram=iso,0x%08X,0x%08X memdisk=yes",
                      LINUX_RAM_ISO_PHYS, total_iso_bytes);
         } else {
             snprintf(kernel_cmdline, sizeof(kernel_cmdline),
-                     "boot=casper console=tty0 console=tty1 modprobe.blacklist=floppy phram=iso,0x%08X,0x%08X memdisk=yes persistent persistent-path=/BootManager/persistence/ quiet",
+                     "boot=casper modprobe.blacklist=floppy phram=iso,0x%08X,0x%08X memdisk=yes persistent persistent-path=/BootManager/persistence/",
                      LINUX_RAM_ISO_PHYS, total_iso_bytes);
         }
     } else {
@@ -627,27 +700,30 @@ static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_fil
         if (is_alpine) {
             if (prof && prof->is_clean_session) {
                 snprintf(kernel_cmdline, sizeof(kernel_cmdline),
-                         "console=tty0 console=tty1 modprobe.blacklist=floppy noapic modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes debug_init quiet",
+                         "modprobe.blacklist=floppy noapic modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes",
                          LINUX_RAM_ISO_PHYS, total_iso_bytes);
             } else {
                 const char *apkovl_target = (prof && prof->filename[0]) ? prof->filename : "apkovl.tgz";
                 snprintf(kernel_cmdline, sizeof(kernel_cmdline),
-                         "console=tty0 console=tty1 modprobe.blacklist=floppy noapic modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes apkovl=LABEL=BOOTLOADER:%s debug_init quiet",
+                         "modprobe.blacklist=floppy noapic modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes apkovl=LABEL=BOOTLOADER:%s",
                          LINUX_RAM_ISO_PHYS, total_iso_bytes, apkovl_target);
             }
         } else {
             // Universal / generic Live OS fallback
             if (prof && prof->is_clean_session) {
                 snprintf(kernel_cmdline, sizeof(kernel_cmdline),
-                         "console=tty0 console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes quiet",
+                         "modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes",
                          LINUX_RAM_ISO_PHYS, total_iso_bytes);
             } else {
                 snprintf(kernel_cmdline, sizeof(kernel_cmdline),
-                         "console=tty0 console=tty1 modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes persistent persistent-path=/BootManager/persistence/ quiet",
+                         "modprobe.blacklist=floppy modules=loop,squashfs,sd-mod,usb-storage phram=iso,0x%08X,0x%08X memdisk=yes persistent persistent-path=/BootManager/persistence/",
                          LINUX_RAM_ISO_PHYS, total_iso_bytes);
             }
         }
     }
+
+    // Apply Debug vs Release log policy
+    finalize_kernel_cmdline(kernel_cmdline, sizeof(kernel_cmdline), iso_files ? iso_files->is_casper : false);
 
     // Standard 80x25 VGA text mode for maximum compatibility across distributions
     linux_boot_params_t *kernel_params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
