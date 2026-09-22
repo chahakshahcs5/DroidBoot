@@ -50,25 +50,17 @@ static void phone_save_boot_log(adb_session_t *adb, mtp_session_t *mtp) {
     if (s_in_save) return;
     s_in_save = true;
 
-    static uint32_t s_last_synced_bytes = 0;
-    uint32_t cur_bytes = disk_log_get_total_written();
-    if (cur_bytes == s_last_synced_bytes) {
-        s_in_save = false;
-        return;
-    }
-
+    // Instant local SD card flush
     disk_log_flush();
 
-    if (adb && adb->is_connected) {
+    if (adb && adb->is_connected && (!adb->usb_dev || !adb->usb_dev->is_disconnected)) {
         adb_save_log_to_phone(adb);
-        s_last_synced_bytes = disk_log_get_total_written();
         s_in_save = false;
         return;
     }
 
-    if (mtp && mtp->session_active) {
+    if (mtp && mtp->session_active && (!mtp->usb_dev || !mtp->usb_dev->is_disconnected)) {
         mtp_save_log_to_phone(mtp);
-        s_last_synced_bytes = disk_log_get_total_written();
         s_in_save = false;
         return;
     }
@@ -1086,7 +1078,6 @@ void c_main(boot_info_t *boot_info) {
 
         // Wait for explicit user selection
         menu_selection_t choice = menu_wait_selection(&os_reg);
-        phone_save_boot_log(&active_adb_session, &active_mtp_session);
 
         if (choice.type == MENU_ACTION_RESCAN) {
             log_info("STAGE3", "Rescanning USB ports for Android phone / USB storage...");
@@ -1259,10 +1250,8 @@ void c_main(boot_info_t *boot_info) {
                     if (active_adb_session.is_connected) {
                         adb_scan_persistence_profiles(&active_adb_session, selected);
                     }
-                    phone_save_boot_log(&active_adb_session, &active_mtp_session);
 
                     selected->selected_profile = menu_select_persistence_profile(selected, active_adb_session.is_connected ? &active_adb_session : NULL);
-                    phone_save_boot_log(&active_adb_session, &active_mtp_session);
                     const persistence_profile_t *prof = (selected->profile_count > 0 && selected->selected_profile < selected->profile_count) ?
                         &selected->profiles[selected->selected_profile] : NULL;
                     char prof_path[256] = {0};
@@ -1333,7 +1322,6 @@ void c_main(boot_info_t *boot_info) {
 
                             int trg = adb_trigger_mass_storage(&active_adb_session, selected->filename, prof_path[0] ? prof_path : NULL);
                             disk_log_flush();
-                            phone_save_boot_log(&active_adb_session, &active_mtp_session);
 
                             // Try to reprobe as MSC regardless of trigger result.
                             if (trg != -2) { // -2 = kernel doesn't have UMS support at all

@@ -70,7 +70,7 @@ void usb_abort_control_endpoint(usb_device_t *dev) {
 }
 
 int usb_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *data, uint16_t len) {
-    if (!dev || !setup) return -1;
+    if (!dev || !setup || dev->is_disconnected) return -1;
 
     xhci_controller_t *ctrl = dev->ctrl;
     uint8_t slot_id = dev->slot_id;
@@ -95,23 +95,20 @@ int usb_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *dat
     trb_setup->control = TRB_TYPE(TRB_SETUP) | TRB_IDT | trt | (dev->ep0_cycle_state ? 1U : 0U);
 
     xhci_trb_t *trb_data = NULL;
-    if (len > 0 && data) {
+    if (len > 0) {
         trb_data = &dev->ep0_ring[idx++];
         if (idx >= EP_RING_TRBS - 1) { idx = 0; dev->ep0_cycle_state ^= 1; }
-
-        uint32_t data_dir = (setup->bmRequestType & 0x80) ? (1U << 16) : 0U;
         trb_data->parameter = (uintptr_t)data;
         trb_data->status = len;
-        trb_data->control = TRB_TYPE(TRB_DATA) | data_dir | (dev->ep0_cycle_state ? 1U : 0U);
+        uint32_t dir_in = (setup->bmRequestType & 0x80) ? (1U << 16) : 0;
+        trb_data->control = TRB_TYPE(TRB_DATA) | dir_in | (dev->ep0_cycle_state ? 1U : 0U);
     }
 
     xhci_trb_t *trb_status = &dev->ep0_ring[idx++];
     if (idx >= EP_RING_TRBS - 1) { idx = 0; dev->ep0_cycle_state ^= 1; }
-
-    // Status direction is opposite of data phase
-    uint32_t status_dir = (len > 0 && (setup->bmRequestType & 0x80)) ? 0 : (1U << 16);
     trb_status->parameter = 0;
     trb_status->status = 0;
+    uint32_t status_dir = (len > 0 && !(setup->bmRequestType & 0x80)) ? (1U << 16) : 0; // Status IN for OUT transfers
     trb_status->control = TRB_TYPE(TRB_STATUS) | TRB_IOC | status_dir | (dev->ep0_cycle_state ? 1U : 0U);
 
     dev->ep0_enqueue_idx = idx;
@@ -124,8 +121,8 @@ int usb_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *dat
     uintptr_t setup_trb_phys = (uintptr_t)trb_setup;
     uintptr_t data_trb_phys = trb_data ? (uintptr_t)trb_data : 0;
 
-    // Poll Event Ring for Transfer Event
-    int timeout = 20000;
+    // Poll Event Ring for Transfer Event (up to 200ms: 4000 * 50us)
+    int timeout = 4000;
     while (--timeout > 0) {
         xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
         uint32_t cycle = evt->control & 1U;
@@ -202,6 +199,7 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
     }
     out_dev->bulk_in_ring = NULL;
     out_dev->bulk_out_ring = NULL;
+    out_dev->is_disconnected = false;
 
     // 2. Enable Slot
     uint8_t slot_id = 0;
@@ -834,8 +832,20 @@ int usb_clear_endpoint_halt(usb_device_t *dev, uint8_t ep_addr) {
 }
 
 int usb_abort_bulk_endpoint(usb_device_t *dev, uint8_t ep_addr) {
-    if (!dev || !dev->ctrl) return -1;
-    log_info("USB", "Aborting timed out transfer on EP 0x%02X...", ep_addr);
+    if (!dev || !dev->ctrl || dev->is_disconnected) return -1;
+
+    // Check physical port connection if applicable
+    if (dev->port_num > 0 && dev->port_num <= dev->ctrl->max_ports) {
+        uintptr_t port_reg = dev->ctrl->op_regs + XHCI_OP_PORTS_BASE + (dev->port_num - 1) * 0x10;
+        uint32_t portsc = *(volatile uint32_t *)port_reg;
+        if (!(portsc & XHCI_PORT_CCS)) {
+            dev->is_disconnected = true;
+            log_info("USB", "Device on port %u physically disconnected. Skipping endpoint abort.", dev->port_num);
+            return -1;
+        }
+    }
+
+    log_info("USB", "Aborting timed out/halted transfer on EP 0x%02X...", ep_addr);
 
     uint8_t ep_num = ep_addr & 0x0F;
     bool is_in = (ep_addr & 0x80) != 0;
@@ -844,20 +854,29 @@ int usb_abort_bulk_endpoint(usb_device_t *dev, uint8_t ep_addr) {
     xhci_trb_t evt;
 
     // 1. Transition endpoint to Stopped state:
-    // When aborting a timed-out transfer, the hardware transfer engine is running.
-    // Issue Stop Endpoint Command (Type 15) to transition to Stopped state.
-    // If the endpoint was halted, issue Reset Endpoint Command (Type 14).
-    xhci_trb_t stop_cmd;
-    stop_cmd.parameter = 0;
-    stop_cmd.status = 0;
-    stop_cmd.control = TRB_TYPE(TRB_STOP_ENDPOINT_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
-    int stop_res = xhci_send_command(dev->ctrl, &stop_cmd, &evt);
-    if (stop_res != 0) {
-        xhci_trb_t reset_cmd;
-        reset_cmd.parameter = 0;
-        reset_cmd.status = 0;
-        reset_cmd.control = TRB_TYPE(TRB_RESET_EP_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
-        xhci_send_command(dev->ctrl, &reset_cmd, &evt);
+    // If endpoint was Halted (e.g. CC=4 USB Transaction Error or CC=6 Stall),
+    // Reset Endpoint Command (Type 14) is required per xHCI spec 4.6.8.
+    // If endpoint was Running (e.g. host timeout), Stop Endpoint Command (Type 15) is required.
+    xhci_trb_t reset_cmd;
+    reset_cmd.parameter = 0;
+    reset_cmd.status = 0;
+    reset_cmd.control = TRB_TYPE(TRB_RESET_EP_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
+    int rst_res = xhci_send_command(dev->ctrl, &reset_cmd, &evt);
+    if (rst_res == -100) {
+        dev->is_disconnected = true;
+        return -100;
+    }
+    if (rst_res != 0) {
+        // Endpoint was not Halted (returned CC=19 Context State Error); issue Stop Endpoint
+        xhci_trb_t stop_cmd;
+        stop_cmd.parameter = 0;
+        stop_cmd.status = 0;
+        stop_cmd.control = TRB_TYPE(TRB_STOP_ENDPOINT_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
+        int stop_res = xhci_send_command(dev->ctrl, &stop_cmd, &evt);
+        if (stop_res == -100) {
+            dev->is_disconnected = true;
+            return -100;
+        }
     }
 
     // 2. Drain any pending transfer events for this device/endpoint from the event ring
@@ -909,24 +928,30 @@ int usb_abort_bulk_endpoint(usb_device_t *dev, uint8_t ep_addr) {
         deq_cmd.parameter = (uintptr_t)ring | 1U; // DCS = 1
         deq_cmd.status = 0;
         deq_cmd.control = TRB_TYPE(TRB_SET_TR_DEQ_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
-        xhci_send_command(dev->ctrl, &deq_cmd, &evt);
+        int deq_res = xhci_send_command(dev->ctrl, &deq_cmd, &evt);
+        if (deq_res == -100) {
+            dev->is_disconnected = true;
+            return -100;
+        }
     }
 
-    // 5. Send CLEAR_FEATURE(ENDPOINT_HALT) to USB device to reset data toggle
-    usb_setup_packet_t req;
-    req.bmRequestType = 0x02;
-    req.bRequest = USB_REQ_CLEAR_FEATURE;
-    req.wValue = 0;
-    req.wIndex = ep_addr;
-    req.wLength = 0;
-    usb_control_transfer(dev, &req, NULL, 0);
+    // 5. Send CLEAR_FEATURE(ENDPOINT_HALT) to USB device only if slot is still responsive
+    if (!dev->is_disconnected) {
+        usb_setup_packet_t req;
+        req.bmRequestType = 0x02;
+        req.bRequest = USB_REQ_CLEAR_FEATURE;
+        req.wValue = 0;
+        req.wIndex = ep_addr;
+        req.wLength = 0;
+        usb_control_transfer(dev, &req, NULL, 0);
+    }
 
     log_info("USB", "EP 0x%02X transfer ring aborted and re-synchronized successfully.", ep_addr);
     return 0;
 }
 
 int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t len, uint32_t *transferred_out) {
-    if (!dev || !data || len == 0) return -1;
+    if (!dev || !data || len == 0 || dev->is_disconnected) return -1;
 
     xhci_controller_t *ctrl = dev->ctrl;
     uint8_t slot_id = dev->slot_id;
@@ -1033,7 +1058,7 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
 }
 
 int usb_bulk_transfer_wait(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t len, uint32_t *transferred_out, int max_seconds) {
-    if (!dev || !data || len == 0) return -1;
+    if (!dev || !data || len == 0 || dev->is_disconnected) return -1;
 
     xhci_controller_t *ctrl = dev->ctrl;
     uint8_t slot_id = dev->slot_id;
@@ -1118,6 +1143,7 @@ int usb_bulk_transfer_wait(usb_device_t *dev, uint8_t ep_addr, void *data, uint3
                         if (cc != TRB_COMPL_SUCCESS && cc != TRB_COMPL_SHORT_TX) {
                             log_error("USB", "Bulk transfer wait failed on EP 0x%02X: CC=%u (%s), transferred %u / %u B",
                                       ep_addr, cc, xhci_cc_to_string(cc), transferred_out ? *transferred_out : 0, len);
+                            usb_abort_bulk_endpoint(dev, ep_addr);
                             return (int)cc;
                         }
                         return 0;

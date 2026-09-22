@@ -17,6 +17,7 @@ typedef struct usb_device {
     uint8_t  slot_id;
     uint8_t  port_num;
     uint8_t  speed;
+    bool     is_disconnected;
 
     usb_device_desc_t dev_desc;
     uint8_t           config_buf[512];

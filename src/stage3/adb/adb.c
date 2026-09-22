@@ -27,7 +27,8 @@ static uint32_t adb_calc_checksum(const void *data, uint32_t len) {
 }
 
 static int adb_send_msg(adb_session_t *s, uint32_t cmd, uint32_t arg0, uint32_t arg1, const void *data, uint32_t data_len) {
-    if (!s || !s->usb_dev) return -1;
+    if (!s || !s->usb_dev || (s->usb_dev && s->usb_dev->is_disconnected)) return -1;
+    if (cmd != A_CNXN && cmd != A_AUTH && !s->is_connected) return -1;
 
     uint8_t ep = s->adb_bulk_out_ep;
     if (ep == 0 && s->usb_dev) ep = s->usb_dev->adb_bulk_out_ep;
@@ -47,12 +48,24 @@ static int adb_send_msg(adb_session_t *s, uint32_t cmd, uint32_t arg0, uint32_t 
 
     uint32_t sent = 0;
     int res = usb_bulk_transfer_wait(s->usb_dev, ep, &msg, sizeof(msg), &sent, 4);
-    if (res != 0) return res;
+    if (res != 0) {
+        if (s->is_connected) {
+            log_info("ADB", "ADB send header failed (%d). Phone connection dropped.", res);
+            s->is_connected = false;
+        }
+        return res;
+    }
 
     if (data && data_len > 0) {
         sent = 0;
         res = usb_bulk_transfer_wait(s->usb_dev, ep, (void *)data, data_len, &sent, 4);
-        if (res != 0) return res;
+        if (res != 0) {
+            if (s->is_connected) {
+                log_info("ADB", "ADB send data failed (%d). Phone connection dropped.", res);
+                s->is_connected = false;
+            }
+            return res;
+        }
     }
     return 0;
 }
@@ -125,7 +138,13 @@ static int adb_recv_msg_wait(adb_session_t *s, adb_message_t *out_msg, void *out
 
     uint32_t rec = 0;
     int res = usb_bulk_transfer_wait(s->usb_dev, ep, out_msg, sizeof(adb_message_t), &rec, max_seconds);
-    if (res != 0 || rec < sizeof(adb_message_t)) return -1;
+    if (res != 0 || rec < sizeof(adb_message_t)) {
+        if (s->is_connected && (res == -100 || res == 4)) {
+            log_info("ADB", "ADB receive failed (%d). Phone connection dropped.", res);
+            s->is_connected = false;
+        }
+        return -1;
+    }
 
     if (out_msg->magic != (out_msg->command ^ 0xFFFFFFFF)) {
         log_error("ADB", "Corrupt message header received (magic mismatch)!");
@@ -307,7 +326,8 @@ int adb_execute_shell_timeout(adb_session_t *session, const char *cmd, char *out
     uint32_t my_id = session->local_id++;
     int res = adb_send_msg(session, A_OPEN, my_id, 0, open_dest, dest_len);
     if (res != 0) {
-        if (!is_b64_log_chunk) log_error("ADB", "Failed to send A_OPEN for shell (code %d)", res);
+        session->is_connected = false;
+        if (!is_b64_log_chunk) log_error("ADB", "Failed to send A_OPEN for shell (code %d) - Phone disconnected", res);
         return res;
     }
 
@@ -855,6 +875,10 @@ int adb_create_sparse_overlay(adb_session_t *session, const char *overlay_path, 
     char out[256] = {0};
     int res = adb_execute_shell_timeout(session, cmd, out, sizeof(out), 15);
     if (res != 0 || !adb_str_contains(out, "OK_CREATED")) {
+        if (!session->is_connected) {
+            log_error("ADB", "Phone disconnected during overlay allocation. Aborting.");
+            return -1;
+        }
         // Fallback with su -c
         snprintf(cmd, sizeof(cmd),
                  "su -c 'mkdir -p /sdcard/BootManager/persistence; "
@@ -894,7 +918,7 @@ static void adb_base64_encode(const uint8_t *src, size_t len, char *out) {
 }
 
 int adb_save_log_to_phone(adb_session_t *session) {
-    if (!session || !session->is_connected) return -1;
+    if (!session || !session->is_connected || (session->usb_dev && session->usb_dev->is_disconnected)) return -1;
 
     static char log_buf[DISK_LOG_BUFFER_SIZE];
     uint32_t total_len = 0;
@@ -903,6 +927,9 @@ int adb_save_log_to_phone(adb_session_t *session) {
 
     // Dedicated per-boot session filename (preserved across flushes of the same boot)
     static char s_boot_session_file[64] = {0};
+    static uint32_t s_phone_log_synced_offset = 0;
+    static bool s_dirs_initialized = false;
+
     if (s_boot_session_file[0] == '\0') {
         char ts[32] = {0};
         rtc_get_timestamp_str(ts, sizeof(ts));
@@ -918,30 +945,45 @@ int adb_save_log_to_phone(adb_session_t *session) {
         }
     }
 
-    // 1. Prepare target directories on Android storage and truncate temp log
-    char prep_cmd[512];
-    snprintf(prep_cmd, sizeof(prep_cmd),
-             "rm -f /data/local/tmp/boot.log 2>/dev/null; "
-             "mkdir -p /sdcard/BootManager/logs /storage/emulated/0/BootManager/logs /data/local/tmp 2>/dev/null; "
-             "chmod 777 /sdcard/BootManager /sdcard/BootManager/logs /storage/emulated/0/BootManager 2>/dev/null");
-    adb_execute_shell_timeout(session, prep_cmd, NULL, 0, 8);
+    // Nothing new to sync?
+    if (total_len <= s_phone_log_synced_offset) {
+        return 0;
+    }
 
-    // 2. Stream log data in atomic base64 chunks via adb_execute_shell_timeout
-    // Chunk size 1536 bytes -> 2048 base64 bytes -> ~2100 bytes command
+    // 1. Prepare target directories on Android storage and truncate temp log ONCE
+    if (!s_dirs_initialized) {
+        char prep_cmd[384];
+        snprintf(prep_cmd, sizeof(prep_cmd),
+                 "rm -f /data/local/tmp/boot.log 2>/dev/null; "
+                 "mkdir -p /sdcard/BootManager/logs /storage/emulated/0/BootManager/logs /data/local/tmp 2>/dev/null; "
+                 "chmod 777 /sdcard/BootManager /sdcard/BootManager/logs 2>/dev/null");
+        int pr_res = adb_execute_shell_timeout(session, prep_cmd, NULL, 0, 4);
+        if (pr_res != 0 || !session->is_connected) {
+            return -1;
+        }
+        s_dirs_initialized = true;
+    }
+
+    // 2. Stream delta log data in atomic base64 chunks
     static char b64_chunk[2500];
     static char cmd_buf[3000];
-    uint32_t offset = 0;
+    uint32_t offset = s_phone_log_synced_offset;
     bool write_failed = false;
 
     while (offset < total_len) {
+        if (!session->is_connected) {
+            write_failed = true;
+            break;
+        }
+
         uint32_t chunk = total_len - offset;
         if (chunk > 1536) chunk = 1536;
 
         adb_base64_encode((const uint8_t *)(log_buf + offset), chunk, b64_chunk);
         snprintf(cmd_buf, sizeof(cmd_buf), "echo %s | base64 -d >> /data/local/tmp/boot.log", b64_chunk);
 
-        int res = adb_execute_shell_timeout(session, cmd_buf, NULL, 0, 8);
-        if (res != 0) {
+        int res = adb_execute_shell_timeout(session, cmd_buf, NULL, 0, 4);
+        if (res != 0 || !session->is_connected) {
             log_error("ADB", "Failed to write base64 chunk at offset %u (code %d)", offset, res);
             write_failed = true;
             break;
@@ -950,49 +992,26 @@ int adb_save_log_to_phone(adb_session_t *session) {
         offset += chunk;
     }
 
-    if (!write_failed) {
-        // Step 2a: Standard shell copy directly to /sdcard/BootManager and /sdcard/BootManager/logs/
-        char copy_cmd[512];
-        snprintf(copy_cmd, sizeof(copy_cmd),
-                 "mkdir -p /sdcard/BootManager/logs /storage/emulated/0/BootManager/logs 2>/dev/null; "
-                 "cp /data/local/tmp/boot.log /sdcard/BootManager/boot.log 2>/dev/null; "
-                 "cp /data/local/tmp/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; "
-                 "chmod 666 /data/local/tmp/boot.log /sdcard/BootManager/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; "
-                 "echo OK_COPIED",
-                 s_boot_session_file, s_boot_session_file);
-        char copy_out[64] = {0};
-        int cp_res = adb_execute_shell_timeout(session, copy_cmd, copy_out, sizeof(copy_out), 4);
-
-        // Step 2b: Fall back to root su copy ONLY if standard copy failed
-        if (cp_res != 0 || !adb_str_contains(copy_out, "OK_COPIED")) {
-            char root_cmd[512];
-            snprintf(root_cmd, sizeof(root_cmd),
-                     "su -c \"mkdir -p /sdcard/BootManager/logs 2>/dev/null; "
-                     "cp /data/local/tmp/boot.log /sdcard/BootManager/boot.log 2>/dev/null; "
-                     "cp /data/local/tmp/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; "
-                     "chmod 666 /sdcard/BootManager/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; "
-                     "echo OK_ROOT_COPIED\"",
-                     s_boot_session_file, s_boot_session_file);
-            adb_execute_shell_timeout(session, root_cmd, NULL, 0, 4);
-        }
+    if (write_failed || !session->is_connected) {
+        return -1;
     }
 
-    // 3. Post-write verification
-    char verify_cmd[256];
-    snprintf(verify_cmd, sizeof(verify_cmd),
-             "ls -l /sdcard/BootManager/logs/%s /sdcard/BootManager/boot.log 2>/dev/null",
-             s_boot_session_file);
-    char verify_out[384] = {0};
-    adb_execute_shell(session, verify_cmd, verify_out, sizeof(verify_out));
+    // All delta chunks succeeded: update synced offset
+    s_phone_log_synced_offset = offset;
 
-    if (adb_str_contains(verify_out, "boot.log") || adb_str_contains(verify_out, s_boot_session_file)) {
-        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-        log_info("ADB", "SUCCESS: Boot log saved to /sdcard/BootManager/logs/%s", s_boot_session_file);
-        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-        return 0;
-    }
+    // 3. Fast copy directly to /sdcard/BootManager/boot.log and /sdcard/BootManager/logs/%s
+    char copy_cmd[512];
+    snprintf(copy_cmd, sizeof(copy_cmd),
+             "cp /data/local/tmp/boot.log /sdcard/BootManager/boot.log 2>/dev/null; "
+             "cp /data/local/tmp/boot.log /sdcard/BootManager/logs/%s 2>/dev/null; "
+             "chmod 666 /sdcard/BootManager/boot.log /sdcard/BootManager/logs/%s 2>/dev/null",
+             s_boot_session_file, s_boot_session_file);
+    adb_execute_shell_timeout(session, copy_cmd, NULL, 0, 3);
 
-    log_error("ADB", "Failed to sync boot log to phone storage (resp: '%s')", verify_out[0] ? verify_out : "none");
-    return -1;
+    vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    log_info("ADB", "SUCCESS: Boot log synced to /sdcard/BootManager/logs/%s (%u bytes)",
+             s_boot_session_file, s_phone_log_synced_offset);
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    return 0;
 }
 
