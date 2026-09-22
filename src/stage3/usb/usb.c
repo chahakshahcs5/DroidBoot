@@ -19,18 +19,33 @@ static inline void mdelay(uint32_t ms) {
 }
 
 void usb_abort_control_endpoint(usb_device_t *dev) {
-    if (!dev || !dev->ctrl || dev->slot_id == 0 || !dev->ep0_ring) return;
+    if (!dev || !dev->ctrl || dev->slot_id == 0 || !dev->ep0_ring || dev->is_disconnected) return;
 
-    // 1. Issue Stop Endpoint Command on EP 1 (EP0 Control)
-    xhci_trb_t stop_cmd;
-    stop_cmd.parameter = 0;
-    stop_cmd.status = 0;
-    stop_cmd.control = TRB_TYPE(TRB_STOP_ENDPOINT_CMD) | ((uint32_t)dev->slot_id << 24) | (1U << 16);
     xhci_trb_t evt;
-    int stop_res = xhci_send_command(dev->ctrl, &stop_cmd, &evt);
-    if (stop_res == -100) {
+
+    // 1. Transition EP0 to Stopped state:
+    // If EP0 was Halted (e.g. CC=6 Stall), Reset Endpoint Command (Type 14) is required per xHCI spec 4.6.8.
+    // If EP0 was Running (e.g. host timeout), Stop Endpoint Command (Type 15) is required.
+    xhci_trb_t reset_cmd;
+    reset_cmd.parameter = 0;
+    reset_cmd.status = 0;
+    reset_cmd.control = TRB_TYPE(TRB_RESET_EP_CMD) | ((uint32_t)dev->slot_id << 24) | (1U << 16);
+    int rst_res = xhci_send_command(dev->ctrl, &reset_cmd, &evt);
+    if (rst_res == -100) {
         dev->is_disconnected = true;
         return;
+    }
+    if (rst_res != 0) {
+        // Endpoint was not Halted (CC=19 Context State Error); issue Stop Endpoint Command
+        xhci_trb_t stop_cmd;
+        stop_cmd.parameter = 0;
+        stop_cmd.status = 0;
+        stop_cmd.control = TRB_TYPE(TRB_STOP_ENDPOINT_CMD) | ((uint32_t)dev->slot_id << 24) | (1U << 16);
+        int stop_res = xhci_send_command(dev->ctrl, &stop_cmd, &evt);
+        if (stop_res == -100) {
+            dev->is_disconnected = true;
+            return;
+        }
     }
 
     // 2. Drain any pending transfer events for this slot/EP0 from the event ring
@@ -150,6 +165,9 @@ int usb_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *dat
                     if (cc != TRB_COMPL_SUCCESS && cc != TRB_COMPL_SHORT_TX) {
                         log_error("USB", "Control transfer failed: bmReq=0x%02X bReq=0x%02X wVal=0x%04X wIdx=0x%04X CC=%u (%s)",
                                   setup->bmRequestType, setup->bRequest, setup->wValue, setup->wIndex, cc, xhci_cc_to_string(cc));
+                        if (cc == TRB_COMPL_STALL_ERR) {
+                            usb_abort_control_endpoint(dev);
+                        }
                         return (int)cc;
                     }
                     return 0;
@@ -495,19 +513,22 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
         ptr += len;
     }
 
-    // 8. Set Configuration 1 (Required by Android to transition to CONFIGURED state and show USB prompt)
-    usb_setup_packet_t req_set_cfg;
-    req_set_cfg.bmRequestType = 0x00;
-    req_set_cfg.bRequest = USB_REQ_SET_CONFIGURATION;
-    req_set_cfg.wValue = 1;
-    req_set_cfg.wIndex = 0;
-    req_set_cfg.wLength = 0;
+    // 8. Set Configuration 1: Required for standard USB devices & Android to transition to CONFIGURED state.
+    // Do NOT send to USB Hubs (causes USB Hub EP0 stall).
+    if (out_dev->dev_desc.bDeviceClass != USB_CLASS_HUB) {
+        usb_setup_packet_t req_set_cfg;
+        req_set_cfg.bmRequestType = 0x00;
+        req_set_cfg.bRequest = USB_REQ_SET_CONFIGURATION;
+        req_set_cfg.wValue = 1;
+        req_set_cfg.wIndex = 0;
+        req_set_cfg.wLength = 0;
 
-    int set_cfg_res = usb_control_transfer(out_dev, &req_set_cfg, NULL, 0);
-    if (set_cfg_res == 0) {
-        log_info("USB", "Device Configuration 1 Activated.");
-    } else {
-        log_info("USB", "Set Configuration 1 status: %d (device already active). Continuing...", set_cfg_res);
+        int set_cfg_res = usb_control_transfer(out_dev, &req_set_cfg, NULL, 0);
+        if (set_cfg_res == 0) {
+            log_info("USB", "Device Configuration 1 Activated.");
+        } else {
+            log_info("USB", "Set Configuration 1 status: %d (device already active). Continuing...", set_cfg_res);
+        }
     }
 
     if (out_dev->has_msc && out_dev->has_adb) {
