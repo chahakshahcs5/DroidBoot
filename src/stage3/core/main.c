@@ -203,14 +203,19 @@ static bool is_boot_drive_msc(usb_device_t *dev) {
 
 static void handle_msc_device(usb_device_t *msc_dev, uint8_t root_port) {
     if (!msc_dev || !msc_dev->has_msc) return;
+    if (boot_msc_detected && msc_dev->slot_id == boot_msc_device.slot_id) {
+        return; // Already registered and active! Do not overwrite live transfer rings.
+    }
     if (is_boot_drive_msc(msc_dev)) {
-        k_memcpy(&boot_msc_device, msc_dev, sizeof(usb_device_t));
-        boot_msc_detected = true;
-        log_info("STAGE3", "Port %u: Boot Drive SD/USB verified! Enabling direct xHCI logging.", root_port);
-        disk_log_register_usb_msc(&boot_msc_device);
-        diskio_set_usb_msc_device(&boot_msc_device);
-        if (!external_msc_detected) {
-            active_msc_dev = &boot_msc_device;
+        if (!boot_msc_detected) {
+            k_memcpy(&boot_msc_device, msc_dev, sizeof(usb_device_t));
+            boot_msc_detected = true;
+            log_info("STAGE3", "Port %u: Boot Drive SD/USB verified! Enabling direct xHCI logging.", root_port);
+            disk_log_register_usb_msc(&boot_msc_device);
+            diskio_set_usb_msc_device(&boot_msc_device);
+            if (!external_msc_detected) {
+                active_msc_dev = &boot_msc_device;
+            }
         }
     } else {
         register_external_msc(&external_usb_dev, msc_dev, root_port);
@@ -220,14 +225,7 @@ static void handle_msc_device(usb_device_t *msc_dev, uint8_t root_port) {
 static void check_and_handle_hub(xhci_controller_t *ctrl, usb_device_t *dev, uint8_t root_port) {
     if (dev->dev_desc.bDeviceClass != USB_CLASS_HUB) return;
     log_info("STAGE3", "Port %u: USB Hub detected! Scanning downstream ports for boot drive / storage...", root_port);
-    usb_device_t hub_msc_dev;
-    k_memset(&hub_msc_dev, 0, sizeof(hub_msc_dev));
-    if (usb_probe_hub_downstream(ctrl, dev, &hub_msc_dev) == 0) {
-        if (hub_msc_dev.has_msc) {
-            log_info("STAGE3", "Hub Port downstream MSC device acquired!");
-            handle_msc_device(&hub_msc_dev, root_port);
-        }
-    }
+    usb_probe_hub_downstream(ctrl, dev, NULL);
 }
 
 static void test_linux_boot_simulation(boot_info_t *boot_info) {
@@ -862,6 +860,7 @@ void c_main(boot_info_t *boot_info) {
     // Dynamic ADB Authentication Key (Loaded from FAT32 boot drive if present)
     load_dynamic_adb_key((uint8_t)boot_info->boot_drive);
     diskio_set_bios_drive((uint8_t)boot_info->boot_drive);
+    usb_set_hub_msc_callback(handle_msc_device);
 
     bool phone_prompted = false;
     bool mtp_found = false;
@@ -1203,6 +1202,15 @@ void c_main(boot_info_t *boot_info) {
                     log_info("BOOT", "Booting '%s' with Direct Block Access (0 MB in RAM)...", sel_img->title);
                     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                     disk_log_flush();
+
+                    if (external_usb_dev.has_adb) {
+                        log_info("BOOT", "Composite phone re-enumerated with ADB! Restoring ADB session...");
+                        if (adb_init_session(&external_usb_dev, &active_adb_session) == 0) {
+                            log_info("BOOT", "ADB session restored! Syncing post-switch boot logs to phone...");
+                            phone_save_boot_log(&active_adb_session, NULL);
+                        }
+                    }
+
                     boot_from_usb_msc(&external_usb_dev, boot_info, prof);
                     break;
                 } else {
@@ -1334,6 +1342,15 @@ void c_main(boot_info_t *boot_info) {
                                     log_info("BOOT", "Phone switched to USB Mass Storage! Booting with Direct Block Access (0 MB in RAM)...");
                                     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                                     disk_log_flush();
+
+                                    if (external_usb_dev.has_adb) {
+                                        log_info("BOOT", "Composite phone re-enumerated with ADB! Restoring ADB session...");
+                                        if (adb_init_session(&external_usb_dev, &active_adb_session) == 0) {
+                                            log_info("BOOT", "ADB session restored! Syncing post-switch boot logs to phone...");
+                                            phone_save_boot_log(&active_adb_session, NULL);
+                                        }
+                                    }
+
                                     boot_from_usb_msc(&external_usb_dev, boot_info, prof);
                                     ums_booted = true;
                                     break;

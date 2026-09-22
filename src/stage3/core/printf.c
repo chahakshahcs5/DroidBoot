@@ -178,7 +178,6 @@ void log_info(const char *tag, const char *fmt, ...) {
     vprintk(fmt, args);
     va_end(args);
     printk("\n");
-    disk_log_flush();
 }
 
 void log_error(const char *tag, const char *fmt, ...) {
@@ -188,7 +187,6 @@ void log_error(const char *tag, const char *fmt, ...) {
     vprintk(fmt, args);
     va_end(args);
     printk("\n");
-    disk_log_flush();
 }
 
 #if IS_DEBUG_BUILD

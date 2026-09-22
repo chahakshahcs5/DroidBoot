@@ -587,8 +587,17 @@ void disk_log_flush(void) {
         }
     }
 
+    static uint8_t consecutive_msc_errors = 0;
     if (any_error) {
         error_counter++;
+        if (use_msc) {
+            consecutive_msc_errors++;
+            if (consecutive_msc_errors >= 2) {
+                log_state = LOG_STATE_BUFFERED;
+            }
+        }
+    } else {
+        consecutive_msc_errors = 0;
     }
     last_flush_ok = !any_error;
     bytes_at_last_flush = total_written;

@@ -81,5 +81,8 @@ int  usb_clear_endpoint_halt(usb_device_t *dev, uint8_t ep_addr);
 int  usb_abort_bulk_endpoint(usb_device_t *dev, uint8_t ep_addr);
 int  usb_get_string_descriptor(usb_device_t *dev, uint8_t index, char *out_str, uint16_t max_len);
 
+typedef void (*usb_msc_callback_fn)(usb_device_t *msc_dev, uint8_t root_port);
+void usb_set_hub_msc_callback(usb_msc_callback_fn cb);
+
 #endif // USB_H
 

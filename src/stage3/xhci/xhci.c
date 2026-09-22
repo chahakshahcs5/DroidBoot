@@ -416,8 +416,8 @@ int xhci_send_command(xhci_controller_t *ctrl, xhci_trb_t *cmd, xhci_trb_t *even
     // Ring Host Controller Doorbell (Target = 0 for Host Controller Command)
     xhci_write32(ctrl->db_regs, 0);
 
-    // Poll Event Ring for Command Completion Event
-    int timeout = 500;
+    // Poll Event Ring for Command Completion Event (up to 1000ms)
+    int timeout = 10000;
     while (--timeout > 0) {
         xhci_trb_t *evt = &ctrl->event_ring[ctrl->event_dequeue_idx];
         uint32_t cycle = evt->control & 1U;

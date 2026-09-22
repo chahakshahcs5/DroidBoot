@@ -18,7 +18,56 @@ static inline void mdelay(uint32_t ms) {
     timer_mdelay(ms);
 }
 
+void usb_abort_control_endpoint(usb_device_t *dev) {
+    if (!dev || !dev->ctrl || dev->slot_id == 0 || !dev->ep0_ring) return;
 
+    // 1. Issue Stop Endpoint Command on EP 1 (EP0 Control)
+    xhci_trb_t stop_cmd;
+    stop_cmd.parameter = 0;
+    stop_cmd.status = 0;
+    stop_cmd.control = TRB_TYPE(TRB_STOP_ENDPOINT_CMD) | ((uint32_t)dev->slot_id << 24) | (1U << 16);
+    xhci_trb_t evt;
+    xhci_send_command(dev->ctrl, &stop_cmd, &evt);
+
+    // 2. Drain any pending transfer events for this slot/EP0 from the event ring
+    for (int i = 0; i < XHCI_EVENT_RING_TRBS; i++) {
+        xhci_trb_t *ev = &dev->ctrl->event_ring[dev->ctrl->event_dequeue_idx];
+        if ((ev->control & 1U) == dev->ctrl->event_cycle_state) {
+            uint32_t type = (ev->control >> TRB_TYPE_SHIFT) & 0x3F;
+            if (type == TRB_TRANSFER_EVENT) {
+                dev->ctrl->event_dequeue_idx++;
+                if (dev->ctrl->event_dequeue_idx == XHCI_EVENT_RING_TRBS) {
+                    dev->ctrl->event_dequeue_idx = 0;
+                    dev->ctrl->event_cycle_state ^= 1;
+                }
+                uintptr_t intr0 = dev->ctrl->rt_regs + 0x20;
+                uintptr_t erdp = (uintptr_t)&dev->ctrl->event_ring[dev->ctrl->event_dequeue_idx];
+                xhci_write64(intr0 + XHCI_INTR_ERDP, erdp | XHCI_ERDP_EHB);
+            }
+        } else {
+            break;
+        }
+    }
+
+    // 3. Reset EP0 transfer ring
+    for (int i = 0; i < EP_RING_TRBS - 1; i++) {
+        dev->ep0_ring[i].parameter = 0;
+        dev->ep0_ring[i].status = 0;
+        dev->ep0_ring[i].control = 0;
+    }
+    dev->ep0_ring[EP_RING_TRBS - 1].parameter = (uintptr_t)dev->ep0_ring;
+    dev->ep0_ring[EP_RING_TRBS - 1].status = 0;
+    dev->ep0_ring[EP_RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE_CYCLE;
+    dev->ep0_enqueue_idx = 0;
+    dev->ep0_cycle_state = 1;
+
+    // 4. Set TR Dequeue Pointer to EP0 ring[0] with DCS = 1
+    xhci_trb_t deq_cmd;
+    deq_cmd.parameter = (uintptr_t)dev->ep0_ring | 1U;
+    deq_cmd.status = 0;
+    deq_cmd.control = TRB_TYPE(TRB_SET_TR_DEQ_CMD) | ((uint32_t)dev->slot_id << 24) | (1U << 16);
+    xhci_send_command(dev->ctrl, &deq_cmd, &evt);
+}
 
 int usb_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *data, uint16_t len) {
     if (!dev || !setup) return -1;
@@ -118,6 +167,7 @@ int usb_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *dat
     }
 
     log_error("USB", "Control transfer timed out!");
+    usb_abort_control_endpoint(dev);
     return -100;
 }
 
@@ -232,8 +282,33 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
     req_dev.bRequest = USB_REQ_GET_DESCRIPTOR;
     req_dev.wValue = (USB_DESC_DEVICE << 8);
     req_dev.wIndex = 0;
-    req_dev.wLength = sizeof(usb_device_desc_t);
 
+    // For Full-Speed (speed 1) or Low-Speed (speed 2), EP0 max packet size is initially 8 bytes.
+    // To prevent xHCI Babble Error (CC=3) caused by devices returning packets > 8 bytes,
+    // read 8 bytes first, evaluate EP0 context with real bMaxPacketSize0, then read full 18 bytes.
+    if (speed < 3) {
+        req_dev.wLength = 8;
+        int res8 = usb_control_transfer(out_dev, &req_dev, &out_dev->dev_desc, 8);
+        if (res8 != 0) {
+            log_error("USB", "Failed initial 8-byte Device Descriptor on Port %u (error %d)!", port_num, res8);
+            return -5;
+        }
+        uint16_t dev_ep0_max = out_dev->dev_desc.bMaxPacketSize0;
+        if (dev_ep0_max > 0 && dev_ep0_max != max_packet) {
+            log_info("USB", "Updating EP0 MaxPacketSize to %u via Evaluate Context...", dev_ep0_max);
+            *(uint32_t *)(input_ctx + 0) = 0;
+            *(uint32_t *)(input_ctx + 4) = (1U << 1); // Add EP0 Context
+            ep0_ctx[1] = (ep0_ctx[1] & ~0xFFFF0000U) | ((uint32_t)dev_ep0_max << 16);
+            xhci_trb_t eval_cmd;
+            eval_cmd.parameter = (uintptr_t)input_ctx;
+            eval_cmd.status = 0;
+            eval_cmd.control = TRB_TYPE(TRB_EVAL_CTX_CMD) | ((uint32_t)slot_id << 24);
+            xhci_send_command(ctrl, &eval_cmd, &addr_evt);
+            max_packet = dev_ep0_max;
+        }
+    }
+
+    req_dev.wLength = sizeof(usb_device_desc_t);
     int get_desc_res = usb_control_transfer(out_dev, &req_dev, &out_dev->dev_desc, sizeof(usb_device_desc_t));
     if (get_desc_res != 0) {
         log_error("USB", "Failed to retrieve Device Descriptor (error %d)!", get_desc_res);
@@ -708,8 +783,7 @@ int usb_configure_adb_endpoints(usb_device_t *dev) {
 }
 
 int usb_clear_endpoint_halt(usb_device_t *dev, uint8_t ep_addr) {
-    if (!dev) return -1;
-    log_info("USB", "Clearing stall/halt condition on EP 0x%02X...", ep_addr);
+    if (!dev || !dev->ctrl) return -1;
 
     // 1. Send CLEAR_FEATURE(ENDPOINT_HALT) control transfer to device
     usb_setup_packet_t req;
@@ -720,32 +794,42 @@ int usb_clear_endpoint_halt(usb_device_t *dev, uint8_t ep_addr) {
     req.wLength = 0;
     int res = usb_control_transfer(dev, &req, NULL, 0);
 
-    // 2. Send Reset Endpoint Command to xHCI
+    // 2. Query xHCI Endpoint State from Device Context
     uint8_t ep_num = ep_addr & 0x0F;
     bool is_in = (ep_addr & 0x80) != 0;
     uint8_t ep_ctx_idx = (ep_num * 2) + (is_in ? 1 : 0);
 
-    xhci_trb_t cmd;
-    cmd.parameter = 0;
-    cmd.status = 0;
-    cmd.control = TRB_TYPE(TRB_RESET_EP_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
-    xhci_trb_t evt;
-    xhci_send_command(dev->ctrl, &cmd, &evt);
+    uint8_t ctx_sz = dev->ctrl->context_size ? dev->ctrl->context_size : 32;
+    void *dev_ctx = (void *)(uintptr_t)dev->ctrl->dcbaa[dev->slot_id];
+    uint32_t *ep_ctx = dev_ctx ? (uint32_t *)((uint8_t *)dev_ctx + (ep_ctx_idx + 1) * ctx_sz) : NULL;
+    uint8_t ep_state = ep_ctx ? (ep_ctx[0] & 0x07) : 0;
 
-    // 3. Set TR Dequeue Pointer Command to restore ring pointer
-    xhci_trb_t *ring = (ep_ctx_idx < 32 && dev->ep_rings[ep_ctx_idx]) ? dev->ep_rings[ep_ctx_idx] : (is_in ? dev->bulk_in_ring : dev->bulk_out_ring);
-    uint32_t deq_idx = (ep_ctx_idx < 32) ? dev->ep_enqueue_idx[ep_ctx_idx] : (is_in ? dev->bulk_in_enqueue_idx : dev->bulk_out_enqueue_idx);
-    uint8_t cycle = (ep_ctx_idx < 32) ? dev->ep_cycle_state[ep_ctx_idx] : (is_in ? dev->bulk_in_cycle_state : dev->bulk_out_cycle_state);
+    // xHCI Spec 4.6.8: Reset Endpoint Command is ONLY valid if Endpoint is in HALTED state (state 2).
+    // If not halted (e.g. running or stopped), issuing Reset Endpoint causes CC 19 (Context State Error).
+    if (ep_state == 2) { // EP_STATE_HALTED
+        log_info("USB", "Clearing stall/halt condition on EP 0x%02X...", ep_addr);
+        xhci_trb_t cmd;
+        cmd.parameter = 0;
+        cmd.status = 0;
+        cmd.control = TRB_TYPE(TRB_RESET_EP_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
+        xhci_trb_t evt;
+        xhci_send_command(dev->ctrl, &cmd, &evt);
 
-    if (ring) {
-        xhci_trb_t deq_cmd;
-        deq_cmd.parameter = (uintptr_t)&ring[deq_idx] | (cycle ? 1U : 0U);
-        deq_cmd.status = 0;
-        deq_cmd.control = TRB_TYPE(TRB_SET_TR_DEQ_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
-        xhci_send_command(dev->ctrl, &deq_cmd, &evt);
+        // xHCI Spec 4.6.10: Set TR Dequeue Pointer is valid once endpoint is in Stopped state
+        xhci_trb_t *ring = (ep_ctx_idx < 32 && dev->ep_rings[ep_ctx_idx]) ? dev->ep_rings[ep_ctx_idx] : (is_in ? dev->bulk_in_ring : dev->bulk_out_ring);
+        uint32_t deq_idx = (ep_ctx_idx < 32) ? dev->ep_enqueue_idx[ep_ctx_idx] : (is_in ? dev->bulk_in_enqueue_idx : dev->bulk_out_enqueue_idx);
+        uint8_t cycle = (ep_ctx_idx < 32) ? dev->ep_cycle_state[ep_ctx_idx] : (is_in ? dev->bulk_in_cycle_state : dev->bulk_out_cycle_state);
+
+        if (ring) {
+            xhci_trb_t deq_cmd;
+            deq_cmd.parameter = (uintptr_t)&ring[deq_idx] | (cycle ? 1U : 0U);
+            deq_cmd.status = 0;
+            deq_cmd.control = TRB_TYPE(TRB_SET_TR_DEQ_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
+            xhci_send_command(dev->ctrl, &deq_cmd, &evt);
+        }
+        log_info("USB", "EP 0x%02X stall cleared, endpoint reset.", ep_addr);
     }
 
-    log_info("USB", "EP 0x%02X stall cleared, endpoint reset.", ep_addr);
     return res;
 }
 
@@ -757,13 +841,29 @@ int usb_abort_bulk_endpoint(usb_device_t *dev, uint8_t ep_addr) {
     bool is_in = (ep_addr & 0x80) != 0;
     uint8_t ep_ctx_idx = (ep_num * 2) + (is_in ? 1 : 0);
 
-    // 1. Issue Stop Endpoint Command (Type 15) to transition from Running to Stopped
-    xhci_trb_t stop_cmd;
-    stop_cmd.parameter = 0;
-    stop_cmd.status = 0;
-    stop_cmd.control = TRB_TYPE(TRB_STOP_ENDPOINT_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
+    uint8_t ctx_sz = dev->ctrl->context_size ? dev->ctrl->context_size : 32;
+    void *dev_ctx = (void *)(uintptr_t)dev->ctrl->dcbaa[dev->slot_id];
+    uint32_t *ep_ctx = dev_ctx ? (uint32_t *)((uint8_t *)dev_ctx + (ep_ctx_idx + 1) * ctx_sz) : NULL;
+    uint8_t ep_state = ep_ctx ? (ep_ctx[0] & 0x07) : 0;
+
     xhci_trb_t evt;
-    xhci_send_command(dev->ctrl, &stop_cmd, &evt);
+
+    // 1. Transition endpoint to Stopped state:
+    // If Running (1), send Stop Endpoint Command (Type 15)
+    // If Halted (2), send Reset Endpoint Command (Type 14) to move from Halted to Stopped
+    if (ep_state == 1) { // RUNNING
+        xhci_trb_t stop_cmd;
+        stop_cmd.parameter = 0;
+        stop_cmd.status = 0;
+        stop_cmd.control = TRB_TYPE(TRB_STOP_ENDPOINT_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
+        xhci_send_command(dev->ctrl, &stop_cmd, &evt);
+    } else if (ep_state == 2) { // HALTED
+        xhci_trb_t reset_cmd;
+        reset_cmd.parameter = 0;
+        reset_cmd.status = 0;
+        reset_cmd.control = TRB_TYPE(TRB_RESET_EP_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
+        xhci_send_command(dev->ctrl, &reset_cmd, &evt);
+    }
 
     // 2. Drain any pending transfer events for this device/endpoint from the event ring
     for (int i = 0; i < XHCI_EVENT_RING_TRBS; i++) {
@@ -1145,9 +1245,17 @@ static void usb_local_memset(void *dst, uint8_t val, size_t n) {
     for (size_t i = 0; i < n; i++) d[i] = val;
 }
 
+static usb_msc_callback_fn g_hub_msc_callback = NULL;
+
+void usb_set_hub_msc_callback(usb_msc_callback_fn cb) {
+    g_hub_msc_callback = cb;
+}
+
 int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb_device_t *out_msc_dev) {
     if (!ctrl || !hub_dev) return -1;
     if (hub_dev->dev_desc.bDeviceClass != USB_CLASS_HUB) return -1;
+
+    bool found_any_msc = false;
 
     // 1. Retrieve Hub Descriptor
     uint8_t hub_desc_buf[16];
@@ -1268,7 +1376,11 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
         uint32_t port_st = 0;
         int st_res = usb_control_transfer(hub_dev, &req_st, &port_st, 4);
         if (st_res != 0) {
-            continue;
+            mdelay(25);
+            st_res = usb_control_transfer(hub_dev, &req_st, &port_st, 4);
+            if (st_res != 0) {
+                continue;
+            }
         }
 
         uint16_t status = (uint16_t)(port_st & 0xFFFF);
@@ -1431,11 +1543,39 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
         c_req_dev.bRequest = USB_REQ_GET_DESCRIPTOR;
         c_req_dev.wValue = (USB_DESC_DEVICE << 8);
         c_req_dev.wIndex = 0;
-        c_req_dev.wLength = sizeof(usb_device_desc_t);
 
+        // Two-phase descriptor read for Full-Speed (speed 1) or Low-Speed (speed 2)
+        // to prevent xHCI Babble Error (CC=3) when child device returns packets > 8 bytes
+        if (child_speed < 3) {
+            c_req_dev.wLength = 8;
+            int r8 = usb_control_transfer(&child_dev, &c_req_dev, &child_dev.dev_desc, 8);
+            if (r8 != 0) {
+                log_error("HUB", "Failed initial 8-byte Device Descriptor on Hub Port %u (error %d)", p, r8);
+                xhci_disable_slot(ctrl, child_slot);
+                mdelay(20);
+                continue;
+            }
+            uint16_t c_dev_ep0_max = child_dev.dev_desc.bMaxPacketSize0;
+            if (c_dev_ep0_max > 0 && c_dev_ep0_max != c_max_packet) {
+                log_info("HUB", "Updating Hub Port %u EP0 MaxPacketSize to %u via Evaluate Context...", p, c_dev_ep0_max);
+                *(uint32_t *)(child_in_ctx + 0) = 0;
+                *(uint32_t *)(child_in_ctx + 4) = (1U << 1);
+                c_ep0_ctx[1] = (c_ep0_ctx[1] & ~0xFFFF0000U) | ((uint32_t)c_dev_ep0_max << 16);
+                xhci_trb_t eval_cmd2;
+                eval_cmd2.parameter = (uintptr_t)child_in_ctx;
+                eval_cmd2.status = 0;
+                eval_cmd2.control = TRB_TYPE(TRB_EVAL_CTX_CMD) | ((uint32_t)child_slot << 24);
+                xhci_send_command(ctrl, &eval_cmd2, &c_addr_evt);
+                c_max_packet = c_dev_ep0_max;
+            }
+        }
+
+        c_req_dev.wLength = sizeof(usb_device_desc_t);
         int c_desc_res = usb_control_transfer(&child_dev, &c_req_dev, &child_dev.dev_desc, sizeof(usb_device_desc_t));
         if (c_desc_res != 0) {
             log_error("HUB", "Failed to retrieve Device Descriptor on Hub Port %u (error %d)", p, c_desc_res);
+            xhci_disable_slot(ctrl, child_slot);
+            mdelay(20);
             continue;
         }
 
@@ -1443,7 +1583,7 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
                  child_dev.dev_desc.idVendor, child_dev.dev_desc.idProduct,
                  child_dev.dev_desc.bDeviceClass, child_dev.dev_desc.bDeviceSubClass, child_dev.dev_desc.bDeviceProtocol);
 
-        // Update EP0 MaxPacket if needed
+        // Update EP0 MaxPacket if needed (SuperSpeed exponent or larger packet)
         uint16_t c_dev_ep0_max = child_dev.dev_desc.bMaxPacketSize0;
         if (child_speed >= 4) {
             c_dev_ep0_max = (1U << child_dev.dev_desc.bMaxPacketSize0);
@@ -1480,6 +1620,8 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
         int c_cfg_res = usb_control_transfer(&child_dev, &c_req_cfg, &c_cfg_hdr, 9);
         if (c_cfg_res != 0) {
             log_error("HUB", "Failed to retrieve Config Header on Hub Port %u (error %d)", p, c_cfg_res);
+            xhci_disable_slot(ctrl, child_slot);
+            mdelay(20);
             continue;
         }
 
@@ -1489,6 +1631,8 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
         c_cfg_res = usb_control_transfer(&child_dev, &c_req_cfg, child_dev.config_buf, c_total);
         if (c_cfg_res != 0) {
             log_error("HUB", "Failed to retrieve Config Descriptor on Hub Port %u (error %d)", p, c_cfg_res);
+            xhci_disable_slot(ctrl, child_slot);
+            mdelay(20);
             continue;
         }
         child_dev.config_len = c_total;
@@ -1551,10 +1695,13 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
                 int msc_init = usb_msc_init_device(&child_dev);
                 if (msc_init == 0) {
                     log_info("HUB", "Mass Storage device on Hub Port %u fully initialized!", p);
-                    if (out_msc_dev) {
+                    if (out_msc_dev && !found_any_msc) {
                         usb_local_memcpy(out_msc_dev, &child_dev, sizeof(usb_device_t));
                     }
-                    return 0; // Found and configured MSC device!
+                    if (g_hub_msc_callback) {
+                        g_hub_msc_callback(&child_dev, hub_dev->port_num);
+                    }
+                    found_any_msc = true;
                 } else {
                     log_error("HUB", "usb_msc_init_device failed on Hub Port %u (code %d)", p, msc_init);
                 }
@@ -1562,6 +1709,6 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
         }
     }
 
-    return -1;
+    return found_any_msc ? 0 : -1;
 }
 
