@@ -87,9 +87,6 @@ static int usb_msc_recv_csw(usb_device_t *dev, uint32_t expected_tag) {
 int usb_msc_init_lun(usb_device_t *dev, uint8_t lun) {
     if (!dev || !dev->has_msc) return -1;
 
-    usb_clear_endpoint_halt(dev, dev->msc_bulk_out_ep);
-    usb_clear_endpoint_halt(dev, dev->msc_bulk_in_ep);
-
     int res = -1;
     for (int retry = 0; retry < 5; retry++) {
         uint32_t tag = ++msc_tag_counter;
