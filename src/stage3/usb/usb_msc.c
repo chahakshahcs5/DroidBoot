@@ -44,8 +44,6 @@ static int usb_msc_send_cbw_lun(usb_device_t *dev, uint8_t lun, uint32_t tag, ui
     uint32_t sent = 0;
     int res = usb_bulk_transfer(dev, dev->msc_bulk_out_ep, &cbw, sizeof(cbw), &sent);
     if (res != 0) {
-        usb_clear_endpoint_halt(dev, dev->msc_bulk_out_ep);
-        usb_clear_endpoint_halt(dev, dev->msc_bulk_in_ep);
         log_error("MSC", "Failed to send CBW (error %d, LUN %u, Opcode %s)", res, lun, scsi_opcode_name(cb[0]));
     }
     return res;
@@ -322,7 +320,15 @@ static void msc_src_close(boot_source_t *src) {
 }
 
 boot_source_t *boot_source_msc_create_lun(usb_device_t *dev, uint8_t lun) {
-    if (!dev || !dev->has_msc) return NULL;
+    if (!dev || !dev->has_msc || dev->is_disconnected) return NULL;
+
+    uint32_t last_lba = 0;
+    uint32_t block_size = 512;
+    int cap_res = usb_msc_read_capacity_lun(dev, lun, &last_lba, &block_size);
+    if (cap_res != 0 || last_lba == 0 || block_size == 0) {
+        log_info("MSC", "LUN %u has no active media or capacity (code %d).", lun, cap_res);
+        return NULL;
+    }
 
     msc_source_priv_t *priv = (msc_source_priv_t *)kmalloc(sizeof(msc_source_priv_t));
     if (!priv) return NULL;
@@ -330,17 +336,11 @@ boot_source_t *boot_source_msc_create_lun(usb_device_t *dev, uint8_t lun) {
     priv->dev = dev;
     priv->lun = lun;
     priv->offset = 0;
-    priv->total_size = 0;
-    priv->block_size = 512;
+    priv->block_size = block_size;
+    priv->total_size = (uint64_t)(last_lba + 1) * block_size;
 
-    uint32_t last_lba = 0;
-    uint32_t block_size = 512;
-    if (usb_msc_read_capacity_lun(dev, lun, &last_lba, &block_size) == 0 && block_size > 0) {
-        priv->block_size = block_size;
-        priv->total_size = (uint64_t)(last_lba + 1) * block_size;
-        log_info("MSC", "USB MSC LUN %u Capacity: %u MB (%u sectors of %u B)",
-                 lun, (uint32_t)(priv->total_size >> 20), last_lba + 1, block_size);
-    }
+    log_info("MSC", "USB MSC LUN %u Capacity: %u MB (%u sectors of %u B)",
+             lun, (uint32_t)(priv->total_size >> 20), last_lba + 1, block_size);
 
     boot_source_t *src = (boot_source_t *)kmalloc(sizeof(boot_source_t));
     if (!src) {

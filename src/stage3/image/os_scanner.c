@@ -146,19 +146,23 @@ int os_add_custom_profile(os_entry_t *entry, const char *name, const char *filen
 // 1. Scan USB Block Storage (MSC) - Approach 1: On-Demand Direct Block Access
 // -----------------------------------------------------------------------------
 static void scan_usb_msc_device(usb_device_t *msc_dev, os_registry_t *reg) {
-    if (!msc_dev || !msc_dev->has_msc || reg->count >= MAX_OS_ENTRIES) return;
-
-    log_info("SCAN", "Inspecting USB Block Storage on Port %u...", msc_dev->port_num);
+    if (!msc_dev || !msc_dev->has_msc || msc_dev->is_disconnected || reg->count >= MAX_OS_ENTRIES) return;
 
     boot_source_t *msc_src = boot_source_msc_create(msc_dev);
     if (!msc_src) {
-        log_info("SCAN", "USB Mass Storage block interface unavailable.");
+        log_info("SCAN", "USB Mass Storage block interface unavailable on Port %u (no media).", msc_dev->port_num);
         return;
     }
 
     uint64_t dev_bytes = msc_src->size(msc_src);
     uint32_t dev_mb = (uint32_t)(dev_bytes / (1024 * 1024));
     log_info("SCAN", "USB Block Device Capacity: %u MB", dev_mb);
+
+    if (dev_bytes == 0 || dev_mb == 0) {
+        log_info("SCAN", "Port %u: USB Mass Storage device has 0 capacity. Skipping filesystem scan.", msc_dev->port_num);
+        msc_src->close(msc_src);
+        return;
+    }
 
     // Probe ISO9660 filesystem on the block device
     iso_boot_files_t files;

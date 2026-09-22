@@ -27,7 +27,11 @@ void usb_abort_control_endpoint(usb_device_t *dev) {
     stop_cmd.status = 0;
     stop_cmd.control = TRB_TYPE(TRB_STOP_ENDPOINT_CMD) | ((uint32_t)dev->slot_id << 24) | (1U << 16);
     xhci_trb_t evt;
-    xhci_send_command(dev->ctrl, &stop_cmd, &evt);
+    int stop_res = xhci_send_command(dev->ctrl, &stop_cmd, &evt);
+    if (stop_res == -100) {
+        dev->is_disconnected = true;
+        return;
+    }
 
     // 2. Drain any pending transfer events for this slot/EP0 from the event ring
     for (int i = 0; i < XHCI_EVENT_RING_TRBS; i++) {
@@ -66,7 +70,8 @@ void usb_abort_control_endpoint(usb_device_t *dev) {
     deq_cmd.parameter = (uintptr_t)dev->ep0_ring | 1U;
     deq_cmd.status = 0;
     deq_cmd.control = TRB_TYPE(TRB_SET_TR_DEQ_CMD) | ((uint32_t)dev->slot_id << 24) | (1U << 16);
-    xhci_send_command(dev->ctrl, &deq_cmd, &evt);
+    int deq_res = xhci_send_command(dev->ctrl, &deq_cmd, &evt);
+    if (deq_res == -100) dev->is_disconnected = true;
 }
 
 int usb_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *data, uint16_t len) {
@@ -1054,6 +1059,7 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
     }
 
     log_error("USB", "Bulk transfer timed out on EP 0x%02X!", ep_addr);
+    usb_abort_bulk_endpoint(dev, ep_addr);
     return -100;
 }
 

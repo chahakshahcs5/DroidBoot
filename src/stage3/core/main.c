@@ -153,7 +153,7 @@ static bool str_contains_nocase(const char *haystack, const char *needle) {
 }
 
 static bool is_boot_drive_msc(usb_device_t *dev) {
-    if (!dev || !dev->has_msc) return false;
+    if (!dev || !dev->has_msc || dev->is_disconnected) return false;
     static uint8_t sec[512];
 
     // Signature 1: Check LBA 1 (Stage 2 bootstrap) for "STG2" magic at offset 4
@@ -203,10 +203,26 @@ static bool is_boot_drive_msc(usb_device_t *dev) {
 }
 
 static void handle_msc_device(usb_device_t *msc_dev, uint8_t root_port) {
-    if (!msc_dev || !msc_dev->has_msc) return;
+    if (!msc_dev || !msc_dev->has_msc || msc_dev->is_disconnected) return;
     if (boot_msc_detected && msc_dev->slot_id == boot_msc_device.slot_id) {
         return; // Already registered and active! Do not overwrite live transfer rings.
     }
+
+    // Android devices with ADB: MSC LUN is unbacked/dormant until an ISO is selected and triggered via ADB.
+    // Probing MSC on an unbacked Android LUN causes bulk transfer timeouts on EP 0x01.
+    if (msc_dev->has_adb) {
+        log_info("STAGE3", "Port %u: Composite Android device detected. Deferring MSC until ISO mount.", root_port);
+        return;
+    }
+
+    // Verify the MSC device actually has active media / capacity before attempting reads
+    uint32_t last_lba = 0;
+    uint32_t block_sz = 512;
+    if (usb_msc_read_capacity(msc_dev, &last_lba, &block_sz) != 0 || last_lba == 0 || block_sz == 0) {
+        log_info("STAGE3", "Port %u: USB MSC device has no media mounted (0 MB). Skipping block registration.", root_port);
+        return;
+    }
+
     if (is_boot_drive_msc(msc_dev)) {
         if (!boot_msc_detected) {
             k_memcpy(&boot_msc_device, msc_dev, sizeof(usb_device_t));
