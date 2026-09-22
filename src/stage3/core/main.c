@@ -50,16 +50,25 @@ static void phone_save_boot_log(adb_session_t *adb, mtp_session_t *mtp) {
     if (s_in_save) return;
     s_in_save = true;
 
+    static uint32_t s_last_synced_bytes = 0;
+    uint32_t cur_bytes = disk_log_get_total_written();
+    if (cur_bytes == s_last_synced_bytes) {
+        s_in_save = false;
+        return;
+    }
+
     disk_log_flush();
 
     if (adb && adb->is_connected) {
         adb_save_log_to_phone(adb);
+        s_last_synced_bytes = disk_log_get_total_written();
         s_in_save = false;
         return;
     }
 
     if (mtp && mtp->session_active) {
         mtp_save_log_to_phone(mtp);
+        s_last_synced_bytes = disk_log_get_total_written();
         s_in_save = false;
         return;
     }

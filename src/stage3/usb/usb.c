@@ -841,23 +841,18 @@ int usb_abort_bulk_endpoint(usb_device_t *dev, uint8_t ep_addr) {
     bool is_in = (ep_addr & 0x80) != 0;
     uint8_t ep_ctx_idx = (ep_num * 2) + (is_in ? 1 : 0);
 
-    uint8_t ctx_sz = dev->ctrl->context_size ? dev->ctrl->context_size : 32;
-    void *dev_ctx = (void *)(uintptr_t)dev->ctrl->dcbaa[dev->slot_id];
-    uint32_t *ep_ctx = dev_ctx ? (uint32_t *)((uint8_t *)dev_ctx + (ep_ctx_idx + 1) * ctx_sz) : NULL;
-    uint8_t ep_state = ep_ctx ? (ep_ctx[0] & 0x07) : 0;
-
     xhci_trb_t evt;
 
     // 1. Transition endpoint to Stopped state:
-    // If Running (1), send Stop Endpoint Command (Type 15)
-    // If Halted (2), send Reset Endpoint Command (Type 14) to move from Halted to Stopped
-    if (ep_state == 1) { // RUNNING
-        xhci_trb_t stop_cmd;
-        stop_cmd.parameter = 0;
-        stop_cmd.status = 0;
-        stop_cmd.control = TRB_TYPE(TRB_STOP_ENDPOINT_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
-        xhci_send_command(dev->ctrl, &stop_cmd, &evt);
-    } else if (ep_state == 2) { // HALTED
+    // When aborting a timed-out transfer, the hardware transfer engine is running.
+    // Issue Stop Endpoint Command (Type 15) to transition to Stopped state.
+    // If the endpoint was halted, issue Reset Endpoint Command (Type 14).
+    xhci_trb_t stop_cmd;
+    stop_cmd.parameter = 0;
+    stop_cmd.status = 0;
+    stop_cmd.control = TRB_TYPE(TRB_STOP_ENDPOINT_CMD) | ((uint32_t)dev->slot_id << 24) | ((uint32_t)ep_ctx_idx << 16);
+    int stop_res = xhci_send_command(dev->ctrl, &stop_cmd, &evt);
+    if (stop_res != 0) {
         xhci_trb_t reset_cmd;
         reset_cmd.parameter = 0;
         reset_cmd.status = 0;
