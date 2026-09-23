@@ -315,6 +315,9 @@ void menu_render(boot_info_t *boot_info, xhci_controller_t *xhci,
             if (entry->approach == BOOT_APPROACH_BLOCK_ON_DEMAND) {
                 vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
                 printk(" Direct Block |\n");
+            } else if (entry->approach == BOOT_APPROACH_CHAINLOAD) {
+                vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+                printk(" Chainload    |\n");
             } else {
                 vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
                 printk(" In-RAM Cache |\n");

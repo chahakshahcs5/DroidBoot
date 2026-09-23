@@ -1,10 +1,28 @@
-# Boot Image Format & Disk Layout
+# Boot Image Format & Disk Sector Layout
 
-This document defines the exact on-disk sector layout of `boot.img` generated automatically by `tools/mkimage.py`.
+This document defines the exact on-disk sector layout of `boot.img` generated automatically by [tools/mkimage.py](file:///c:/Users/chaha/Projects/bootmanager/tools/mkimage.py).
 
 ---
 
-## Disk Sector Layout
+## 1. Visual Disk Structure
+
+```mermaid
+graph TD
+    subgraph Disk["boot.img (64 MiB / 131,072 Sectors)"]
+        LBA0["LBA 0: Stage 1 MBR (512 B)<br>• Bootstrap Assembly Code<br>• Partition Table (0x1BE)<br>• Boot Signature 0xAA55"]
+        LBA1["LBA 1-2: Stage 2 Bootstrap (1 KiB)<br>• Magic 'STG2'<br>• Load Address 0x00100000"]
+        LBA3["LBA 3-1023: Stage 3 C Kernel (~510 KiB)<br>• Flat 32-bit ELF binary<br>• xHCI, USB, MTP, ADB, FAT32, ISO"]
+        LBA1024["LBA 1024: Raw Log Header (512 B)<br>• Magic 'BOOTLOG!'<br>• Monotonic Flush Counter"]
+        LBA1025["LBA 1025-1151: Raw Log Sectors (63.5 KiB)<br>• Circular crash log buffer<br>• Survives FAT32 filesystem corruption"]
+        LBA1152["LBA 1152-2047: 1 MiB Alignment Padding"]
+        LBA2048["LBA 2048-END: Partition 1 (FAT32, ~63 MiB)<br>• VBR (LBA 2048) & FSInfo (2049)<br>• FAT1 (2080) & FAT2 (2336)<br>• Root Dir, BOOTLOG.TXT, BOOTCNT.DAT<br>• /BootManager/persistence/ profiles"]
+    end
+    LBA0 --> LBA1 --> LBA3 --> LBA1024 --> LBA1025 --> LBA1152 --> LBA2048
+```
+
+---
+
+## 2. Disk Sector Layout Table
 
 Standard sector size = 512 bytes (`0x200`). Total default size = 64 MiB (131,072 sectors).
 
@@ -39,7 +57,7 @@ LBA 1024            0x080000 - 0x0801FF       Raw Backup Log Header Sector (512 
                     Offset 0x014 - 0x017:     Flush Error Counter (uint32)
 
 LBA 1025 .. 1151    0x080200 - 0x08FFFF       Raw Persistent Backup Log Area (127 Sectors = ~63.5 KiB)
-                    Emergency fallback log readable via tools/read_log.py even if FAT32 corrupts.
+                    Emergency fallback log readable via tools/read_bootlog.py even if FAT32 corrupts.
 
 LBA 1152 .. 2047    0x090000 - 0x0FFFFF       Reserved Boot Alignment Padding (to 1 MiB boundary)
 
@@ -58,11 +76,10 @@ LBA 2048 .. END     0x100000 - END            Partition 1: FAT32 Boot Filesystem
 
 ---
 
-## Image Generation Constraints
+## 3. Image Generation Constraints
 
-1. **Deterministic Build**: Running `mkimage.py` on unchanged inputs produces byte-for-byte identical output.
+1. **Deterministic Build**: Running `tools/mkimage.py` on unchanged inputs produces byte-for-byte identical output.
 2. **Alignment & Padding**: Every stage is strictly padded to a 512-byte sector boundary.
 3. **Partition Table Integrity**: Stage 1 code size is strictly bounded to $\le 432$ bytes, preserving the patch table (`0x1B0`), the 64-byte standard MBR partition table (`0x1BE`), and the boot signature `0xAA55`.
 4. **Pre-Allocated Persistent Logs**: Both the FAT32 `BOOTLOG.TXT` cluster chain and the raw sector range (LBA 1024..1151) are formatted upfront to guarantee write targets without requiring complex runtime cluster allocation.
-5. **Zero Manual Editing**: Manual hex editing of the boot image is strictly forbidden. All offsets and headers are patched automatically.
-
+5. **Zero Manual Editing**: Manual hex editing of the boot image is strictly forbidden. All offsets and headers are patched automatically via [tools/mkimage.py](file:///c:/Users/chaha/Projects/bootmanager/tools/mkimage.py).

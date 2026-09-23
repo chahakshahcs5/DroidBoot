@@ -13,6 +13,12 @@ typedef struct iso_boot_files {
     bool     found_kernel;
     bool     found_initrd;
     bool     is_casper;
+    bool     is_windows;
+    uint32_t bootmgr_lba;
+    uint32_t bootmgr_size;
+    uint32_t boot_sector_lba;
+    uint32_t boot_sector_size;
+    char     volume_id[33];
     char     title[96];
     char     cmdline[384];
 } iso_boot_files_t;

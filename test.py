@@ -31,6 +31,8 @@ from tools.qemu_test import (
     test_multiprofile_persistence,
     test_custom_capacity_selection,
     test_in_ram_iso_boot,
+    test_kali_msc_boot,
+    test_windows_chainload_boot,
     test_dynamic_gadget_switch,
     test_sd_card_persistence,
     run_all_tests
@@ -65,7 +67,7 @@ def main():
     parser = argparse.ArgumentParser(description="BootManager Unified Test Orchestrator")
     parser.add_argument(
         "--suite",
-        choices=["all", "baseline", "persistence", "sizing", "ram", "gadget", "sdlog"],
+        choices=["all", "baseline", "persistence", "sizing", "ram", "gadget", "sdlog", "kali", "windows"],
         default="all",
         help="Test suite to execute (default: all)"
     )
@@ -90,11 +92,13 @@ def main():
     if args.list:
         print()
         print("Available Test Suites:")
-        print("  all          - Complete 6-phase automated regression suite")
+        print("  all          - Complete 8-phase automated regression suite")
         print("  baseline     - Phase 1-10 bootstrap, E820, PCI, xHCI, TUI menu, self-test")
         print("  persistence  - Persistence sub-menu and clean disposable session")
         print("  sizing       - Dynamic custom persistence overlay capacity sizing (2G-16G)")
         print("  ram          - In-RAM ISO streaming and phram parameter kernel handoff")
+        print("  kali         - Kali Linux 2026.2 installer UMS block boot & handoff test")
+        print("  windows      - Windows 10/11 installation media VBR chainloader test")
         print("  gadget       - Dynamic phone gadget mode-switching (MTP -> UMS via QMP)")
         print("  sdlog        - Verify live disk block writeback to SD card (FAT32 & raw sectors)")
         print()
@@ -120,6 +124,10 @@ def main():
         success = test_custom_capacity_selection(boot_img=target_img)
     elif suite == "ram":
         success = test_in_ram_iso_boot(boot_img=target_img)
+    elif suite == "kali":
+        success = test_kali_msc_boot(boot_img=target_img)
+    elif suite == "windows":
+        success = test_windows_chainload_boot(boot_img=target_img)
     elif suite == "gadget":
         success = test_dynamic_gadget_switch(boot_img=target_img)
     elif suite == "sdlog":

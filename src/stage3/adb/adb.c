@@ -453,7 +453,7 @@ int adb_probe_kernel_gadgets(adb_session_t *session, char *out_buf, uint32_t max
     return adb_execute_shell(session, cmd, out_buf, max_len);
 }
 
-int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path, const char *profile_path) {
+int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path, const char *profile_path, bool is_cdrom) {
     if (!session || !session->is_connected) return -1;
 
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
@@ -544,7 +544,8 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path, const
     const char *req_name = (iso_path && iso_path[0]) ? iso_path : "";
     const char *prof_name = (profile_path && profile_path[0]) ? profile_path : "";
     bool is_raw_img = (req_name[0] && adb_str_ends_with_nocase(req_name, ".img"));
-    int ro_val = is_raw_img ? 0 : 1;
+    int cdrom_val = is_cdrom ? 1 : 0;
+    int ro_val = is_cdrom ? 1 : (is_raw_img ? 0 : 1);
 
     if (!is_sysfs) {
         snprintf(switch_cmd, sizeof(switch_cmd),
@@ -557,16 +558,16 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path, const
                  "if [ -z \"$F\" ] || [ ! -f \"$F\" ]; then echo ERR_NO_FILE; exit 2; fi; "
                  "L0=\"%s/functions/%s/lun.0\"; "
                  "mkdir -p \"$L0\" 2>/dev/null; "
-                 "echo \"$F\" > \"$L0/file\" 2>/dev/null; "
+                 "echo %d > \"$L0/cdrom\" 2>/dev/null; "
                  "echo %d > \"$L0/ro\" 2>/dev/null; "
-                 "echo 0 > \"$L0/cdrom\" 2>/dev/null; "
+                 "echo \"$F\" > \"$L0/file\" 2>/dev/null; "
                  "if [ ! -s \"$L0/file\" ]; then echo ERR_LUN_FAIL; exit 3; fi; "
                  "L1=\"%s/functions/%s/lun.1\"; "
                  "if [ -n \"$PROF\" ] && [ -f \"$PROF\" ]; then "
                  "  mkdir -p \"$L1\" 2>/dev/null; "
-                 "  echo \"$PROF\" > \"$L1/file\" 2>/dev/null; "
-                 "  echo 0 > \"$L1/ro\" 2>/dev/null; "
                  "  echo 0 > \"$L1/cdrom\" 2>/dev/null; "
+                 "  echo 0 > \"$L1/ro\" 2>/dev/null; "
+                 "  echo \"$PROF\" > \"$L1/file\" 2>/dev/null; "
                  "fi; "
                  "C=$(ls -d %s/configs/*.* 2>/dev/null | head -1); "
                  "U=$(cat %s/UDC 2>/dev/null); "
@@ -579,7 +580,7 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path, const
                  "setprop sys.usb.state mass_storage,adb 2>/dev/null || setprop sys.usb.state mass_storage 2>/dev/null; "
                  "echo \"$U\" > %s/UDC 2>/dev/null) &"
                  "'",
-                 req_name, prof_name, gadget_dir, func_name, ro_val,
+                 req_name, prof_name, gadget_dir, func_name, cdrom_val, ro_val,
                  gadget_dir, func_name, gadget_dir, gadget_dir,
                  gadget_dir, gadget_dir, func_name, gadget_dir, gadget_dir, gadget_dir);
     } else {
@@ -598,15 +599,15 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path, const
                  "if [ -z \"$L\" ]; then echo ERR_NO_SYSFS_LUN; exit 3; fi; "
                  "echo OK_SWITCHING:\"$F\"; "
                  "(sleep 2; echo 0 > /sys/class/android_usb/android0/enable 2>/dev/null; "
-                 "echo \"$F\" > \"$L/file\" 2>/dev/null; echo %d > \"$L/ro\" 2>/dev/null; echo 0 > \"$L/cdrom\" 2>/dev/null; "
+                 "echo %d > \"$L/cdrom\" 2>/dev/null; echo %d > \"$L/ro\" 2>/dev/null; echo \"$F\" > \"$L/file\" 2>/dev/null; "
                  "if [ -n \"$PROF\" ] && [ -f \"$PROF\" ]; then "
+                 "  echo 0 > \"$L/../lun1/cdrom\" 2>/dev/null; echo 0 > \"$L/../lun1/ro\" 2>/dev/null; "
                  "  echo \"$PROF\" > \"$L/../lun1/file\" 2>/dev/null; "
-                 "  echo 0 > \"$L/../lun1/ro\" 2>/dev/null; "
                  "fi; "
                  "echo mass_storage,adb > /sys/class/android_usb/android0/functions 2>/dev/null || echo mass_storage > /sys/class/android_usb/android0/functions 2>/dev/null; "
                  "echo 1 > /sys/class/android_usb/android0/enable 2>/dev/null) &"
                  "'",
-                 req_name, prof_name, ro_val);
+                 req_name, prof_name, cdrom_val, ro_val);
     }
 
     char switch_out[256] = {0};
@@ -646,7 +647,7 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path, const
     return 0;
 }
 
-int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path, const char *profile_path) {
+int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path, const char *profile_path, bool is_cdrom) {
     if (!session || !session->is_connected) return -1;
 
     char req_name[128] = {0};
@@ -660,15 +661,16 @@ int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path, c
 
     const char *prof_name = (profile_path && profile_path[0]) ? profile_path : "";
     bool is_raw_img = (req_name[0] && adb_str_ends_with_nocase(req_name, ".img"));
-    int ro_val = is_raw_img ? 0 : 1;
+    int cdrom_val = is_cdrom ? 1 : 0;
+    int ro_val = is_cdrom ? 1 : (is_raw_img ? 0 : 1);
 
-    log_info("ADB", "Hot-swapping USB Mass Storage: LUN0='%s' (ro=%d), LUN1='%s'...",
-             req_name[0] ? req_name : "*.iso", ro_val, prof_name[0] ? prof_name : "(none)");
+    log_info("ADB", "Hot-swapping USB Mass Storage: LUN0='%s' (ro=%d, cdrom=%d), LUN1='%s'...",
+             req_name[0] ? req_name : "*.iso", ro_val, cdrom_val, prof_name[0] ? prof_name : "(none)");
 
     static char update_cmd[4096];
     snprintf(update_cmd, sizeof(update_cmd),
              "su -c '"
-             "ISO=\"%s\"; PROF=\"%s\"; RO=%d; "
+             "ISO=\"%s\"; PROF=\"%s\"; RO=%d; CDROM=%d; "
              "if [ -f \"$ISO\" ]; then F=\"$ISO\"; else "
              "  F=$(find /sdcard /storage/emulated/0 /mnt/media_rw -name \"$ISO\" 2>/dev/null | head -1); "
              "  [ -z \"$F\" ] && [ -f \"/sdcard/Download/$ISO\" ] && F=\"/sdcard/Download/$ISO\"; "
@@ -679,14 +681,15 @@ int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path, c
              "for M in /config/usb_gadget/*/functions/mass_storage* /sys/kernel/config/usb_gadget/*/functions/mass_storage*; do "
              "  if [ -d \"$M\" ]; then "
              "    echo \"\" > \"$M/lun.0/file\" 2>/dev/null; "
-             "    echo \"$F\" > \"$M/lun.0/file\" 2>/dev/null; "
+             "    echo $CDROM > \"$M/lun.0/cdrom\" 2>/dev/null; "
              "    echo $RO > \"$M/lun.0/ro\" 2>/dev/null; "
+             "    echo \"$F\" > \"$M/lun.0/file\" 2>/dev/null; "
              "    if [ -n \"$PROF\" ] && [ -f \"$PROF\" ]; then "
              "      mkdir -p \"$M/lun.1\" 2>/dev/null; "
              "      echo \"\" > \"$M/lun.1/file\" 2>/dev/null; "
-             "      echo \"$PROF\" > \"$M/lun.1/file\" 2>/dev/null; "
-             "      echo 0 > \"$M/lun.1/ro\" 2>/dev/null; "
              "      echo 0 > \"$M/lun.1/cdrom\" 2>/dev/null; "
+             "      echo 0 > \"$M/lun.1/ro\" 2>/dev/null; "
+             "      echo \"$PROF\" > \"$M/lun.1/file\" 2>/dev/null; "
              "    else "
              "      echo \"\" > \"$M/lun.1/file\" 2>/dev/null; "
              "    fi; "
@@ -698,12 +701,14 @@ int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path, c
              "  for L in /sys/class/android_usb/android0/f_mass_storage/lun /sys/class/android_usb/android0/f_mass_storage/lun0; do "
              "    if [ -f \"$L/file\" ]; then "
              "      echo \"\" > \"$L/file\" 2>/dev/null; "
-             "      echo \"$F\" > \"$L/file\" 2>/dev/null; "
+             "      echo $CDROM > \"$L/cdrom\" 2>/dev/null; "
              "      echo $RO > \"$L/ro\" 2>/dev/null; "
+             "      echo \"$F\" > \"$L/file\" 2>/dev/null; "
              "      if [ -n \"$PROF\" ] && [ -f \"$PROF\" ]; then "
              "        echo \"\" > \"$L/../lun1/file\" 2>/dev/null; "
-             "        echo \"$PROF\" > \"$L/../lun1/file\" 2>/dev/null; "
+             "        echo 0 > \"$L/../lun1/cdrom\" 2>/dev/null; "
              "        echo 0 > \"$L/../lun1/ro\" 2>/dev/null; "
+             "        echo \"$PROF\" > \"$L/../lun1/file\" 2>/dev/null; "
              "      fi; "
              "      DONE=1; "
              "      break; "
@@ -711,7 +716,7 @@ int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path, c
              "  done; "
              "fi; "
              "if [ $DONE -eq 1 ]; then echo OK_UPDATED:\"$F\"; exit 0; else echo ERR_NO_LUN; exit 3; fi;'",
-             req_name, prof_name, ro_val);
+             req_name, prof_name, ro_val, cdrom_val);
 
     char out[256] = {0};
     int res = adb_execute_shell(session, update_cmd, out, sizeof(out));

@@ -467,16 +467,83 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
 
     iso_boot_files_t iso_files;
     int r = iso_find_boot_files(msc_src, &iso_files);
-    if (r != 0 || !iso_files.found_kernel) {
+    if (r != 0 || (!iso_files.found_kernel && !iso_files.is_windows)) {
         log_error("BOOT", "No bootable kernel found on USB block device!");
         sound_error_tone();
         msc_src->close(msc_src);
         return;
     }
 
+    if (iso_files.is_windows) {
+        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        log_info("BOOT", "==========================================================");
+        log_info("BOOT", "  BOOTABLE WINDOWS MEDIA DETECTED ON USB BLOCK DEVICE!    ");
+        log_info("BOOT", "  * Distro Type    : Microsoft Windows Setup / WinPE       ");
+        log_info("BOOT", "  * Volume ID      : %s", iso_files.volume_id);
+        log_info("BOOT", "  * Boot Sector LBA: %u (%u bytes)", iso_files.boot_sector_lba, iso_files.boot_sector_size);
+        log_info("BOOT", "  * Mode           : Real-Mode VBR Chainload               ");
+        log_info("BOOT", "==========================================================");
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+        // Read boot sector (VBR / El Torito boot sector) into 0x00007C00
+        uint8_t *vbr_buf = (uint8_t *)0x00007C00;
+        uint64_t vbr_offset = (uint64_t)iso_files.boot_sector_lba * 2048;
+        uint32_t read_size = (iso_files.boot_sector_size >= 512) ? iso_files.boot_sector_size : 512;
+        if (read_size > 8192) read_size = 8192;
+        msc_src->seek(msc_src, vbr_offset);
+        uint32_t bytes_read = msc_src->read(msc_src, vbr_buf, read_size);
+
+        msc_src->close(msc_src);
+
+        if (bytes_read < 512) {
+            log_error("BOOT", "Failed to read boot sector from Windows media (%u bytes read).", bytes_read);
+            sound_error_tone();
+            return;
+        }
+
+        // Verify boot sector magic 0x55, 0xAA (little-endian 0xAA55)
+        uint32_t sig_offset = (bytes_read >= 4096) ? 4094 : 510;
+        if (vbr_buf[sig_offset] != 0x55 || vbr_buf[sig_offset + 1] != 0xAA) {
+            log_warn("BOOT", "Boot sector signature not 0xAA55 (got 0x%02X%02X at offset %u). Patching standard signature...",
+                     vbr_buf[sig_offset + 1], vbr_buf[sig_offset], sig_offset);
+            vbr_buf[sig_offset] = 0x55;
+            vbr_buf[sig_offset + 1] = 0xAA;
+        }
+
+        // Determine BIOS drive number
+        uint8_t boot_drive = (boot_info && boot_info->boot_drive) ? (uint8_t)boot_info->boot_drive : 0x80;
+        static uint8_t test_buf[512];
+        const uint8_t cand_drives[] = { 0x80, 0x81, 0x82, 0x83, 0x90, 0x91, 0xE0 };
+        for (size_t cd = 0; cd < sizeof(cand_drives); cd++) {
+            uint8_t cand = cand_drives[cd];
+            if (bios_disk_read(cand, (uint64_t)iso_files.boot_sector_lba, 1, test_buf) == 0) {
+                if (k_memcmp(test_buf, vbr_buf, 512) == 0) {
+                    boot_drive = cand;
+                    log_info("BOOT", "Matched BIOS drive number 0x%02X via INT 13h sector match.", boot_drive);
+                    break;
+                }
+            }
+        }
+
+        log_info("BOOT", "Boot sector loaded at 0x00007C00 with valid signature.");
+        log_info("BOOT", "Flushing logs and halting USB controller for BIOS handoff...");
+        disk_log_flush_with_feedback();
+        phone_save_boot_log(&active_adb_session, &active_mtp_session);
+        xhci_stop(&xhci_ctrl);
+        sound_silence();
+
+        log_info("BOOT", "Handing off to Real-Mode VBR Chainloader (Drive 0x%02X)...", boot_drive);
+
+        bios_chainload(boot_drive, 0x00007C00);
+        return;
+    }
+
     log_info("BOOT", "==========================================================");
     log_info("BOOT", "  BOOTABLE OS DETECTED ON USB BLOCK DEVICE!               ");
-    log_info("BOOT", "  * Distro Type    : %s", iso_files.is_casper ? "Ubuntu / Casper Live (6GB)" : "Linux Live System");
+    const char *distro_desc = "Linux Live System";
+    if (iso_files.is_casper) distro_desc = "Ubuntu / Casper Live (6GB)";
+    else if (str_contains_nocase(iso_files.volume_id, "kali") || str_contains_nocase(iso_files.title, "kali")) distro_desc = "Kali Linux Installer";
+    log_info("BOOT", "  * Distro Type    : %s", distro_desc);
     log_info("BOOT", "  * Kernel LBA     : %u (Size: %u MB)", iso_files.kernel_lba, iso_files.kernel_size / 1024 / 1024);
     log_info("BOOT", "  * Initramfs LBA  : %u (Size: %u MB)", iso_files.initrd_lba, iso_files.initrd_size / 1024 / 1024);
     log_info("BOOT", "  * Mode           : Direct Block Access (0 MB OS in RAM!) ");
@@ -816,8 +883,10 @@ static void boot_from_android_mtp(os_entry_t *selected, boot_info_t *boot_info, 
 
     iso_boot_files_t iso_files;
     if (iso_find_boot_files(mtp_src, &iso_files) == 0 && iso_files.found_kernel) {
-        log_info("BOOT", "Bootable ISO detected! (%s)",
-                 iso_files.is_casper ? "Ubuntu / Casper Live" : "Alpine Linux");
+        const char *distro_desc = "Alpine Linux";
+        if (iso_files.is_casper) distro_desc = "Ubuntu / Casper Live";
+        else if (str_contains_nocase(iso_files.volume_id, "kali") || str_contains_nocase(iso_files.title, "kali")) distro_desc = "Kali Linux Installer";
+        log_info("BOOT", "Bootable ISO detected! (%s)", distro_desc);
         if (prof) {
             log_info("BOOT", "  * Persistence    : %s (%s)", prof->profile_name, prof->filename);
         }
@@ -1286,7 +1355,7 @@ void c_main(boot_info_t *boot_info) {
 
                 // If phone is ALREADY operating as USB Mass Storage, check if selected image is already active!
                 if (external_msc_detected && external_usb_dev.has_msc) {
-                    if (sel_img->approach == BOOT_APPROACH_BLOCK_ON_DEMAND && sel_img->storage_type == OS_STORAGE_BLOCK_USB) {
+                    if ((sel_img->approach == BOOT_APPROACH_BLOCK_ON_DEMAND || sel_img->approach == BOOT_APPROACH_CHAINLOAD) && sel_img->storage_type == OS_STORAGE_BLOCK_USB) {
                         vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
                         log_info("BOOT", "Image '%s' is already active on USB Mass Storage LUN 0!", sel_img->title);
                         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
@@ -1301,7 +1370,7 @@ void c_main(boot_info_t *boot_info) {
                     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                     disk_log_flush();
 
-                    int upd_res = adb_update_mass_storage_file(&active_adb_session, sel_img->filename, prof_path[0] ? prof_path : NULL);
+                    int upd_res = adb_update_mass_storage_file(&active_adb_session, sel_img->filename, prof_path[0] ? prof_path : NULL, sel_img->is_windows);
                     if (upd_res == 0) {
                         for (int w = 0; w < 200000; w++) io_wait();
                         uint32_t last_lba = 0, block_sz = 0;
@@ -1325,7 +1394,7 @@ void c_main(boot_info_t *boot_info) {
                          sel_img->filename, prof_path[0] ? prof->filename : "Clean Session");
                 vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                 disk_log_flush();
-                int trg_res = adb_trigger_mass_storage(&active_adb_session, sel_img->filename, prof_path[0] ? prof_path : NULL);
+                int trg_res = adb_trigger_mass_storage(&active_adb_session, sel_img->filename, prof_path[0] ? prof_path : NULL, sel_img->is_windows);
                 disk_log_flush();
 
                 if (trg_res != 0 && trg_res != -2) {
@@ -1409,7 +1478,7 @@ void c_main(boot_info_t *boot_info) {
                     bool ums_booted = false;
 
                     // 1. If selected image is ALREADY on the active USB block storage, boot directly without touching ADB!
-                    if (selected->approach == BOOT_APPROACH_BLOCK_ON_DEMAND && selected->storage_type == OS_STORAGE_BLOCK_USB) {
+                    if ((selected->approach == BOOT_APPROACH_BLOCK_ON_DEMAND || selected->approach == BOOT_APPROACH_CHAINLOAD) && selected->storage_type == OS_STORAGE_BLOCK_USB) {
                         usb_device_t *target_msc = selected->usb_dev ? selected->usb_dev : active_msc_dev;
                         if (target_msc && target_msc->has_msc) {
                             vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
@@ -1431,7 +1500,7 @@ void c_main(boot_info_t *boot_info) {
                             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                             disk_log_flush();
 
-                            int upd = adb_update_mass_storage_file(&active_adb_session, selected->filename, prof_path[0] ? prof_path : NULL);
+                            int upd = adb_update_mass_storage_file(&active_adb_session, selected->filename, prof_path[0] ? prof_path : NULL, selected->is_windows);
                             if (upd == 0) {
                                 for (int w = 0; w < 200000; w++) io_wait();
                                 uint32_t last_lba = 0, block_sz = 0;
@@ -1458,7 +1527,7 @@ void c_main(boot_info_t *boot_info) {
                     }
 
                     // If image is on Android phone/MTP and ADB is available, try Root USB Mass Storage switch first!
-                    if (!ums_booted && (selected->approach == BOOT_APPROACH_MTP_IN_RAM || selected->storage_type == OS_STORAGE_MTP_ANDROID)) {
+                    if (!ums_booted && (selected->approach == BOOT_APPROACH_MTP_IN_RAM || selected->approach == BOOT_APPROACH_CHAINLOAD || selected->storage_type == OS_STORAGE_MTP_ANDROID)) {
                         if (active_adb_session.is_connected) {
                             vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
                             log_info("BOOT", "Root ADB active! Attaching '%s' to USB Mass Storage (Profile: '%s')...",
@@ -1467,7 +1536,7 @@ void c_main(boot_info_t *boot_info) {
                             disk_log_flush();
                             phone_save_boot_log(&active_adb_session, &active_mtp_session);
 
-                            int trg = adb_trigger_mass_storage(&active_adb_session, selected->filename, prof_path[0] ? prof_path : NULL);
+                            int trg = adb_trigger_mass_storage(&active_adb_session, selected->filename, prof_path[0] ? prof_path : NULL, selected->is_windows);
                             disk_log_flush();
 
                             // Try to reprobe as MSC regardless of trigger result.
@@ -1523,7 +1592,7 @@ void c_main(boot_info_t *boot_info) {
                     }
 
                     if (!ums_booted) {
-                        if (selected->approach == BOOT_APPROACH_BLOCK_ON_DEMAND) {
+                        if (selected->approach == BOOT_APPROACH_BLOCK_ON_DEMAND || selected->approach == BOOT_APPROACH_CHAINLOAD) {
                             if (selected->storage_type == OS_STORAGE_BLOCK_USB) {
                                 boot_from_usb_msc(selected->usb_dev, boot_info, prof);
                             } else if (selected->storage_type == OS_STORAGE_BLOCK_SD) {

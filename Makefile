@@ -66,7 +66,9 @@ $(BUILD_DIR)/stage1.bin: $(SRC_DIR)/stage1/stage1.asm | $(BUILD_DIR)
 $(BUILD_DIR)/stage2.bin: $(SRC_DIR)/stage2/stage2.asm | $(BUILD_DIR)
 	$(NASM) -f bin $< -o $@
 
-$(BUILD_DIR)/release/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+STAGE3_HEADERS := $(wildcard $(SRC_DIR)/include/*.h) $(wildcard $(SRC_DIR)/stage3/*/*.h)
+
+$(BUILD_DIR)/release/%.o: $(SRC_DIR)/%.c $(STAGE3_HEADERS) | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS_RELEASE) -c $< -o $@
 
@@ -74,7 +76,7 @@ $(BUILD_DIR)/release/%.o: $(SRC_DIR)/%.S | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS_RELEASE) -c $< -o $@
 
-$(BUILD_DIR)/debug/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+$(BUILD_DIR)/debug/%.o: $(SRC_DIR)/%.c $(STAGE3_HEADERS) | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS_DEBUG) -c $< -o $@
 

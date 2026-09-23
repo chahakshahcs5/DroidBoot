@@ -26,6 +26,7 @@ typedef struct bios_dap {
 
 // Thunk assembly interface
 int bios_int13_call(uint8_t drive, uint32_t dap_phys, uint8_t cmd);
+void bios_chainload(uint8_t drive_num, uint32_t boot_sector_phys) __attribute__((noreturn));
 
 // High-level disk read/write functions
 int bios_disk_read(uint8_t drive, uint64_t lba, uint16_t count, void *dst);

@@ -13,6 +13,61 @@ static void k_memset(void *dst, int val, size_t n) {
     for (size_t i = 0; i < n; i++) d[i] = (uint8_t)val;
 }
 
+static int k_memcmp(const void *s1, const void *s2, size_t n) {
+    const uint8_t *p1 = (const uint8_t *)s1;
+    const uint8_t *p2 = (const uint8_t *)s2;
+    for (size_t i = 0; i < n; i++) {
+        if (p1[i] != p2[i]) return (int)p1[i] - (int)p2[i];
+    }
+    return 0;
+}
+
+static bool iso_parse_el_torito(boot_source_t *iso_src, uint32_t *out_boot_lba, uint32_t *out_boot_size) {
+    if (!iso_src || !out_boot_lba || !out_boot_size) return false;
+
+    // Sector 17 (0x8800) is the Boot Record Volume Descriptor (BRVD)
+    uint8_t sector[2048];
+    if (iso_src->seek(iso_src, 17 * 2048) != 0) return false;
+    if (iso_src->read(iso_src, sector, 2048) != 2048) return false;
+
+    // Check type 0, "CD001", and "EL TORITO SPECIFICATION"
+    if (sector[0] != 0 || sector[1] != 'C' || sector[2] != 'D' || sector[3] != '0' ||
+        sector[4] != '0' || sector[5] != '1') {
+        return false;
+    }
+    if (k_memcmp(&sector[7], "EL TORITO SPECIFICATION", 23) != 0) {
+        return false;
+    }
+
+    uint32_t cat_sector = *(uint32_t *)&sector[71];
+    if (cat_sector == 0) return false;
+
+    // Read the Boot Catalog
+    if (iso_src->seek(iso_src, (uint64_t)cat_sector * 2048) != 0) return false;
+    if (iso_src->read(iso_src, sector, 2048) != 2048) return false;
+
+    // Validation entry must have Header ID 0x01 and key 0x55, 0xAA
+    if (sector[0] != 0x01 || sector[30] != 0x55 || sector[31] != 0xAA) {
+        return false;
+    }
+
+    // Initial / Default Entry at offset 32
+    uint8_t bootable = sector[32];
+    uint16_t sector_count = *(uint16_t *)&sector[38];
+    uint32_t load_rba = *(uint32_t *)&sector[40];
+
+    if (bootable == 0x88 && load_rba > 0) {
+        *out_boot_lba = load_rba;
+        uint32_t byte_count = (sector_count > 0) ? ((uint32_t)sector_count * 512) : 2048;
+        if (byte_count < 512) byte_count = 512;
+        if (byte_count > 8192) byte_count = 8192;
+        *out_boot_size = byte_count;
+        return true;
+    }
+
+    return false;
+}
+
 static bool str_eq_nocase_len(const char *a, const char *b, uint32_t b_len) {
     if (!a || !b) return false;
     uint32_t i = 0;
@@ -30,6 +85,20 @@ static bool str_prefix_nocase(const char *str, const char *prefix) {
         str++; prefix++;
     }
     return true;
+}
+
+static bool str_contains_nocase(const char *str, const char *sub) {
+    if (!str || !sub) return false;
+    if (!*sub) return true;
+    for (int i = 0; str[i]; i++) {
+        int j = 0;
+        while (str[i + j] && sub[j]) {
+            if (to_lower((unsigned char)str[i + j]) != to_lower((unsigned char)sub[j])) break;
+            j++;
+        }
+        if (!sub[j]) return true;
+    }
+    return false;
 }
 
 /* Extract real name from directory record (Rock Ridge NM or standard 8.3/ISO name) */
@@ -206,12 +275,30 @@ int iso_find_boot_files(boot_source_t *iso_src, iso_boot_files_t *out_files) {
     out_files->found_kernel = false;
     out_files->found_initrd = false;
     out_files->is_casper = false;
+    out_files->is_windows = false;
+    out_files->bootmgr_lba = 0;
+    out_files->bootmgr_size = 0;
+    out_files->boot_sector_lba = 0;
+    out_files->boot_sector_size = 512;
     out_files->kernel_lba = 0;
     out_files->kernel_size = 0;
     out_files->initrd_lba = 0;
     out_files->initrd_size = 0;
+    out_files->volume_id[0] = '\0';
     out_files->title[0] = '\0';
     out_files->cmdline[0] = '\0';
+
+    // Step 0: Read Sector 16 (0x8000) - Primary Volume Descriptor to grab Volume ID
+    uint8_t pvd_sector[2048];
+    if (iso_src->seek(iso_src, 0x8000) == 0 && iso_src->read(iso_src, pvd_sector, 2048) == 2048) {
+        if (pvd_sector[1] == 'C' && pvd_sector[2] == 'D' && pvd_sector[3] == '0' && pvd_sector[4] == '0' && pvd_sector[5] == '1') {
+            int vlen = 32;
+            while (vlen > 0 && (pvd_sector[40 + vlen - 1] == ' ' || pvd_sector[40 + vlen - 1] == '\0')) vlen--;
+            for (int i = 0; i < vlen; i++) out_files->volume_id[i] = (char)pvd_sector[40 + i];
+            out_files->volume_id[vlen] = '\0';
+            log_info("ISO", "Volume ID: '%s'", out_files->volume_id);
+        }
+    }
 
     // Step 1: Attempt to dynamically discover and parse bootloader config from ISO
     static parsed_boot_config_t cfg;
@@ -237,10 +324,29 @@ int iso_find_boot_files(boot_source_t *iso_src, iso_boot_files_t *out_files) {
         }
 
         if (out_files->found_kernel) {
-            for (int i = 0; entry->title[i] && i < 95; i++) out_files->title[i] = entry->title[i];
-            out_files->title[95] = '\0';
-            for (int i = 0; entry->cmdline[i] && i < 383; i++) out_files->cmdline[i] = entry->cmdline[i];
-            out_files->cmdline[383] = '\0';
+            bool is_kali = str_contains_nocase(out_files->volume_id, "kali");
+            if (is_kali && str_contains_nocase(entry->title, "graphical")) {
+                const char *ktitle = "Kali Linux (Graphical Install)";
+                for (int i = 0; ktitle[i] && i < 95; i++) out_files->title[i] = ktitle[i];
+                out_files->title[95] = '\0';
+            } else if (is_kali && str_contains_nocase(entry->title, "install")) {
+                const char *ktitle = "Kali Linux (Install)";
+                for (int i = 0; ktitle[i] && i < 95; i++) out_files->title[i] = ktitle[i];
+                out_files->title[95] = '\0';
+            } else {
+                int t_idx = 0;
+                while (entry->title[t_idx] && t_idx < 95) {
+                    out_files->title[t_idx] = entry->title[t_idx];
+                    t_idx++;
+                }
+                out_files->title[t_idx] = '\0';
+            }
+            int c_idx = 0;
+            while (entry->cmdline[c_idx] && c_idx < 383) {
+                out_files->cmdline[c_idx] = entry->cmdline[c_idx];
+                c_idx++;
+            }
+            out_files->cmdline[c_idx] = '\0';
             if (str_prefix_nocase(entry->cmdline, "boot=casper") ||
                 str_prefix_nocase(entry->kernel_path, "/casper/")) {
                 out_files->is_casper = true;
@@ -264,6 +370,7 @@ int iso_find_boot_files(boot_source_t *iso_src, iso_boot_files_t *out_files) {
     const char *search_dirs[] = {
         "/casper",
         "/boot",
+        "/install.amd",
         "/live",
         "/arch/boot/x86_64",
         "/isolinux",
@@ -271,7 +378,7 @@ int iso_find_boot_files(boot_source_t *iso_src, iso_boot_files_t *out_files) {
         ""
     };
 
-    for (int i = 0; i < 7 && !out_files->found_kernel; i++) {
+    for (int i = 0; i < 8 && !out_files->found_kernel; i++) {
         uint32_t dir_lba = root_lba;
         uint32_t dir_size = root_size;
 
@@ -290,5 +397,51 @@ int iso_find_boot_files(boot_source_t *iso_src, iso_boot_files_t *out_files) {
         search_dir_heuristic(iso_src, dir_lba, dir_size, out_files, sector);
     }
 
-    return out_files->found_kernel ? 0 : -9;
+    if (out_files->found_kernel && out_files->title[0] == '\0') {
+        if (str_contains_nocase(out_files->volume_id, "kali")) {
+            const char *ktitle = "Kali Linux Installer";
+            for (int i = 0; ktitle[i] && i < 95; i++) out_files->title[i] = ktitle[i];
+            out_files->title[95] = '\0';
+        }
+    }
+
+    if (!out_files->found_kernel) {
+        // Check for Windows boot files / volume signatures
+        uint32_t bm_lba = 0, bm_sz = 0;
+        bool has_bootmgr = (iso_find_file(iso_src, "/bootmgr", &bm_lba, &bm_sz) == 0 && bm_sz > 0);
+        if (!has_bootmgr) {
+            has_bootmgr = (iso_find_file(iso_src, "/boot/bcd", &bm_lba, &bm_sz) == 0);
+        }
+        if (!has_bootmgr) {
+            has_bootmgr = (iso_find_file(iso_src, "/sources/boot.wim", &bm_lba, &bm_sz) == 0);
+        }
+        bool has_win_vol = (str_contains_nocase(out_files->volume_id, "CCCOMA") ||
+                            str_contains_nocase(out_files->volume_id, "ESD-ISO") ||
+                            str_contains_nocase(out_files->volume_id, "WIN") ||
+                            str_contains_nocase(out_files->volume_id, "WINDOWS"));
+
+        if (has_bootmgr || has_win_vol) {
+            out_files->is_windows = true;
+            out_files->bootmgr_lba = bm_lba;
+            out_files->bootmgr_size = bm_sz;
+            out_files->boot_sector_lba = 0;
+            out_files->boot_sector_size = 512;
+
+            uint32_t el_lba = 0, el_size = 0;
+            if (iso_parse_el_torito(iso_src, &el_lba, &el_size)) {
+                out_files->boot_sector_lba = el_lba;
+                out_files->boot_sector_size = el_size;
+                log_info("ISO", "  El Torito Boot Image discovered: LBA %u (%u bytes)", el_lba, el_size);
+            }
+
+            const char *wtitle = "Windows 10/11 Installer";
+            for (int i = 0; wtitle[i] && i < 95; i++) out_files->title[i] = wtitle[i];
+            out_files->title[95] = '\0';
+            log_info("ISO", "  Windows installation media verified (Volume: '%s', boot LBA %u)",
+                     out_files->volume_id, out_files->boot_sector_lba);
+            return 0;
+        }
+    }
+
+    return (out_files->found_kernel || out_files->is_windows) ? 0 : -9;
 }

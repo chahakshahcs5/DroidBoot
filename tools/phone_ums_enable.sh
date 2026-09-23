@@ -27,7 +27,7 @@ fi
 
 if [ -z "$ISO_TARGET" ] || [ ! -f "$ISO_TARGET" ]; then
     echo "[-] No ISO image found! Please specify the path:"
-    echo "    su -c \"sh $0 /sdcard/Download/alpine-standard-3.24.2-x86_64.iso\""
+    echo "    su -c \"sh $0 /sdcard/Download/kali-linux-2026.2-installer-amd64.iso\""
     exit 2
 fi
 

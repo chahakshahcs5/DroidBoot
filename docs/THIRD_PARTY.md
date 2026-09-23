@@ -1,10 +1,10 @@
 # Third-Party Open-Source Components & Licensing
 
-This document tracks all external open-source code, specifications, and reference implementations used in this project, in accordance with the project specification.
+This document tracks all external open-source code, specifications, and reference implementations used across the **DroidBoot Manager** codebase.
 
 ---
 
-## Tracking Matrix
+## 1. Tracking Matrix
 
 | Component | Upstream Project | License | Source / Repository URL | Files / Concepts Used | Modifications / Integration Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -23,7 +23,6 @@ This document tracks all external open-source code, specifications, and referenc
 
 ---
 
-## License Texts & Notices
+## 2. License Texts & Notices
 
-All incorporated third-party files retain their original copyright and license headers. The full texts of the BSD 3-Clause, BSD 2-Clause, Apache 2.0, LGPL-2.1, and GPLv2 licenses are maintained in the repository under `licenses/`.
-
+All incorporated third-party files retain their original copyright and license headers. The full texts of the BSD 3-Clause, BSD 2-Clause, Apache 2.0, LGPL-2.1, and GPLv2 licenses are maintained in the repository.

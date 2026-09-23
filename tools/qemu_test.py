@@ -12,6 +12,7 @@ import re
 from tools.qemu_harness import QemuHarness, WORKSPACE_ROOT, BUILD_DIR, DEFAULT_BOOT_IMG
 
 DEFAULT_UBUNTU_ISO = r"C:\Users\chaha\Downloads\ubuntu-26.04.1-desktop-amd64.iso"
+DEFAULT_KALI_ISO = r"C:\Users\chaha\Downloads\kali-linux-2026.2-installer-amd64.iso"
 DEFAULT_ALPINE_ISO = r"C:\Users\chaha\Downloads\alpine-standard-3.24.2-x86_64.iso"
 SERIAL_LOG = os.path.join(BUILD_DIR, "serial.log")
 
@@ -441,6 +442,206 @@ def test_sd_card_persistence(boot_img=None):
     return all_passed
 
 
+def test_kali_msc_boot(boot_img=DEFAULT_BOOT_IMG):
+    if not os.path.exists(DEFAULT_KALI_ISO):
+        print(f"[*] Skipping Kali Linux test (ISO not present at {DEFAULT_KALI_ISO})")
+        return True
+
+    print("\n" + "=" * 70)
+    print("  TEST 7: Kali Linux 2026.2 Installer UMS Block Boot & Handoff Test")
+    print("=" * 70)
+
+    harness = QemuHarness(boot_img=boot_img, memory="2048M")
+    extra_args = [
+        "-drive", f"id=phone_disk,file={DEFAULT_KALI_ISO},format=raw,if=none,readonly=on",
+        "-device", "usb-storage,bus=xhci.0,drive=phone_disk"
+    ]
+
+    def trigger(conn, current_log, state, qmp):
+        if not state.get("sent_os") and "[MENU] Select option" in current_log:
+            print("[*] Main boot menu detected! Selecting OS [1] (Kali Linux)...")
+            time.sleep(0.1)
+            conn.sendall(b"1\n")
+            state["sent_os"] = True
+
+        if not state.get("sent_prof") and "[PROFILE] Select persistence profile" in current_log:
+            print("[*] Persistence Profile menu detected! Selecting Clean Disposable Session [1]...")
+            time.sleep(0.1)
+            conn.sendall(b"1\n")
+            state["sent_prof"] = True
+
+        if "HANDING OFF EXECUTION TO LINUX" in current_log:
+            time.sleep(0.3)
+            return True
+        return False
+
+    captured_log = harness.run(extra_args=extra_args, interaction_fn=trigger, timeout_sec=30)
+
+    checks = [
+        ("Volume ID: 'Kali Linux amd64 1'", "Kali ISO Volume ID detected"),
+        ("Kali Linux (Graphical Install)", "Kali Linux Graphical Install entry recognized"),
+        ("Resolved Kernel : '/install.amd/vmlinuz'", "Kali kernel resolved from ISO"),
+        ("Resolved Initrd : '/install.amd/gtk/initrd.gz'", "Kali GTK initrd resolved from ISO"),
+        ("Distro Type    : Kali Linux Installer", "Distro Type identified as Kali Linux Installer"),
+        ("HANDING OFF EXECUTION TO LINUX", "Kernel handoff reached for Kali Linux")
+    ]
+
+    all_passed = True
+    for needle, desc in checks:
+        if needle in captured_log:
+            print(f"[PASS] {desc}: '{needle}'")
+        else:
+            print(f"[FAIL] Missing {desc}: '{needle}'")
+            all_passed = False
+
+    return all_passed
+
+
+def create_synthetic_windows_iso(output_path):
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    SECTOR_SIZE = 2048
+    TOTAL_SECTORS = 2048
+    iso = bytearray(TOTAL_SECTORS * SECTOR_SIZE)
+
+    # Sector 0: Boot sector (VBR)
+    # x86 infinite loop: jmp $ (EB FE) + padding + 0x55 0xAA
+    iso[0:2] = b"\xeb\xfe"
+    iso[510:512] = b"\x55\xaa"
+
+    # Sector 16: Primary Volume Descriptor (PVD)
+    pvd_offset = 16 * SECTOR_SIZE
+    iso[pvd_offset + 0] = 0x01 # Type = 1 (PVD)
+    iso[pvd_offset + 1:pvd_offset + 6] = b"CD001"
+    iso[pvd_offset + 6] = 0x01 # Version = 1
+    iso[pvd_offset + 8:pvd_offset + 16] = b"WIN_TEST"
+    vol_id = b"ESD-ISO_WIN11".ljust(32, b" ")
+    iso[pvd_offset + 40:pvd_offset + 72] = vol_id
+    iso[pvd_offset + 80:pvd_offset + 84] = TOTAL_SECTORS.to_bytes(4, "little")
+    iso[pvd_offset + 84:pvd_offset + 88] = TOTAL_SECTORS.to_bytes(4, "big")
+    iso[pvd_offset + 128:pvd_offset + 130] = SECTOR_SIZE.to_bytes(2, "little")
+    iso[pvd_offset + 130:pvd_offset + 132] = SECTOR_SIZE.to_bytes(2, "big")
+
+    # Root Directory Record at offset 156 (34 bytes)
+    root_rec = bytearray(34)
+    root_rec[0] = 34
+    root_rec[2:6] = (18).to_bytes(4, "little")
+    root_rec[6:10] = (18).to_bytes(4, "big")
+    root_rec[10:14] = SECTOR_SIZE.to_bytes(4, "little")
+    root_rec[14:18] = SECTOR_SIZE.to_bytes(4, "big")
+    root_rec[25] = 0x02
+    root_rec[32] = 1
+    root_rec[33] = 0x00
+    iso[pvd_offset + 156:pvd_offset + 190] = root_rec
+
+    # Sector 17: Volume Descriptor Set Terminator
+    term_offset = 17 * SECTOR_SIZE
+    iso[term_offset + 0] = 0xFF
+    iso[term_offset + 1:term_offset + 6] = b"CD001"
+    iso[term_offset + 6] = 0x01
+
+    # Sector 18: Root Directory
+    root_dir_offset = 18 * SECTOR_SIZE
+    pos = root_dir_offset
+    iso[pos:pos + 34] = root_rec
+    pos += 34
+    parent_rec = bytearray(root_rec)
+    parent_rec[33] = 0x01
+    iso[pos:pos + 34] = parent_rec
+    pos += 34
+
+    # Entry 3: 'BOOTMGR;1'
+    name = b"BOOTMGR;1"
+    rlen = 33 + len(name)
+    if rlen % 2 != 0:
+        rlen += 1
+    bm_rec = bytearray(rlen)
+    bm_rec[0] = rlen
+    bm_rec[2:6] = (20).to_bytes(4, "little")
+    bm_rec[6:10] = (20).to_bytes(4, "big")
+    bm_rec[10:14] = (409600).to_bytes(4, "little")
+    bm_rec[14:18] = (409600).to_bytes(4, "big")
+    bm_rec[25] = 0x00
+    bm_rec[32] = len(name)
+    bm_rec[33:33 + len(name)] = name
+    iso[pos:pos + rlen] = bm_rec
+
+    with open(output_path, "wb") as f:
+        f.write(iso)
+    return output_path
+
+
+def test_windows_chainload_boot(boot_img=DEFAULT_BOOT_IMG, win_iso_path=None):
+    print("\n" + "=" * 70)
+    print("  TEST 8: Windows 10/11 Installation Media & VBR Chainloader Test")
+    print("=" * 70)
+
+    if not win_iso_path:
+        candidate_paths = [
+            r"C:\Users\chaha\Downloads\Win11_25H2_English_x64_v2.iso",
+            r"C:\Users\chaha\Downloads\windows.iso"
+        ]
+        for cp in candidate_paths:
+            if os.path.exists(cp):
+                win_iso_path = cp
+                break
+
+    if not win_iso_path or not os.path.exists(win_iso_path):
+        win_iso_path = os.path.join(BUILD_DIR, "test_windows.iso")
+        create_synthetic_windows_iso(win_iso_path)
+        print(f"[*] Generated synthetic Windows 10/11 Test ISO at: {win_iso_path}")
+    else:
+        print(f"[*] Testing against genuine Windows Installation ISO: {win_iso_path}")
+
+    harness = QemuHarness(boot_img=boot_img, memory="1024M")
+    extra_args = [
+        "-drive", f"id=win_disk,file={win_iso_path},format=raw,if=none,readonly=on",
+        "-device", "usb-storage,bus=xhci.0,drive=win_disk"
+    ]
+
+    def trigger(conn, current_log, state, qmp):
+        if not state.get("sent_os") and "[MENU] Select option" in current_log:
+            print("[*] Main boot menu detected! Selecting Windows OS option...")
+            time.sleep(0.1)
+            m = re.search(r"\[(\d+)\]\s+Windows", current_log)
+            win_opt = m.group(1) if m else "1"
+            conn.sendall(f"{win_opt}\n".encode("ascii"))
+            state["sent_os"] = True
+
+        if not state.get("sent_prof") and "[PROFILE] Select persistence profile" in current_log:
+            print("[*] Persistence Profile menu detected! Selecting Clean Disposable Session [1]...")
+            time.sleep(0.1)
+            conn.sendall(b"1\n")
+            state["sent_prof"] = True
+
+        if "Handing off to Real-Mode VBR Chainloader" in current_log:
+            time.sleep(0.3)
+            return True
+        return False
+
+    captured_log = harness.run(extra_args=extra_args, interaction_fn=trigger, timeout_sec=25)
+
+    with open(os.path.join(BUILD_DIR, "serial_windows.log"), "w", encoding="utf-8", errors="ignore") as f:
+        f.write(captured_log)
+
+    checks = [
+        ("BOOTABLE WINDOWS MEDIA DETECTED ON USB BLOCK DEVICE!", "Windows bootable media detected"),
+        ("Microsoft Windows Setup / WinPE", "Identified as Microsoft Windows Setup / WinPE"),
+        ("Real-Mode VBR Chainload", "Mode selected as Real-Mode VBR Chainload"),
+        ("Boot sector loaded at 0x00007C00 with valid signature.", "Boot sector loaded and verified"),
+        ("Handing off to Real-Mode VBR Chainloader", "Handoff to Real-Mode VBR Chainloader reached")
+    ]
+
+    all_passed = True
+    for needle, desc in checks:
+        if needle in captured_log:
+            print(f"[PASS] {desc}: '{needle}'")
+        else:
+            print(f"[FAIL] Missing {desc}: '{needle}'")
+            all_passed = False
+
+    return all_passed
+
+
 def run_all_tests(boot_img=DEFAULT_BOOT_IMG):
     print("=" * 70)
     print("  BOOTLOADER AUTOMATED REGRESSION SUITE")
@@ -452,6 +653,8 @@ def run_all_tests(boot_img=DEFAULT_BOOT_IMG):
     results.append(("Multi-Profile Persistence Sub-Menu", test_multiprofile_persistence(boot_img)))
     results.append(("Dynamic Custom Profile Sizing", test_custom_capacity_selection(boot_img)))
     results.append(("In-RAM ISO Detection & Handoff", test_in_ram_iso_boot(boot_img)))
+    results.append(("Kali Linux 2026.2 UMS Block Boot", test_kali_msc_boot(boot_img)))
+    results.append(("Windows 10/11 VBR Chainloader", test_windows_chainload_boot(boot_img)))
     results.append(("Dynamic Phone Gadget Mode-Switch (QMP)", test_dynamic_gadget_switch(boot_img)))
     results.append(("SD Card Live Logging Persistence", test_sd_card_persistence(boot_img)))
 

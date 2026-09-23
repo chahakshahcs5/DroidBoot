@@ -18,6 +18,7 @@ BOOT_IMG = os.path.join(BUILD_DIR, "boot.img")
 SERIAL_LOG = os.path.join(BUILD_DIR, "serial.log")
 
 DEFAULT_UBUNTU_ISO = r"C:\Users\chaha\Downloads\ubuntu-26.04.1-desktop-amd64.iso"
+DEFAULT_KALI_ISO = r"C:\Users\chaha\Downloads\kali-linux-2026.2-installer-amd64.iso"
 DEFAULT_ALPINE_ISO = r"C:\Users\chaha\Downloads\alpine-standard-3.24.2-x86_64.iso"
 
 def check_build():
@@ -97,6 +98,21 @@ def build_qemu_command(mode, iso_path, memory, headless, usb_host):
             "-device", "usb-storage,bus=xhci.0,drive=phone_disk"
         ])
 
+    elif mode in ["kali"]:
+        if not os.path.exists(iso_path):
+            print(f"[-] Kali ISO not found at {iso_path}!")
+            print("    Please provide a valid ISO with --iso <path>.")
+            sys.exit(1)
+
+        print(f"[+] Mimicking Rooted Android Phone (USB Mass Storage) with Kali: {iso_path}")
+        print("    * Bootloader will read ONLY vmlinuz (13MB) and initrd (78MB) in ~1-2 sec.")
+        print("    * Linux kernel will mount the installer OS directly from block device.")
+        print("    * RAM consumed by OS image: 0 MB!")
+        cmd.extend([
+            "-drive", f"id=phone_disk,file={iso_path},format=raw,if=none,readonly=on",
+            "-device", "usb-storage,bus=xhci.0,drive=phone_disk"
+        ])
+
     elif mode in ["alpine-block"]:
         # Pathway 2 with Alpine ISO on USB block storage
         if not os.path.exists(iso_path):
@@ -107,6 +123,23 @@ def build_qemu_command(mode, iso_path, memory, headless, usb_host):
         cmd.extend([
             "-drive", f"id=phone_disk,file={iso_path},format=raw,if=none,readonly=on",
             "-device", "usb-storage,bus=xhci.0,drive=phone_disk"
+        ])
+
+    elif mode in ["windows"]:
+        if not iso_path:
+            iso_path = r"C:\Users\chaha\Downloads\windows.iso"
+        if not os.path.exists(iso_path):
+            print(f"[-] Windows ISO not found at {iso_path}!")
+            print("    Please provide a valid Windows ISO with --iso <path>.")
+            sys.exit(1)
+
+        print(f"[+] Mimicking Rooted Android Phone (Optical SCSI cdrom=1) with Windows: {iso_path}")
+        print("    * Bootloader will detect Windows Setup / WinPE via ISO 9660.")
+        print("    * Real-Mode VBR Chainloader will drop to 16-bit real mode and jump to 0x0000:0x7C00.")
+        print("    * RAM consumed by OS image: 0 MB!")
+        cmd.extend([
+            "-drive", f"id=win_disk,file={iso_path},format=raw,if=none,readonly=on",
+            "-device", "usb-storage,bus=xhci.0,drive=win_disk"
         ])
 
     elif mode in ["dual"]:
@@ -151,8 +184,8 @@ def build_qemu_command(mode, iso_path, memory, headless, usb_host):
 
 def main():
     parser = argparse.ArgumentParser(description="Desktop QEMU Bootloader Runner")
-    parser.add_argument("--mode", choices=["block", "ubuntu", "alpine-block", "ram", "mtp", "dual"], default="block",
-                        help="Boot mode: 'block' (Rooted phone UMS), 'mtp' (In-RAM Alpine), or 'dual' (Both storages attached)")
+    parser.add_argument("--mode", choices=["block", "ubuntu", "kali", "windows", "alpine-block", "ram", "mtp", "dual"], default="block",
+                        help="Boot mode: 'block'/'ubuntu' (Ubuntu UMS), 'kali' (Kali Linux UMS), 'windows' (Windows VBR chainload), 'mtp' (In-RAM Alpine), or 'dual'")
     parser.add_argument("--iso", default="",
                         help="Path to ISO image (defaults to Downloads folder)")
     parser.add_argument("--memory", default="2048M",
@@ -189,6 +222,8 @@ def main():
     if not iso_path:
         if args.mode in ["block", "ubuntu"]:
             iso_path = DEFAULT_UBUNTU_ISO
+        elif args.mode in ["kali"]:
+            iso_path = DEFAULT_KALI_ISO
         else:
             iso_path = DEFAULT_ALPINE_ISO
 

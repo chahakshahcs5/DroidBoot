@@ -85,13 +85,19 @@ static void guess_distro_title(const char *filename, char *out_title, uint32_t m
     } else if (str_contains_nocase(filename, "fedora")) {
         copy_str(out_title, "Fedora Workstation Live", max_len);
     } else if (str_contains_nocase(filename, "kali")) {
-        copy_str(out_title, "Kali Linux Live", max_len);
+        if (str_contains_nocase(filename, "installer") || str_contains_nocase(filename, "install")) {
+            copy_str(out_title, "Kali Linux Installer", max_len);
+        } else {
+            copy_str(out_title, "Kali Linux Live", max_len);
+        }
     } else if (str_contains_nocase(filename, "corepure") || str_contains_nocase(filename, "tinycore")) {
         copy_str(out_title, "Tiny Core Linux (CorePure64)", max_len);
     } else if (str_contains_nocase(filename, "slitaz")) {
         copy_str(out_title, "SliTaz GNU/Linux Live", max_len);
     } else if (str_contains_nocase(filename, "rescue")) {
         copy_str(out_title, "Rescue / Diagnostic Linux", max_len);
+    } else if (str_contains_nocase(filename, "windows") || str_contains_nocase(filename, "win10") || str_contains_nocase(filename, "win11")) {
+        copy_str(out_title, "Windows 10/11 Installer", max_len);
     } else {
         copy_str(out_title, filename, max_len);
     }
@@ -158,7 +164,7 @@ static void scan_usb_msc_device(usb_device_t *msc_dev, os_registry_t *reg) {
     uint32_t dev_mb = (uint32_t)(dev_bytes / (1024 * 1024));
     log_info("SCAN", "USB Block Device Capacity: %u MB", dev_mb);
 
-    if (dev_bytes == 0 || dev_mb == 0) {
+    if (dev_bytes < 32768) {
         log_info("SCAN", "Port %u: USB Mass Storage device has 0 capacity. Skipping filesystem scan.", msc_dev->port_num);
         msc_src->close(msc_src);
         return;
@@ -167,11 +173,23 @@ static void scan_usb_msc_device(usb_device_t *msc_dev, os_registry_t *reg) {
     // Probe ISO9660 filesystem on the block device
     iso_boot_files_t files;
     int iso_res = iso_find_boot_files(msc_src, &files);
-    if (iso_res == 0 && files.found_kernel) {
+    if (iso_res == 0 && (files.found_kernel || files.is_windows)) {
         os_entry_t *entry = &reg->entries[reg->count];
         k_memset(entry, 0, sizeof(os_entry_t));
 
-        if (files.title[0] != '\0') {
+        if (files.is_windows) {
+            copy_str(entry->title, "Windows 10/11 Installer", sizeof(entry->title));
+            copy_str(entry->filename, "windows.iso", sizeof(entry->filename));
+            entry->is_windows = true;
+            entry->approach = BOOT_APPROACH_CHAINLOAD;
+        } else if (str_contains_nocase(files.volume_id, "kali") || str_contains_nocase(files.title, "kali")) {
+            if (files.title[0] != '\0') {
+                copy_str(entry->title, files.title, sizeof(entry->title));
+            } else {
+                copy_str(entry->title, "Kali Linux Installer", sizeof(entry->title));
+            }
+            copy_str(entry->filename, "kali-linux-2026.2-installer-amd64.iso", sizeof(entry->filename));
+        } else if (files.title[0] != '\0') {
             copy_str(entry->title, files.title, sizeof(entry->title));
             copy_str(entry->filename, "live.iso", sizeof(entry->filename));
         } else if (files.is_casper) {
@@ -185,7 +203,9 @@ static void scan_usb_msc_device(usb_device_t *msc_dev, os_registry_t *reg) {
         copy_str(entry->storage_desc, "USB Block Storage (Rooted Phone / MSC)", sizeof(entry->storage_desc));
         entry->file_size = dev_bytes;
         entry->storage_type = OS_STORAGE_BLOCK_USB;
-        entry->approach = BOOT_APPROACH_BLOCK_ON_DEMAND;
+        if (!entry->is_windows) {
+            entry->approach = BOOT_APPROACH_BLOCK_ON_DEMAND;
+        }
         entry->iso_files = files;
         entry->usb_dev = msc_dev;
 
@@ -279,7 +299,12 @@ static void scan_mtp_storage(mtp_session_t *session, os_registry_t *reg) {
                              "Phone MTP Root (%s)", (s_idx == 0) ? "Internal" : "SD Card");
                     entry->file_size = size;
                     entry->storage_type = OS_STORAGE_MTP_ANDROID;
-                    entry->approach = BOOT_APPROACH_MTP_IN_RAM;
+                    if (str_contains_nocase(name, "windows") || str_contains_nocase(name, "win10") || str_contains_nocase(name, "win11")) {
+                        entry->is_windows = true;
+                        entry->approach = BOOT_APPROACH_CHAINLOAD;
+                    } else {
+                        entry->approach = BOOT_APPROACH_MTP_IN_RAM;
+                    }
                     entry->mtp_handle = root_handles[i];
                     entry->mtp_session = session;
 
@@ -317,7 +342,12 @@ static void scan_mtp_storage(mtp_session_t *session, os_registry_t *reg) {
                                      "Phone MTP: /%s/ (%s)", sub_folder_names[sf], (s_idx == 0) ? "Internal" : "SD");
                             entry->file_size = csize;
                             entry->storage_type = OS_STORAGE_MTP_ANDROID;
-                            entry->approach = BOOT_APPROACH_MTP_IN_RAM;
+                            if (str_contains_nocase(cname, "windows") || str_contains_nocase(cname, "win10") || str_contains_nocase(cname, "win11")) {
+                                entry->is_windows = true;
+                                entry->approach = BOOT_APPROACH_CHAINLOAD;
+                            } else {
+                                entry->approach = BOOT_APPROACH_MTP_IN_RAM;
+                            }
                             entry->mtp_handle = child_handles[c];
                             entry->mtp_session = session;
 
@@ -417,9 +447,9 @@ static void scan_sd_storage(uint8_t boot_drive, os_registry_t *reg) {
     // 2. Fallback probe for standard candidate images
     if (reg->count == 0) {
         const char *candidate_images[] = {
-            "alpine.iso", "ubuntu.iso", "rescue.iso", "linux.iso", "vmlinuz"
+            "alpine.iso", "ubuntu.iso", "kali.iso", "windows.iso", "rescue.iso", "linux.iso", "vmlinuz"
         };
-        for (int i = 0; i < 5 && reg->count < MAX_OS_ENTRIES; i++) {
+        for (int i = 0; i < 7 && reg->count < MAX_OS_ENTRIES; i++) {
             if (fat_src->open(fat_src, candidate_images[i]) == 0) {
                 uint64_t fsize = fat_src->size(fat_src);
                 fat_src->close(fat_src);
@@ -538,6 +568,13 @@ static void scan_ram_storage(os_registry_t *reg) {
             if (iso_files.is_casper || str_contains_nocase(iso_files.title, "ubuntu") || str_contains_nocase(vol_id, "ubuntu")) {
                 copy_str(entry->title, "Ubuntu Desktop Live (In-RAM)", sizeof(entry->title));
                 copy_str(entry->filename, "ubuntu-desktop.iso (In-RAM)", sizeof(entry->filename));
+            } else if (str_contains_nocase(vol_id, "kali") || str_contains_nocase(iso_files.title, "kali")) {
+                if (iso_files.title[0] != '\0') {
+                    copy_str(entry->title, iso_files.title, sizeof(entry->title));
+                } else {
+                    copy_str(entry->title, "Kali Linux Installer (In-RAM)", sizeof(entry->title));
+                }
+                copy_str(entry->filename, "kali-linux-installer.iso (In-RAM)", sizeof(entry->filename));
             } else if (str_contains_nocase(vol_id, "alpine") || str_contains_nocase(iso_files.title, "alpine") || str_contains_nocase(iso_files.title, "lts") || !iso_files.is_casper) {
                 copy_str(entry->title, "Alpine Linux Standard", sizeof(entry->title));
                 copy_str(entry->filename, "alpine-standard.iso (In-RAM)", sizeof(entry->filename));

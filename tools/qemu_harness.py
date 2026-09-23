@@ -158,6 +158,11 @@ class QemuHarness:
                             if stop:
                                 break
                 except (BlockingIOError, OSError):
+                    if interaction_fn:
+                        current_log = "".join(chunks)
+                        stop = interaction_fn(self.conn, current_log, state, self.qmp)
+                        if stop:
+                            break
                     time.sleep(0.05)
         finally:
             self.cleanup()

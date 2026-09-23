@@ -29,7 +29,8 @@ typedef enum {
 
 typedef enum {
     BOOT_APPROACH_BLOCK_ON_DEMAND, // Extract only vmlinuz + initrd (0 MB of 6GB in RAM)
-    BOOT_APPROACH_MTP_IN_RAM       // Stream complete ISO into RAM + SD card persistence
+    BOOT_APPROACH_MTP_IN_RAM,      // Stream complete ISO into RAM + SD card persistence
+    BOOT_APPROACH_CHAINLOAD        // Real-mode VBR chainloading (Windows, BSD)
 } boot_approach_t;
 
 typedef struct os_entry {
@@ -39,6 +40,7 @@ typedef struct os_entry {
     uint64_t          file_size;           // Image size in bytes
     os_storage_type_t storage_type;
     boot_approach_t   approach;
+    bool              is_windows;
 
     // Approach 1 (Block on-demand):
     iso_boot_files_t  iso_files;
