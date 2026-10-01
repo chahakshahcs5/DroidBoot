@@ -2,7 +2,7 @@
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 [![Regression Tests](https://img.shields.io/badge/tests-7%2F7%20passed-brightgreen.svg)]()
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](file:///c:/Users/chaha/Projects/bootmanager/LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Target: x86 Bare--Metal](https://img.shields.io/badge/target-x86_Legacy_BIOS-blue.svg)]()
 
 **DroidBoot** is an advanced, bare-metal x86 firmware bootloader that turns any **Android smartphone** (or USB storage device) into a universal, multi-OS boot medium for PCs and laptops.
@@ -116,18 +116,18 @@ graph LR
 
 ## 5. Documentation Hub
 
-All in-depth technical specifications and guides are located in the [`docs/`](file:///c:/Users/chaha/Projects/bootmanager/docs/) directory:
+All in-depth technical specifications and guides are located in the [`docs/`](docs/) directory:
 
 | Document | Description |
 | :--- | :--- |
-| **[ARCHITECTURE.md](file:///c:/Users/chaha/Projects/bootmanager/docs/ARCHITECTURE.md)** | Deep technical specifications, hardware driver stack, and Mermaid flowcharts. |
-| **[DEVELOPER_GUIDE.md](file:///c:/Users/chaha/Projects/bootmanager/docs/DEVELOPER_GUIDE.md)** | Contributor reference, bare-metal coding constraints, and diagnostic workflows. |
-| **[ADDING_NEW_OS.md](file:///c:/Users/chaha/Projects/bootmanager/docs/ADDING_NEW_OS.md)** | Step-by-step developer tutorial: How to add support for any new Linux distro or Windows. |
-| **[MEMORY_MAP.md](file:///c:/Users/chaha/Projects/bootmanager/docs/MEMORY_MAP.md)** | Physical memory layout (0x0000_0000 to 4 GiB) and collision-free initrd boundaries. |
-| **[BOOT_IMAGE_FORMAT.md](file:///c:/Users/chaha/Projects/bootmanager/docs/BOOT_IMAGE_FORMAT.md)** | Exact on-disk sector layout (LBA 0 to 2048+) and raw persistent log structures. |
-| **[PROJECT_STATUS.md](file:///c:/Users/chaha/Projects/bootmanager/docs/PROJECT_STATUS.md)** | Subsystem verification matrix and development roadmap (Phases 0 through 18). |
-| **[TESTING.md](file:///c:/Users/chaha/Projects/bootmanager/docs/TESTING.md)** | QEMU automated regression test harness, QMP hotplugging, and physical phone passthrough. |
-| **[THIRD_PARTY.md](file:///c:/Users/chaha/Projects/bootmanager/docs/THIRD_PARTY.md)** | Upstream open-source components and licensing tracking. |
+| **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Deep technical specifications, hardware driver stack, and Mermaid flowcharts. |
+| **[DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md)** | Contributor reference, bare-metal coding constraints, and diagnostic workflows. |
+| **[ADDING_NEW_OS.md](docs/ADDING_NEW_OS.md)** | Step-by-step developer tutorial: How to add support for any new Linux distro or Windows. |
+| **[MEMORY_MAP.md](docs/MEMORY_MAP.md)** | Physical memory layout (0x0000_0000 to 4 GiB) and collision-free initrd boundaries. |
+| **[BOOT_IMAGE_FORMAT.md](docs/BOOT_IMAGE_FORMAT.md)** | Exact on-disk sector layout (LBA 0 to 2048+) and raw persistent log structures. |
+| **[PROJECT_STATUS.md](docs/PROJECT_STATUS.md)** | Subsystem verification matrix and development roadmap (Phases 0 through 18). |
+| **[TESTING.md](docs/TESTING.md)** | QEMU automated regression test harness, QMP hotplugging, and physical phone passthrough. |
+| **[THIRD_PARTY.md](docs/THIRD_PARTY.md)** | Upstream open-source components and licensing tracking. |
 
 ---
 
@@ -170,4 +170,4 @@ python tools/test_physical_phone_qemu.py
 
 ## 7. License
 
-This project is licensed under the **MIT License** — see the [LICENSE](file:///c:/Users/chaha/Projects/bootmanager/LICENSE) file for details. Third-party components retain their respective permissive open-source licenses as documented in [docs/THIRD_PARTY.md](file:///c:/Users/chaha/Projects/bootmanager/docs/THIRD_PARTY.md).
+This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details. Third-party components retain their respective permissive open-source licenses as documented in [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).

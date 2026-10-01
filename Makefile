@@ -1,4 +1,4 @@
-NASM        ?= $(shell which nasm 2>/dev/null || echo /mnt/c/Users/chaha/AppData/Local/bin/NASM/nasm.exe)
+NASM        ?= $(shell which nasm 2>/dev/null || echo nasm)
 CC          ?= gcc
 LD          ?= ld
 OBJCOPY     ?= objcopy

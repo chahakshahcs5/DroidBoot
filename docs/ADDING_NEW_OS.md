@@ -36,13 +36,13 @@ Every OS addition touches a predictable set of modular files in `src/stage3/`:
 
 | Subsystem | File Path | Responsibility |
 | :--- | :--- | :--- |
-| **OS Scanner** | [src/stage3/image/os_scanner.c](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/image/os_scanner.c) | Filename matching, Volume ID classification, and menu entry registration. |
-| **ISO Reader** | [src/stage3/filesystem/iso_reader.c](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/filesystem/iso_reader.c) | ISO9660 PVD parsing, kernel/initrd path heuristics, GRUB/Syslinux config parser. |
-| **Boot Header** | [src/stage3/filesystem/iso_reader.h](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/filesystem/iso_reader.h) | Data structures for discovered boot files and distribution flags. |
-| **ADB Gadget** | [src/stage3/adb/adb.c](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/adb/adb.c) | Phone USB gadget configuration (LUN 0 ISO binding, LUN 1 persistence, `cdrom` mode). |
-| **Main Orchestrator** | [src/stage3/core/main.c](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/core/main.c) | Kernel command-line assembly, persistence matching, safe memory layout, and kernel jump. |
-| **Linux Boot Engine** | [src/stage3/linux/linux_boot.c](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/linux/linux_boot.c) | Linux `boot_params` (Zero Page), E820 map transfer, video modes, and protected-mode jump. |
-| **BIOS Thunk** | [src/stage3/bios/bios_thunk.S](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/bios/bios_thunk.S) | Real-mode transition gateway for non-Linux OSes (Windows, FreeDOS, BSD). |
+| **OS Scanner** | [src/stage3/image/os_scanner.c](../src/stage3/image/os_scanner.c) | Filename matching, Volume ID classification, and menu entry registration. |
+| **ISO Reader** | [src/stage3/filesystem/iso_reader.c](../src/stage3/filesystem/iso_reader.c) | ISO9660 PVD parsing, kernel/initrd path heuristics, GRUB/Syslinux config parser. |
+| **Boot Header** | [src/stage3/filesystem/iso_reader.h](../src/stage3/filesystem/iso_reader.h) | Data structures for discovered boot files and distribution flags. |
+| **ADB Gadget** | [src/stage3/adb/adb.c](../src/stage3/adb/adb.c) | Phone USB gadget configuration (LUN 0 ISO binding, LUN 1 persistence, `cdrom` mode). |
+| **Main Orchestrator** | [src/stage3/core/main.c](../src/stage3/core/main.c) | Kernel command-line assembly, persistence matching, safe memory layout, and kernel jump. |
+| **Linux Boot Engine** | [src/stage3/linux/linux_boot.c](../src/stage3/linux/linux_boot.c) | Linux `boot_params` (Zero Page), E820 map transfer, video modes, and protected-mode jump. |
+| **BIOS Thunk** | [src/stage3/bios/bios_thunk.S](../src/stage3/bios/bios_thunk.S) | Real-mode transition gateway for non-Linux OSes (Windows, FreeDOS, BSD). |
 
 ---
 
@@ -51,7 +51,7 @@ Every OS addition touches a predictable set of modular files in `src/stage3/`:
 Let's walk through adding support for a new Linux distribution (e.g., **Arch Linux Live** or **Fedora Workstation**).
 
 ### Step 3.1: Add Distro Title Classification
-In [src/stage3/image/os_scanner.c](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/image/os_scanner.c), locate `guess_distro_title()`:
+In [src/stage3/image/os_scanner.c](../src/stage3/image/os_scanner.c), locate `guess_distro_title()`:
 
 ```c
 static void guess_distro_title(const char *filename, char *out_title, uint32_t max_len) {
@@ -76,7 +76,7 @@ Linux distributions place their kernel and initramfs binaries in different stand
 * **Alpine**: `/boot/vmlinuz-lts` and `/boot/initramfs-lts`
 * **Arch Linux**: `/arch/boot/x86_64/vmlinuz-linux` and `/arch/boot/x86_64/initramfs-linux.img`
 
-In [src/stage3/filesystem/iso_reader.c](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/filesystem/iso_reader.c), update `candidate_dirs` in `iso_find_boot_files()`:
+In [src/stage3/filesystem/iso_reader.c](../src/stage3/filesystem/iso_reader.c), update `candidate_dirs` in `iso_find_boot_files()`:
 
 ```c
 static const char *candidate_dirs[] = {
@@ -93,7 +93,7 @@ static const char *candidate_dirs[] = {
 ```
 
 ### Step 3.3: Configure Distro-Specific Boot Parameters
-In [src/stage3/core/main.c](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/core/main.c), inside `boot_from_usb_msc()`:
+In [src/stage3/core/main.c](../src/stage3/core/main.c), inside `boot_from_usb_msc()`:
 When an ISO has an embedded GRUB configuration (`/boot/grub/grub.cfg`), our parser automatically extracts its command-line. However, if no configuration is present or fallback defaults are needed, assemble the distro-specific arguments:
 
 ```c
@@ -111,8 +111,8 @@ if (str_contains_nocase(iso_files.title, "arch") || str_contains_nocase(iso_file
 ### Step 3.4: Configure Persistence Overlays
 If the distribution supports persistent storage:
 1. Define the persistence file format (e.g., ext4 disk image `.casper-rw`, `.img`, or tarball `.apkovl.tar.gz`).
-2. In [src/stage3/adb/adb.c](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/adb/adb.c), verify `adb_scan_persistence_profiles()` recognizes the profile extension.
-3. In [src/stage3/core/main.c](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/core/main.c), append the persistence flag (e.g. `persistent persistent-path=/BootManager/persistence/`).
+2. In [src/stage3/adb/adb.c](../src/stage3/adb/adb.c), verify `adb_scan_persistence_profiles()` recognizes the profile extension.
+3. In [src/stage3/core/main.c](../src/stage3/core/main.c), append the persistence flag (e.g. `persistent persistent-path=/BootManager/persistence/`).
 
 ---
 
@@ -154,7 +154,7 @@ echo 1 > "$M/lun.0/ro"
 ```
 
 ### Step 4.3: Real-Mode Chainload Execution
-In [src/stage3/bios/bios_thunk.S](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/bios/bios_thunk.S), implement `bios_chainload(uint8_t drive)`:
+In [src/stage3/bios/bios_thunk.S](../src/stage3/bios/bios_thunk.S), implement `bios_chainload(uint8_t drive)`:
 1. Load sector 0 of LUN 0 to physical address `0x0000:0x7C00`.
 2. Stop the xHCI USB controller (`xhci_stop()`) to halt hardware DMA rings.
 3. Drop to 16-bit real mode.

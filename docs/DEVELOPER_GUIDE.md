@@ -55,7 +55,7 @@ sudo apt install build-essential gcc-multilib nasm qemu-system-x86 python3
 
 ## 3. Build System Architecture
 
-The build process is managed by both a native GNU [Makefile](file:///c:/Users/chaha/Projects/bootmanager/Makefile) and a cross-platform Python orchestrator ([build.py](file:///c:/Users/chaha/Projects/bootmanager/build.py)):
+The build process is managed by both a native GNU [Makefile](../Makefile) and a cross-platform Python orchestrator ([build.py](../build.py)):
 
 ```mermaid
 flowchart LR
@@ -110,7 +110,7 @@ The Android phone presents **two Logical Unit Numbers (LUNs)** across its single
 * **LUN 0**: The **Selected OS ISO** (Read-Only, 512-byte SCSI blocks or 2048-byte CD-ROM)
 * **LUN 1**: The **Matching Writable Persistence Profile** (Read-Write ext4 overlay disk)
 
-When you select a different distribution in the bootloader menu, [src/stage3/adb/adb.c](file:///c:/Users/chaha/Projects/bootmanager/src/stage3/adb/adb.c) executes a hot-swap command across ADB to re-bind LUN 0 and LUN 1 in under 1 second without disconnecting the physical USB cable.
+When you select a different distribution in the bootloader menu, [src/stage3/adb/adb.c](../src/stage3/adb/adb.c) executes a hot-swap command across ADB to re-bind LUN 0 and LUN 1 in under 1 second without disconnecting the physical USB cable.
 
 ---
 
@@ -167,5 +167,5 @@ python tools/test_physical_phone_qemu.py
 ## 7. Submitting Changes & Code Standards
 
 1. **Keep Commits Focused**: Separate driver additions from UI or build harness changes.
-2. **Synchronize Dependencies**: Header changes in `src/stage3/` must trigger recompilation of all affected modules (guaranteed by `STAGE3_HEADERS` in [Makefile](file:///c:/Users/chaha/Projects/bootmanager/Makefile)).
-3. **Preserve Documentation**: When modifying physical addresses, update [docs/MEMORY_MAP.md](file:///c:/Users/chaha/Projects/bootmanager/docs/MEMORY_MAP.md). When changing sector offsets, update [docs/BOOT_IMAGE_FORMAT.md](file:///c:/Users/chaha/Projects/bootmanager/docs/BOOT_IMAGE_FORMAT.md).
+2. **Synchronize Dependencies**: Header changes in `src/stage3/` must trigger recompilation of all affected modules (guaranteed by `STAGE3_HEADERS` in [Makefile](../Makefile)).
+3. **Preserve Documentation**: When modifying physical addresses, update [docs/MEMORY_MAP.md](MEMORY_MAP.md). When changing sector offsets, update [docs/BOOT_IMAGE_FORMAT.md](BOOT_IMAGE_FORMAT.md).

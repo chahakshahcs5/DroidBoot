@@ -12,9 +12,10 @@ import re
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools.qemu_harness import QemuHarness, WORKSPACE_ROOT, BUILD_DIR, DEFAULT_BOOT_IMG
 
-DEFAULT_UBUNTU_ISO = r"C:\Users\chaha\Downloads\ubuntu-26.04.1-desktop-amd64.iso"
-DEFAULT_KALI_ISO = r"C:\Users\chaha\Downloads\kali-linux-2026.2-installer-amd64.iso"
-DEFAULT_ALPINE_ISO = r"C:\Users\chaha\Downloads\alpine-standard-3.24.2-x86_64.iso"
+DOWNLOADS_DIR = os.environ.get("BOOTMANAGER_ISO_DIR", os.path.expanduser("~/Downloads"))
+DEFAULT_UBUNTU_ISO = os.path.join(DOWNLOADS_DIR, "ubuntu-26.04.1-desktop-amd64.iso")
+DEFAULT_KALI_ISO = os.path.join(DOWNLOADS_DIR, "kali-linux-2026.2-installer-amd64.iso")
+DEFAULT_ALPINE_ISO = os.path.join(DOWNLOADS_DIR, "alpine-standard-3.24.2-x86_64.iso")
 SERIAL_LOG = os.path.join(BUILD_DIR, "serial.log")
 
 REQUIRED_LOG_PATTERNS = [
@@ -589,8 +590,8 @@ def test_windows_chainload_boot(boot_img=DEFAULT_BOOT_IMG, win_iso_path=None):
 
     if not win_iso_path:
         candidate_paths = [
-            r"C:\Users\chaha\Downloads\Win11_25H2_English_x64_v2.iso",
-            r"C:\Users\chaha\Downloads\windows.iso"
+            os.path.join(DOWNLOADS_DIR, "Win11_25H2_English_x64_v2.iso"),
+            os.path.join(DOWNLOADS_DIR, "windows.iso")
         ]
         for cp in candidate_paths:
             if os.path.exists(cp):

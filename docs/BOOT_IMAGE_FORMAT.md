@@ -1,6 +1,6 @@
 # Boot Image Format & Disk Sector Layout
 
-This document defines the exact on-disk sector layout of `boot.img` generated automatically by [tools/mkimage.py](file:///c:/Users/chaha/Projects/bootmanager/tools/mkimage.py).
+This document defines the exact on-disk sector layout of `boot.img` generated automatically by [tools/mkimage.py](../tools/mkimage.py).
 
 ---
 
@@ -82,4 +82,4 @@ LBA 2048 .. END     0x100000 - END            Partition 1: FAT32 Boot Filesystem
 2. **Alignment & Padding**: Every stage is strictly padded to a 512-byte sector boundary.
 3. **Partition Table Integrity**: Stage 1 code size is strictly bounded to $\le 432$ bytes, preserving the patch table (`0x1B0`), the 64-byte standard MBR partition table (`0x1BE`), and the boot signature `0xAA55`.
 4. **Pre-Allocated Persistent Logs**: Both the FAT32 `BOOTLOG.TXT` cluster chain and the raw sector range (LBA 1024..1151) are formatted upfront to guarantee write targets without requiring complex runtime cluster allocation.
-5. **Zero Manual Editing**: Manual hex editing of the boot image is strictly forbidden. All offsets and headers are patched automatically via [tools/mkimage.py](file:///c:/Users/chaha/Projects/bootmanager/tools/mkimage.py).
+5. **Zero Manual Editing**: Manual hex editing of the boot image is strictly forbidden. All offsets and headers are patched automatically via [tools/mkimage.py](../tools/mkimage.py).

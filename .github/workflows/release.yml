@@ -1,0 +1,64 @@
+name: Release Build & Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag or version for release (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Publish Release Images
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Toolchain Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm gcc-multilib binutils zip
+
+      - name: Build Release and Debug Images
+        run: |
+          make all
+
+      - name: Package Release Assets & Generate Checksums
+        run: |
+          cd build
+          # Create compressed zip archives (shrinks 64MB sparse images to ~150KB)
+          zip -9 droidboot-${{ github.ref_name || github.event.inputs.tag_name }}.zip boot.img
+          zip -9 droidboot-debug-${{ github.ref_name || github.event.inputs.tag_name }}.zip boot-debug.img
+
+          # Generate SHA256 checksums for verification
+          sha256sum boot.img boot-debug.img droidboot-*.zip > SHA256SUMS.txt
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || github.event.inputs.tag_name }}
+          name: DroidBoot Manager ${{ github.ref_name || github.event.inputs.tag_name }}
+          files: |
+            build/droidboot-*.zip
+            build/boot.img
+            build/boot-debug.img
+            build/SHA256SUMS.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

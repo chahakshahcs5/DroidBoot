@@ -12,10 +12,11 @@ import re
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools.qemu_harness import QemuHarness, WORKSPACE_ROOT, BUILD_DIR, DEFAULT_BOOT_IMG
 
-UBUNTU_ISO = r"C:\Users\chaha\Downloads\ubuntu-26.04.1-desktop-amd64.iso"
-KALI_LIVE_ISO = r"C:\Users\chaha\Downloads\kali-linux-2026.2-live-amd64.iso"
-HBCD_ISO = r"C:\Users\chaha\Downloads\HBCD_PE_x64.iso"
-ALPINE_ISO = r"C:\Users\chaha\Downloads\alpine-standard-3.24.2-x86_64.iso"
+DOWNLOADS_DIR = os.environ.get("BOOTMANAGER_ISO_DIR", os.path.expanduser("~/Downloads"))
+UBUNTU_ISO = os.path.join(DOWNLOADS_DIR, "ubuntu-26.04.1-desktop-amd64.iso")
+KALI_LIVE_ISO = os.path.join(DOWNLOADS_DIR, "kali-linux-2026.2-live-amd64.iso")
+HBCD_ISO = os.path.join(DOWNLOADS_DIR, "HBCD_PE_x64.iso")
+ALPINE_ISO = os.path.join(DOWNLOADS_DIR, "alpine-standard-3.24.2-x86_64.iso")
 
 
 def verify_iso_with_keyboard(iso_path, iso_name, is_windows=False):

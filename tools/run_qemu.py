@@ -17,9 +17,10 @@ BUILD_DIR = os.path.join(WORKSPACE_ROOT, "build")
 BOOT_IMG = os.path.join(BUILD_DIR, "boot.img")
 SERIAL_LOG = os.path.join(BUILD_DIR, "serial.log")
 
-DEFAULT_UBUNTU_ISO = r"C:\Users\chaha\Downloads\ubuntu-26.04.1-desktop-amd64.iso"
-DEFAULT_KALI_ISO = r"C:\Users\chaha\Downloads\kali-linux-2026.2-installer-amd64.iso"
-DEFAULT_ALPINE_ISO = r"C:\Users\chaha\Downloads\alpine-standard-3.24.2-x86_64.iso"
+DOWNLOADS_DIR = os.environ.get("BOOTMANAGER_ISO_DIR", os.path.expanduser("~/Downloads"))
+DEFAULT_UBUNTU_ISO = os.path.join(DOWNLOADS_DIR, "ubuntu-26.04.1-desktop-amd64.iso")
+DEFAULT_KALI_ISO = os.path.join(DOWNLOADS_DIR, "kali-linux-2026.2-installer-amd64.iso")
+DEFAULT_ALPINE_ISO = os.path.join(DOWNLOADS_DIR, "alpine-standard-3.24.2-x86_64.iso")
 
 def check_build():
     needs_build = not os.path.exists(BOOT_IMG)
@@ -127,7 +128,7 @@ def build_qemu_command(mode, iso_path, memory, headless, usb_host):
 
     elif mode in ["windows"]:
         if not iso_path:
-            iso_path = r"C:\Users\chaha\Downloads\windows.iso"
+            iso_path = os.path.join(DOWNLOADS_DIR, "windows.iso")
         if not os.path.exists(iso_path):
             print(f"[-] Windows ISO not found at {iso_path}!")
             print("    Please provide a valid Windows ISO with --iso <path>.")
