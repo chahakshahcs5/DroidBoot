@@ -22,6 +22,9 @@
 #include "../image/os_scanner.h"
 #include "../adb/adb.h"
 #include "../filesystem/diskio.h"
+#include "../bios/vbe.h"
+#include "../bios/int13_emu.h"
+#include "../usb/usb_hid.h"
 
 static xhci_controller_t xhci_ctrl;
 
@@ -218,8 +221,57 @@ static void ensure_cmdline_arg(char *cmdline, size_t max_len, const char *arg) {
     }
 }
 
+static void ensure_cmdline_arg_before_separator(char *cmdline, size_t max_len, const char *arg, const char *sep) {
+    if (!cmdline || !arg || !*arg || max_len == 0) return;
+    size_t arg_len = k_strlen(arg);
+    size_t clen = k_strlen(cmdline);
+
+    for (size_t i = 0; i + arg_len <= clen; i++) {
+        if ((i == 0 || cmdline[i - 1] == ' ' || cmdline[i - 1] == '\t') &&
+            str_starts_with_nocase(&cmdline[i], arg)) {
+            char after = cmdline[i + arg_len];
+            if (after == '\0' || after == ' ' || after == '\t' || after == '=') {
+                return;
+            }
+        }
+    }
+
+    if (sep && *sep) {
+        size_t sep_len = k_strlen(sep);
+        for (size_t i = 0; i + sep_len <= clen; i++) {
+            if ((i == 0 || cmdline[i - 1] == ' ' || cmdline[i - 1] == '\t') &&
+                str_starts_with_nocase(&cmdline[i], sep)) {
+                if (clen + arg_len + 2 < max_len) {
+                    for (int s = (int)clen; s >= (int)i; s--) {
+                        cmdline[s + arg_len + 1] = cmdline[s];
+                    }
+                    k_memcpy(&cmdline[i], arg, arg_len);
+                    cmdline[i + arg_len] = ' ';
+                    return;
+                }
+            }
+        }
+    }
+
+    ensure_cmdline_arg(cmdline, max_len, arg);
+}
+
 static void finalize_kernel_cmdline(char *cmdline, size_t max_len, bool is_casper) {
     if (!cmdline || max_len == 0) return;
+
+    // Strip legacy 16-bit VGA mode parameters (e.g. vga=788) that conflict with modern Linear Framebuffers
+    strip_cmdline_arg(cmdline, "vga=");
+
+    // For Debian / Kali installer media, ensure cdrom-detect can discover USB block media BEFORE '---'
+    if (str_contains_nocase(cmdline, "preseed") || str_contains_nocase(cmdline, "simple-cdd") ||
+        str_contains_nocase(cmdline, "kali") || str_contains_nocase(cmdline, "debian")) {
+        ensure_cmdline_arg_before_separator(cmdline, max_len, "cdrom-detect/try-usb=true", "---");
+    }
+
+    // Direct video routing: disable broken internal laptop LCD (eDP-1 / LVDS-1) and force HDMI-A-1 primary
+    ensure_cmdline_arg(cmdline, max_len, "video=eDP-1:d");
+    ensure_cmdline_arg(cmdline, max_len, "video=LVDS-1:d");
+    ensure_cmdline_arg(cmdline, max_len, "video=HDMI-A-1:1920x1080@60e");
 
 #if IS_DEBUG_BUILD
     (void)is_casper;
@@ -367,7 +419,7 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
             linux_prepare_boot_params(kernel_buf, kernel_size,
                                       initrd_buf, initrd_size,
                                       alpine_cmdline, boot_info,
-                                      NULL, 0, 0,
+                                      vbe_get_active_mode(), 0, 0,
                                       params_at_low_mem);
 
             vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
@@ -429,7 +481,7 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
     int prep = linux_prepare_boot_params(test_kernel_image, sizeof(test_kernel_image),
                                          (void *)LINUX_INITRD_LOAD_PHYS, 1048576,
                                          cmdline, boot_info,
-                                         NULL, 0, 0,
+                                         vbe_get_active_mode(), 0, 0,
                                          &test_params);
     if (prep == 0 && test_params.hdr.header == LINUX_HDRS_MAGIC && test_params.e820_entries > 0) {
         log_info("TEST", "Phase 9 Boot Params Setup: SUCCESS (%u E820 entries attached)",
@@ -444,7 +496,7 @@ static void test_linux_boot_simulation(boot_info_t *boot_info) {
     }
 }
 
-static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const persistence_profile_t *prof) {
+static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const persistence_profile_t *prof, const iso_boot_files_t *cached_files) {
     if (!dev) return;
 
     // Check if device was spuriously marked disconnected by an ADB timeout while physically present
@@ -466,12 +518,18 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
     }
 
     iso_boot_files_t iso_files;
-    int r = iso_find_boot_files(msc_src, &iso_files);
-    if (r != 0 || (!iso_files.found_kernel && !iso_files.is_windows)) {
-        log_error("BOOT", "No bootable kernel found on USB block device!");
-        sound_error_tone();
-        msc_src->close(msc_src);
-        return;
+    k_memset(&iso_files, 0, sizeof(iso_files));
+
+    if (cached_files && (cached_files->found_kernel || cached_files->is_windows)) {
+        iso_files = *cached_files;
+    } else {
+        int r = iso_find_boot_files(msc_src, &iso_files);
+        if (r != 0 || (!iso_files.found_kernel && !iso_files.is_windows)) {
+            log_error("BOOT", "No bootable kernel found on USB block device!");
+            sound_error_tone();
+            msc_src->close(msc_src);
+            return;
+        }
     }
 
     if (iso_files.is_windows) {
@@ -502,47 +560,82 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
         }
 
         // Verify boot sector magic 0x55, 0xAA (little-endian 0xAA55)
-        uint32_t sig_offset = (bytes_read >= 4096) ? 4094 : 510;
-        if (vbr_buf[sig_offset] != 0x55 || vbr_buf[sig_offset + 1] != 0xAA) {
-            log_warn("BOOT", "Boot sector signature not 0xAA55 (got 0x%02X%02X at offset %u). Patching standard signature...",
-                     vbr_buf[sig_offset + 1], vbr_buf[sig_offset], sig_offset);
-            vbr_buf[sig_offset] = 0x55;
-            vbr_buf[sig_offset + 1] = 0xAA;
-        }
-
-        // Determine BIOS drive number
-        uint8_t boot_drive = (boot_info && boot_info->boot_drive) ? (uint8_t)boot_info->boot_drive : 0x80;
-        static uint8_t test_buf[512];
-        const uint8_t cand_drives[] = { 0x80, 0x81, 0x82, 0x83, 0x90, 0x91, 0xE0 };
-        for (size_t cd = 0; cd < sizeof(cand_drives); cd++) {
-            uint8_t cand = cand_drives[cd];
-            if (bios_disk_read(cand, (uint64_t)iso_files.boot_sector_lba, 1, test_buf) == 0) {
-                if (k_memcmp(test_buf, vbr_buf, 512) == 0) {
-                    boot_drive = cand;
-                    log_info("BOOT", "Matched BIOS drive number 0x%02X via INT 13h sector match.", boot_drive);
-                    break;
-                }
-            }
+        // Standard BIOS boot sectors require 0x55, 0xAA at offset 510-511
+        if (vbr_buf[510] != 0x55 || vbr_buf[511] != 0xAA) {
+            log_warn("BOOT", "Boot sector signature not 0xAA55 (got 0x%02X%02X at offset 510). Patching standard signature...",
+                     vbr_buf[511], vbr_buf[510]);
+            vbr_buf[510] = 0x55;
+            vbr_buf[511] = 0xAA;
         }
 
         log_info("BOOT", "Boot sector loaded at 0x00007C00 with valid signature.");
-        log_info("BOOT", "Flushing logs and halting USB controller for BIOS handoff...");
+
+        // For native xHCI USB devices, install INT 13h emulation layer directly.
+        // We do NOT call bios_disk_read() across candidate drives because real-mode
+        // BIOS INT 13h causes BIOS to poll USB and overwrite active xHCI state.
+        vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+        log_info("BOOT", "==========================================================");
+        log_info("BOOT", "  WINDOWS BOOT — INT 13h EMULATION ACTIVE                ");
+        log_info("BOOT", "==========================================================");
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+        log_info("BOOT", "Installing INT 13h emulation layer (xHCI MSC bridge)...");
+
+        // Get disk capacity for the emulation layer
+        uint32_t emu_last_lba = 0, emu_block_sz = 512;
+        usb_msc_read_capacity(dev, &emu_last_lba, &emu_block_sz);
+        uint32_t phys_block_sz = emu_block_sz ? emu_block_sz : 512;
+        uint32_t emu_total_sectors = emu_last_lba + 1;
+        // Convert total sectors to 512-byte units if device block size differs (e.g. CD-ROM 2048)
+        if (phys_block_sz > 512) {
+            emu_total_sectors = emu_total_sectors * (phys_block_sz / 512);
+        }
+
+        int emu_res = int13_emu_install(dev, 0, emu_total_sectors, 512, phys_block_sz);
+        if (emu_res != 0) {
+            log_error("BOOT", "Failed to install INT 13h emulation! Windows cannot boot.");
+            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+            sound_error_tone();
+            return;
+        }
+
+        uint8_t boot_drive = int13_emu_get_drive_num();
+        log_info("BOOT", "Phone UMS mapped as BIOS drive 0x%02X via INT 13h emulation.", boot_drive);
+        vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+        log_info("BOOT", "INT 13h emulation active! Windows VBR will read from phone.");
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+        log_info("BOOT", "Flushing logs before Windows handoff...");
         disk_log_flush_with_feedback();
         phone_save_boot_log(&active_adb_session, &active_mtp_session);
-        xhci_stop(&xhci_ctrl);
+
+        // Mask xHCI hardware interrupts before switching to Real Mode
+        log_info("BOOT", "Masking xHCI hardware interrupts prior to real-mode handoff...");
+        xhci_mask_interrupts(&xhci_ctrl);
+
+        // Keeping xHCI controller running for INT 13h emulation
+        log_info("BOOT", "Keeping xHCI controller running for INT 13h emulation.");
         sound_silence();
 
         log_info("BOOT", "Handing off to Real-Mode VBR Chainloader (Drive 0x%02X)...", boot_drive);
-
+        // Do NOT restore text mode if VBE is active to avoid killing HDMI pixel clock on external monitors!
+        if (!vbe_is_active()) {
+            vbe_restore_text_mode();
+        } else {
+            log_info("BOOT", "Maintaining active VBE video mode to preserve HDMI external monitor signal.");
+        }
         bios_chainload(boot_drive, 0x00007C00);
         return;
     }
+
+
 
     log_info("BOOT", "==========================================================");
     log_info("BOOT", "  BOOTABLE OS DETECTED ON USB BLOCK DEVICE!               ");
     const char *distro_desc = "Linux Live System";
     if (iso_files.is_casper) distro_desc = "Ubuntu / Casper Live (6GB)";
-    else if (str_contains_nocase(iso_files.volume_id, "kali") || str_contains_nocase(iso_files.title, "kali")) distro_desc = "Kali Linux Installer";
+    else if (iso_files.is_kali && str_contains_nocase(iso_files.title, "live")) distro_desc = "Kali Linux Live";
+    else if (iso_files.is_kali) distro_desc = "Kali Linux Installer";
+    else if (str_contains_nocase(iso_files.volume_id, "kali") || str_contains_nocase(iso_files.title, "kali")) distro_desc = "Kali Linux";
     log_info("BOOT", "  * Distro Type    : %s", distro_desc);
     log_info("BOOT", "  * Kernel LBA     : %u (Size: %u MB)", iso_files.kernel_lba, iso_files.kernel_size / 1024 / 1024);
     log_info("BOOT", "  * Initramfs LBA  : %u (Size: %u MB)", iso_files.initrd_lba, iso_files.initrd_size / 1024 / 1024);
@@ -608,6 +701,16 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
                 if (iso_files.is_casper) {
                     snprintf(cmdline + clen, sizeof(cmdline) - clen,
                              " persistent persistent-path=/BootManager/persistence/");
+                } else if (iso_files.is_kali) {
+                    // Kali Live uses boot=live + persistence (different from Ubuntu's boot=casper)
+                    if (!str_contains_nocase(cmdline, "boot=live")) {
+                        char temp[512];
+                        k_memcpy(temp, cmdline, sizeof(temp));
+                        snprintf(cmdline, sizeof(cmdline), "boot=live %s", temp);
+                        clen = k_strlen(cmdline);
+                    }
+                    snprintf(cmdline + clen, sizeof(cmdline) - clen,
+                             " persistence persistence-path=/BootManager/persistence/");
                 } else if (str_ends_with_nocase(prof->filename, ".apkovl.tar.gz") ||
                            str_ends_with_nocase(prof->filename, ".tgz")) {
                     snprintf(cmdline + clen, sizeof(cmdline) - clen,
@@ -656,7 +759,7 @@ static void boot_from_usb_msc(usb_device_t *dev, boot_info_t *boot_info, const p
                               iso_files.found_initrd ? initrd_buf : NULL,
                               iso_files.found_initrd ? iso_files.initrd_size : 0,
                               cmdline, boot_info,
-                              NULL, // Standard 80x25 VGA text mode
+                              vbe_get_active_mode(), // Linear Framebuffer or fallback to text mode
                               0, 0, // 0 MB of 6GB in RAM, no E820 reservation needed!
                               params);
 
@@ -798,7 +901,7 @@ static void boot_in_ram_iso_handoff(uint32_t total_iso_bytes, const iso_boot_fil
                               iso_files->found_initrd ? initrd_buf : NULL,
                               iso_files->found_initrd ? iso_files->initrd_size : 0,
                               kernel_cmdline, boot_info,
-                              NULL, // Standard 80x25 VGA text mode
+                              vbe_get_active_mode(), // Linear Framebuffer or fallback to text mode
                               LINUX_RAM_ISO_PHYS, total_iso_bytes,
                               kernel_params);
 
@@ -882,6 +985,7 @@ static void boot_from_android_mtp(os_entry_t *selected, boot_info_t *boot_info, 
              (uint32_t)(fsize / 1024 / 1024));
 
     iso_boot_files_t iso_files;
+    k_memset(&iso_files, 0, sizeof(iso_files));
     if (iso_find_boot_files(mtp_src, &iso_files) == 0 && iso_files.found_kernel) {
         const char *distro_desc = "Alpine Linux";
         if (iso_files.is_casper) distro_desc = "Ubuntu / Casper Live";
@@ -949,7 +1053,7 @@ static void boot_from_android_mtp(os_entry_t *selected, boot_info_t *boot_info, 
             linux_prepare_boot_params(kernel_buf, (uint32_t)fsize,
                                       NULL, 0,
                                       cmdline, boot_info,
-                                      NULL, 0, 0,
+                                      vbe_get_active_mode(), 0, 0,
                                       raw_params);
 
             xhci_stop(&xhci_ctrl);
@@ -1002,7 +1106,7 @@ static void boot_from_sd_fat(os_entry_t *entry, boot_info_t *boot_info) {
     if (linux_check_kernel_image(kernel_buf, fsize, &kinfo) == 0) {
         linux_boot_params_t *params = (linux_boot_params_t *)LINUX_BOOT_PARAMS_PHYS;
         const char *cmdline = "console=tty0 root=/dev/sda1 rw loglevel=7";
-        linux_prepare_boot_params(kernel_buf, fsize, NULL, 0, cmdline, boot_info, NULL, 0, 0, params);
+        linux_prepare_boot_params(kernel_buf, fsize, NULL, 0, cmdline, boot_info, vbe_get_active_mode(), 0, 0, params);
         sound_kernel_jump_tone();
         linux_boot_jump((uint32_t)kernel_buf + kinfo.protected_mode_offset,
                         LINUX_KERNEL_LOAD_PHYS,
@@ -1048,6 +1152,14 @@ void c_main(boot_info_t *boot_info) {
     vga_init();
     sound_boot_tone();
     timer_init();
+
+    if (vbe_is_active()) {
+        const vbe_mode_info_t *m = vbe_get_active_mode();
+        log_info("VBE", "Active Graphics Console: %ux%ux%u LFB at 0x%08X (HDMI Ready)",
+                 m->x_res, m->y_res, m->bits_per_pixel, m->phys_base_ptr);
+    } else {
+        log_info("VBE", "Active Console: Standard VGA 80x25 Text Mode (0xB8000)");
+    }
 
     // 2. Initialize Persistent SD Disk Logging EARLY
     disk_log_init(boot_info);
@@ -1132,12 +1244,9 @@ void c_main(boot_info_t *boot_info) {
                     log_info("STAGE3", "Phase 4 USB Enumeration Successfully Verified!");
                     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-                    if (current_dev.has_adb || current_dev.has_mtp) {
+                    if (current_dev.has_adb && !active_adb_session.is_connected) {
                         k_memcpy(&external_usb_dev, &current_dev, sizeof(usb_device_t));
                         external_usb_detected = true;
-                    }
-
-                    if (external_usb_detected && external_usb_dev.has_adb && !active_adb_session.is_connected) {
                         log_info("STAGE3", "Port %u: Android ADB interface detected! Initializing ADB Root Bridge...", p);
                         if (adb_init_session(&external_usb_dev, &active_adb_session) == 0) {
                             log_info("STAGE3", "ADB Root Bridge connected! Phone can switch to USB Mass Storage (0 MB in RAM).");
@@ -1150,7 +1259,9 @@ void c_main(boot_info_t *boot_info) {
                         handle_msc_device(&current_dev, p);
                     } else if (current_dev.dev_desc.bDeviceClass == USB_CLASS_HUB) {
                         check_and_handle_hub(&xhci_ctrl, &current_dev, p);
-                    } else if (external_usb_detected && external_usb_dev.has_mtp && !active_adb_session.is_connected && !active_mtp_session.session_active) {
+                    } else if (current_dev.has_mtp && !active_adb_session.is_connected && !active_mtp_session.session_active) {
+                        k_memcpy(&external_usb_dev, &current_dev, sizeof(usb_device_t));
+                        external_usb_detected = true;
                         log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
                         int mtp_res = mtp_init_session(&external_usb_dev, &active_mtp_session);
                         if (mtp_res == 0) {
@@ -1165,24 +1276,30 @@ void c_main(boot_info_t *boot_info) {
                             phone_save_boot_log(&active_adb_session, &active_mtp_session);
                         }
                     } else if (!current_dev.has_msc && !current_dev.has_adb && !current_dev.has_mtp && current_dev.dev_desc.bDeviceClass != USB_CLASS_HUB) {
-                        log_info("STAGE3", "Port %u: Attached device (VID 0x%04X, PID 0x%04X) is in Charging/No-Data mode.",
-                                 p, current_dev.dev_desc.idVendor, current_dev.dev_desc.idProduct);
-                        vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
-                        log_info("STAGE3", ">>> PLEASE UNLOCK PHONE AND TAP 'File Transfer / MTP' ON SCREEN! <<<");
-                        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-                        if (!phone_prompted) {
-                            sound_prompt_tone();
-                            phone_prompted = true;
+                        // Try to detect USB HID Boot Keyboard
+                        if (usb_keyboard_try_init(&xhci_ctrl, &current_dev)) {
+                            log_info("STAGE3", "Port %u: External USB Keyboard detected and initialized!", p);
+                        } else if (current_dev.dev_desc.bDeviceClass == 0xE0) {
+                            log_info("STAGE3", "Port %u: Wireless/Bluetooth Controller (VID 0x%04X, PID 0x%04X) active.",
+                                     p, current_dev.dev_desc.idVendor, current_dev.dev_desc.idProduct);
+                        } else {
+                            log_info("STAGE3", "Port %u: Attached device (VID 0x%04X, PID 0x%04X) is in Charging/No-Data mode.",
+                                     p, current_dev.dev_desc.idVendor, current_dev.dev_desc.idProduct);
+                            vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+                            log_info("STAGE3", ">>> PLEASE UNLOCK PHONE AND TAP 'File Transfer / MTP' ON SCREEN! <<<");
+                            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                            if (!phone_prompted) {
+                                sound_prompt_tone();
+                                phone_prompted = true;
+                            }
+                            probed_ports &= ~(1U << p);
                         }
-                        probed_ports &= ~(1U << p);
                     }
                 }
             }
 
-            if (!boot_msc_detected) {
-                disk_log_enable_bios_fallback();
-                diskio_enable_bios_fallback();
-            }
+            // Note: BIOS disk fallback is intentionally NEVER re-enabled after xHCI takeover
+            // because calling real-mode BIOS INT 13h causes BIOS to poll USB and overwrite xHCI state.
 
             // Poll loop: wait if device not yet detected
             for (int poll_iter = 0; poll_iter < 100 && !active_adb_session.is_connected && !mtp_found && !external_msc_detected; poll_iter++) {
@@ -1221,12 +1338,9 @@ void c_main(boot_info_t *boot_info) {
                         log_info("STAGE3", "Phase 4 USB Enumeration Successfully Verified!");
                         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
-                        if (current_dev.has_adb || current_dev.has_mtp) {
+                        if (current_dev.has_adb && !active_adb_session.is_connected) {
                             k_memcpy(&external_usb_dev, &current_dev, sizeof(usb_device_t));
                             external_usb_detected = true;
-                        }
-
-                        if (external_usb_detected && external_usb_dev.has_adb && !active_adb_session.is_connected) {
                             log_info("STAGE3", "Port %u: Android ADB interface detected! Initializing ADB Root Bridge...", p);
                             if (adb_init_session(&external_usb_dev, &active_adb_session) == 0) {
                                 log_info("STAGE3", "ADB Root Bridge connected! Phone can switch to USB Mass Storage (0 MB in RAM).");
@@ -1241,7 +1355,9 @@ void c_main(boot_info_t *boot_info) {
                         } else if (current_dev.dev_desc.bDeviceClass == USB_CLASS_HUB) {
                             check_and_handle_hub(&xhci_ctrl, &current_dev, p);
                             if (external_msc_detected) break;
-                        } else if (external_usb_detected && external_usb_dev.has_mtp && !active_adb_session.is_connected && !active_mtp_session.session_active) {
+                        } else if (current_dev.has_mtp && !active_adb_session.is_connected && !active_mtp_session.session_active) {
+                            k_memcpy(&external_usb_dev, &current_dev, sizeof(usb_device_t));
+                            external_usb_detected = true;
                             log_info("STAGE3", "Android MTP interface detected on Port %u! Initializing MTP session...", p);
                             int mtp_res = mtp_init_session(&external_usb_dev, &active_mtp_session);
                             if (mtp_res == 0) {
@@ -1256,6 +1372,15 @@ void c_main(boot_info_t *boot_info) {
                                 mtp_found = true;
                                 phone_save_boot_log(&active_adb_session, &active_mtp_session);
                                 break;
+                            }
+                        } else if (!current_dev.has_adb && !current_dev.has_mtp && current_dev.dev_desc.bDeviceClass != USB_CLASS_HUB) {
+                            if (usb_keyboard_try_init(&xhci_ctrl, &current_dev)) {
+                                log_info("STAGE3", "Port %u: External USB Keyboard detected and initialized!", p);
+                            } else if (current_dev.dev_desc.bDeviceClass == 0xE0) {
+                                log_info("STAGE3", "Port %u: Wireless/Bluetooth Controller (VID 0x%04X, PID 0x%04X) active.",
+                                         p, current_dev.dev_desc.idVendor, current_dev.dev_desc.idProduct);
+                            } else {
+                                probed_ports &= ~(1U << p);
                             }
                         } else {
                             probed_ports &= ~(1U << p);
@@ -1308,21 +1433,23 @@ void c_main(boot_info_t *boot_info) {
                     k_memset(&current_dev, 0, sizeof(current_dev));
                     if (usb_probe_port(&xhci_ctrl, p, &current_dev) == 0) {
                         probed_ports |= (1U << p);
-                        if (current_dev.has_adb || current_dev.has_mtp) {
+                        if (current_dev.has_adb && !active_adb_session.is_connected) {
                             k_memcpy(&external_usb_dev, &current_dev, sizeof(usb_device_t));
                             external_usb_detected = true;
-                        }
-                        if (external_usb_detected && external_usb_dev.has_adb && !active_adb_session.is_connected) {
                             adb_init_session(&external_usb_dev, &active_adb_session);
                         }
                         if (current_dev.has_msc) {
                             handle_msc_device(&current_dev, p);
                         } else if (current_dev.dev_desc.bDeviceClass == USB_CLASS_HUB) {
                             check_and_handle_hub(&xhci_ctrl, &current_dev, p);
-                        } else if (external_usb_detected && external_usb_dev.has_mtp && !active_adb_session.is_connected && !active_mtp_session.session_active) {
+                        } else if (current_dev.has_mtp && !active_adb_session.is_connected && !active_mtp_session.session_active) {
+                            k_memcpy(&external_usb_dev, &current_dev, sizeof(usb_device_t));
+                            external_usb_detected = true;
                             if (mtp_init_session(&external_usb_dev, &active_mtp_session) == 0) {
                                 mtp_found = true;
                             }
+                        } else if (!current_dev.has_adb && !current_dev.has_mtp && current_dev.dev_desc.bDeviceClass != USB_CLASS_HUB) {
+                            usb_keyboard_try_init(&xhci_ctrl, &current_dev);
                         }
                     }
                 }
@@ -1360,7 +1487,7 @@ void c_main(boot_info_t *boot_info) {
                         log_info("BOOT", "Image '%s' is already active on USB Mass Storage LUN 0!", sel_img->title);
                         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                         disk_log_flush();
-                        boot_from_usb_msc(&external_usb_dev, boot_info, prof);
+                        boot_from_usb_msc(&external_usb_dev, boot_info, prof, &sel_img->iso_files);
                         break;
                     }
 
@@ -1370,7 +1497,7 @@ void c_main(boot_info_t *boot_info) {
                     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                     disk_log_flush();
 
-                    int upd_res = adb_update_mass_storage_file(&active_adb_session, sel_img->filename, prof_path[0] ? prof_path : NULL, sel_img->is_windows);
+                    int upd_res = adb_update_mass_storage_file(&active_adb_session, sel_img->filename, prof_path[0] ? prof_path : NULL, str_ends_with_nocase(sel_img->filename, ".iso"));
                     if (upd_res == 0) {
                         for (int w = 0; w < 200000; w++) io_wait();
                         uint32_t last_lba = 0, block_sz = 0;
@@ -1382,7 +1509,7 @@ void c_main(boot_info_t *boot_info) {
                         log_info("BOOT", "Booting '%s' with Direct Block Access (0 MB in RAM)...", sel_img->title);
                         vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                         disk_log_flush();
-                        boot_from_usb_msc(&external_usb_dev, boot_info, prof);
+                        boot_from_usb_msc(&external_usb_dev, boot_info, prof, &sel_img->iso_files);
                         break;
                     } else {
                         log_error("STAGE3", "Hot-swap failed (%d), falling back to full gadget switch...", upd_res);
@@ -1394,7 +1521,7 @@ void c_main(boot_info_t *boot_info) {
                          sel_img->filename, prof_path[0] ? prof->filename : "Clean Session");
                 vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                 disk_log_flush();
-                int trg_res = adb_trigger_mass_storage(&active_adb_session, sel_img->filename, prof_path[0] ? prof_path : NULL, sel_img->is_windows);
+                int trg_res = adb_trigger_mass_storage(&active_adb_session, sel_img->filename, prof_path[0] ? prof_path : NULL, false);
                 disk_log_flush();
 
                 if (trg_res != 0 && trg_res != -2) {
@@ -1427,7 +1554,7 @@ void c_main(boot_info_t *boot_info) {
                         }
                     }
 
-                    boot_from_usb_msc(&external_usb_dev, boot_info, prof);
+                    boot_from_usb_msc(&external_usb_dev, boot_info, prof, &sel_img->iso_files);
                     break;
                 } else {
                     vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
@@ -1485,7 +1612,7 @@ void c_main(boot_info_t *boot_info) {
                             log_info("BOOT", "Booting '%s' directly from active USB Mass Storage Block Device...", selected->title);
                             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                             disk_log_flush();
-                            boot_from_usb_msc(target_msc, boot_info, prof);
+                            boot_from_usb_msc(target_msc, boot_info, prof, &selected->iso_files);
                             ums_booted = true;
                             break;
                         }
@@ -1500,7 +1627,7 @@ void c_main(boot_info_t *boot_info) {
                             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                             disk_log_flush();
 
-                            int upd = adb_update_mass_storage_file(&active_adb_session, selected->filename, prof_path[0] ? prof_path : NULL, selected->is_windows);
+                            int upd = adb_update_mass_storage_file(&active_adb_session, selected->filename, prof_path[0] ? prof_path : NULL, str_ends_with_nocase(selected->filename, ".iso"));
                             if (upd == 0) {
                                 for (int w = 0; w < 200000; w++) io_wait();
                                 uint32_t last_lba = 0, block_sz = 0;
@@ -1511,7 +1638,7 @@ void c_main(boot_info_t *boot_info) {
                                 log_info("BOOT", "USB Mass Storage updated! Booting '%s' directly...", selected->title);
                                 vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
                                 disk_log_flush();
-                                boot_from_usb_msc(&external_usb_dev, boot_info, prof);
+                                boot_from_usb_msc(&external_usb_dev, boot_info, prof, &selected->iso_files);
                                 ums_booted = true;
                                 break;
                             } else {
@@ -1536,7 +1663,7 @@ void c_main(boot_info_t *boot_info) {
                             disk_log_flush();
                             phone_save_boot_log(&active_adb_session, &active_mtp_session);
 
-                            int trg = adb_trigger_mass_storage(&active_adb_session, selected->filename, prof_path[0] ? prof_path : NULL, selected->is_windows);
+                            int trg = adb_trigger_mass_storage(&active_adb_session, selected->filename, prof_path[0] ? prof_path : NULL, false);
                             disk_log_flush();
 
                             // Try to reprobe as MSC regardless of trigger result.
@@ -1563,7 +1690,7 @@ void c_main(boot_info_t *boot_info) {
                                         }
                                     }
 
-                                    boot_from_usb_msc(&external_usb_dev, boot_info, prof);
+                                    boot_from_usb_msc(&external_usb_dev, boot_info, prof, &selected->iso_files);
                                     ums_booted = true;
                                     break;
                                 } else {
@@ -1594,7 +1721,7 @@ void c_main(boot_info_t *boot_info) {
                     if (!ums_booted) {
                         if (selected->approach == BOOT_APPROACH_BLOCK_ON_DEMAND || selected->approach == BOOT_APPROACH_CHAINLOAD) {
                             if (selected->storage_type == OS_STORAGE_BLOCK_USB) {
-                                boot_from_usb_msc(selected->usb_dev, boot_info, prof);
+                                boot_from_usb_msc(selected->usb_dev, boot_info, prof, &selected->iso_files);
                             } else if (selected->storage_type == OS_STORAGE_BLOCK_SD) {
                                 boot_from_sd_fat(selected, boot_info);
                             }
@@ -1615,7 +1742,7 @@ void c_main(boot_info_t *boot_info) {
                         }
                     }
                 }
-                break;
+                continue; // Return to menu if boot returned or was cancelled
             }
 
             case MENU_ACTION_DIAGNOSTICS:

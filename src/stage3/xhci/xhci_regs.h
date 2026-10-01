@@ -7,6 +7,12 @@ static inline uint32_t xhci_read32(uintptr_t addr) {
     return *(volatile uint32_t *)addr;
 }
 
+static inline uint64_t xhci_read64(uintptr_t addr) {
+    uint32_t lo = *(volatile uint32_t *)addr;
+    uint32_t hi = *(volatile uint32_t *)(addr + 4);
+    return ((uint64_t)hi << 32) | lo;
+}
+
 static inline void xhci_write32(uintptr_t addr, uint32_t val) {
     *(volatile uint32_t *)addr = val;
 }

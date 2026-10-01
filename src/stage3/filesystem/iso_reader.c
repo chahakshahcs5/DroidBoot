@@ -272,21 +272,8 @@ static void search_dir_heuristic(boot_source_t *iso_src, uint32_t dir_lba, uint3
 int iso_find_boot_files(boot_source_t *iso_src, iso_boot_files_t *out_files) {
     if (!iso_src || !out_files) return -1;
 
-    out_files->found_kernel = false;
-    out_files->found_initrd = false;
-    out_files->is_casper = false;
-    out_files->is_windows = false;
-    out_files->bootmgr_lba = 0;
-    out_files->bootmgr_size = 0;
-    out_files->boot_sector_lba = 0;
+    k_memset(out_files, 0, sizeof(iso_boot_files_t));
     out_files->boot_sector_size = 512;
-    out_files->kernel_lba = 0;
-    out_files->kernel_size = 0;
-    out_files->initrd_lba = 0;
-    out_files->initrd_size = 0;
-    out_files->volume_id[0] = '\0';
-    out_files->title[0] = '\0';
-    out_files->cmdline[0] = '\0';
 
     // Step 0: Read Sector 16 (0x8000) - Primary Volume Descriptor to grab Volume ID
     uint8_t pvd_sector[2048];
@@ -304,7 +291,39 @@ int iso_find_boot_files(boot_source_t *iso_src, iso_boot_files_t *out_files) {
     static parsed_boot_config_t cfg;
     k_memset(&cfg, 0, sizeof(cfg));
     if (boot_cfg_find_and_parse(iso_src, iso_src->name, &cfg) == 0 && cfg.count > 0) {
+        bool is_kali = str_contains_nocase(out_files->volume_id, "kali");
         parsed_boot_entry_t *entry = &cfg.entries[cfg.default_index];
+        parsed_boot_entry_t *alt_entry = NULL;
+
+        if (is_kali) {
+            out_files->is_kali = true;
+            parsed_boot_entry_t *live_entry = NULL;
+            parsed_boot_entry_t *text_entry = NULL;
+            parsed_boot_entry_t *gui_entry = NULL;
+
+            for (uint32_t e = 0; e < cfg.count; e++) {
+                parsed_boot_entry_t *cand = &cfg.entries[e];
+                if (!cand->valid) continue;
+                if (str_contains_nocase(cand->title, "live") && !str_contains_nocase(cand->title, "forensic") && !str_contains_nocase(cand->title, "failsafe")) {
+                    if (!live_entry) live_entry = cand;
+                } else if (str_contains_nocase(cand->title, "graphical")) {
+                    if (!gui_entry) gui_entry = cand;
+                } else if (str_contains_nocase(cand->title, "install")) {
+                    if (!text_entry) text_entry = cand;
+                }
+            }
+
+            // Prefer Live entry (for persistence support). Fall back to installer entries only if no Live entry exists.
+            if (live_entry) {
+                entry = live_entry;
+            } else if (text_entry) {
+                entry = text_entry;
+                alt_entry = gui_entry;
+            } else if (gui_entry) {
+                entry = gui_entry;
+            }
+        }
+
         log_info("ISO", "Applying boot configuration from '%s': '%s'", cfg.config_source, entry->title);
 
         uint32_t klba = 0, ksz = 0;
@@ -323,9 +342,24 @@ int iso_find_boot_files(boot_source_t *iso_src, iso_boot_files_t *out_files) {
             log_info("ISO", "  Resolved Initrd : '%s' -> LBA %u (%u MB)", entry->initrd_path, ilba, isz / 1024 / 1024);
         }
 
+        if (alt_entry && alt_entry->initrd_path[0]) {
+            uint32_t ailba = 0, aisz = 0;
+            if (iso_find_file(iso_src, alt_entry->initrd_path, &ailba, &aisz) == 0 && aisz > 0) {
+                out_files->alt_initrd_lba = ailba;
+                out_files->alt_initrd_size = aisz;
+                out_files->has_alt_initrd = true;
+                log_info("ISO", "  Resolved Alt Initrd (Graphical): '%s' -> LBA %u (%u MB)",
+                         alt_entry->initrd_path, ailba, aisz / 1024 / 1024);
+            }
+        }
+
         if (out_files->found_kernel) {
             bool is_kali = str_contains_nocase(out_files->volume_id, "kali");
-            if (is_kali && str_contains_nocase(entry->title, "graphical")) {
+            if (is_kali && str_contains_nocase(entry->title, "live")) {
+                const char *ktitle = "Kali Linux Live";
+                for (int i = 0; ktitle[i] && i < 95; i++) out_files->title[i] = ktitle[i];
+                out_files->title[95] = '\0';
+            } else if (is_kali && str_contains_nocase(entry->title, "graphical")) {
                 const char *ktitle = "Kali Linux (Graphical Install)";
                 for (int i = 0; ktitle[i] && i < 95; i++) out_files->title[i] = ktitle[i];
                 out_files->title[95] = '\0';
@@ -435,10 +469,17 @@ int iso_find_boot_files(boot_source_t *iso_src, iso_boot_files_t *out_files) {
             }
 
             const char *wtitle = "Windows 10/11 Installer";
+            if (str_contains_nocase(out_files->volume_id, "HBCD") || str_contains_nocase(iso_src->name, "HBCD")) {
+                wtitle = "Hiren's BootCD PE (Windows 11 Live)";
+            } else if (str_contains_nocase(out_files->volume_id, "STRELEC") || str_contains_nocase(iso_src->name, "STRELEC")) {
+                wtitle = "Sergei Strelec (Windows Live)";
+            } else if (str_contains_nocase(out_files->volume_id, "WINPE") || str_contains_nocase(iso_src->name, "WINPE")) {
+                wtitle = "Windows Live WinPE";
+            }
             for (int i = 0; wtitle[i] && i < 95; i++) out_files->title[i] = wtitle[i];
             out_files->title[95] = '\0';
-            log_info("ISO", "  Windows installation media verified (Volume: '%s', boot LBA %u)",
-                     out_files->volume_id, out_files->boot_sector_lba);
+            log_info("ISO", "  Windows media verified: '%s' (Volume: '%s', boot LBA %u)",
+                     wtitle, out_files->volume_id, out_files->boot_sector_lba);
             return 0;
         }
     }

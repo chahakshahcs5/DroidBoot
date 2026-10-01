@@ -23,6 +23,7 @@ STAGE3_SRCS_C := $(SRC_DIR)/stage3/core/main.c \
                  $(SRC_DIR)/stage3/debug/vga.c \
                  $(SRC_DIR)/stage3/debug/disk_log.c \
                  $(SRC_DIR)/stage3/bios/bios_disk.c \
+                 $(SRC_DIR)/stage3/bios/int13_emu.c \
                  $(SRC_DIR)/stage3/bios/vbe.c \
                  $(SRC_DIR)/stage3/memory/heap.c \
                  $(SRC_DIR)/stage3/memory/memory.c \
@@ -30,6 +31,7 @@ STAGE3_SRCS_C := $(SRC_DIR)/stage3/core/main.c \
                  $(SRC_DIR)/stage3/xhci/xhci.c \
                  $(SRC_DIR)/stage3/usb/usb.c \
                  $(SRC_DIR)/stage3/usb/usb_msc.c \
+                 $(SRC_DIR)/stage3/usb/usb_hid.c \
                  $(SRC_DIR)/stage3/mtp/mtp.c \
                  $(SRC_DIR)/stage3/filesystem/ff.c \
                  $(SRC_DIR)/stage3/filesystem/diskio.c \
@@ -44,7 +46,8 @@ STAGE3_SRCS_C := $(SRC_DIR)/stage3/core/main.c \
                  $(SRC_DIR)/stage3/ui/menu.c
 
 STAGE3_SRCS_S := $(SRC_DIR)/stage3/core/entry.S \
-                 $(SRC_DIR)/stage3/bios/bios_thunk.S
+                 $(SRC_DIR)/stage3/bios/bios_thunk.S \
+                 $(SRC_DIR)/stage3/bios/int13_hook.S
 
 STAGE3_OBJS_RELEASE := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/release/%.o, $(STAGE3_SRCS_C)) \
                        $(patsubst $(SRC_DIR)/%.S, $(BUILD_DIR)/release/%.o, $(STAGE3_SRCS_S))

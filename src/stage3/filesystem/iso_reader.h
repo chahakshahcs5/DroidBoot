@@ -14,6 +14,10 @@ typedef struct iso_boot_files {
     bool     found_initrd;
     bool     is_casper;
     bool     is_windows;
+    bool     is_kali;
+    uint32_t alt_initrd_lba;
+    uint32_t alt_initrd_size;
+    bool     has_alt_initrd;
     uint32_t bootmgr_lba;
     uint32_t bootmgr_size;
     uint32_t boot_sector_lba;

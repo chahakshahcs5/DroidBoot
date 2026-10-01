@@ -7,6 +7,7 @@
 #include "../image/os_scanner.h"
 
 static bool adb_str_contains(const char *haystack, const char *needle);
+static bool adb_str_contains_nocase(const char *haystack, const char *needle);
 static bool adb_str_ends_with_nocase(const char *str, const char *suffix);
 static bool adb_str_eq_nocase(const char *s1, const char *s2);
 static bool adb_str_starts_with_nocase(const char *str, const char *prefix);
@@ -405,6 +406,20 @@ static bool adb_str_contains(const char *haystack, const char *needle) {
     return false;
 }
 
+static inline char adb_tolower(char c) {
+    return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+}
+
+static bool adb_str_contains_nocase(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return false;
+    for (int i = 0; haystack[i]; i++) {
+        int j = 0;
+        while (haystack[i + j] && needle[j] && adb_tolower(haystack[i + j]) == adb_tolower(needle[j])) j++;
+        if (!needle[j]) return true;
+    }
+    return false;
+}
+
 static bool adb_str_ends_with_nocase(const char *str, const char *suffix) {
     if (!str || !suffix) return false;
     int str_len = 0, suf_len = 0;
@@ -558,13 +573,16 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path, const
                  "if [ -z \"$F\" ] || [ ! -f \"$F\" ]; then echo ERR_NO_FILE; exit 2; fi; "
                  "L0=\"%s/functions/%s/lun.0\"; "
                  "mkdir -p \"$L0\" 2>/dev/null; "
+                 "echo 1 > \"$L0/removable\" 2>/dev/null; "
+                 "echo \"\" > \"$L0/file\" 2>/dev/null; "
                  "echo %d > \"$L0/cdrom\" 2>/dev/null; "
                  "echo %d > \"$L0/ro\" 2>/dev/null; "
                  "echo \"$F\" > \"$L0/file\" 2>/dev/null; "
-                 "if [ ! -s \"$L0/file\" ]; then echo ERR_LUN_FAIL; exit 3; fi; "
                  "L1=\"%s/functions/%s/lun.1\"; "
                  "if [ -n \"$PROF\" ] && [ -f \"$PROF\" ]; then "
                  "  mkdir -p \"$L1\" 2>/dev/null; "
+                 "  echo 1 > \"$L1/removable\" 2>/dev/null; "
+                 "  echo \"\" > \"$L1/file\" 2>/dev/null; "
                  "  echo 0 > \"$L1/cdrom\" 2>/dev/null; "
                  "  echo 0 > \"$L1/ro\" 2>/dev/null; "
                  "  echo \"$PROF\" > \"$L1/file\" 2>/dev/null; "
@@ -574,15 +592,45 @@ int adb_trigger_mass_storage(adb_session_t *session, const char *iso_path, const
                  "[ -z \"$U\" ] && U=$(ls /sys/class/udc 2>/dev/null | head -1); "
                  "if [ -z \"$C\" ] || [ -z \"$U\" ]; then echo ERR_NO_UDC; exit 4; fi; "
                  "echo OK_SWITCHING:\"$F\"; "
-                 "(sleep 2; echo \"\" > %s/UDC 2>/dev/null; rm -f \"$C\"/f* 2>/dev/null; "
+                 "(sleep 1; echo \"\" > %s/UDC 2>/dev/null; "
+                 "echo 1 > \"%s/functions/%s/lun.0/removable\" 2>/dev/null; "
+                 "echo \"\" > \"%s/functions/%s/lun.0/file\" 2>/dev/null; "
+                 "echo %d > \"%s/functions/%s/lun.0/cdrom\" 2>/dev/null; "
+                 "echo %d > \"%s/functions/%s/lun.0/ro\" 2>/dev/null; "
+                 "echo \"$F\" > \"%s/functions/%s/lun.0/file\" 2>/dev/null; "
+                 "if [ -n \"$PROF\" ] && [ -f \"$PROF\" ]; then "
+                 "  mkdir -p \"%s/functions/%s/lun.1\" 2>/dev/null; "
+                 "  echo 1 > \"%s/functions/%s/lun.1/removable\" 2>/dev/null; "
+                 "  echo \"\" > \"%s/functions/%s/lun.1/file\" 2>/dev/null; "
+                 "  echo 0 > \"%s/functions/%s/lun.1/cdrom\" 2>/dev/null; "
+                 "  echo 0 > \"%s/functions/%s/lun.1/ro\" 2>/dev/null; "
+                 "  echo \"$PROF\" > \"%s/functions/%s/lun.1/file\" 2>/dev/null; "
+                 "fi; "
+                 "rm -f \"$C\"/f* 2>/dev/null; "
                  "ln -s %s/functions/%s \"$C/f1\" 2>/dev/null; "
                  "[ -d %s/functions/ffs.adb ] && ln -s %s/functions/ffs.adb \"$C/f2\" 2>/dev/null; "
                  "setprop sys.usb.state mass_storage,adb 2>/dev/null || setprop sys.usb.state mass_storage 2>/dev/null; "
                  "echo \"$U\" > %s/UDC 2>/dev/null) &"
                  "'",
-                 req_name, prof_name, gadget_dir, func_name, cdrom_val, ro_val,
-                 gadget_dir, func_name, gadget_dir, gadget_dir,
-                 gadget_dir, gadget_dir, func_name, gadget_dir, gadget_dir, gadget_dir);
+                 req_name, prof_name,
+                 gadget_dir, func_name, cdrom_val, ro_val,
+                 gadget_dir, func_name,
+                 gadget_dir, gadget_dir,
+                 gadget_dir,
+                 gadget_dir, func_name,
+                 gadget_dir, func_name,
+                 cdrom_val, gadget_dir, func_name,
+                 ro_val, gadget_dir, func_name,
+                 gadget_dir, func_name,
+                 gadget_dir, func_name,
+                 gadget_dir, func_name,
+                 gadget_dir, func_name,
+                 gadget_dir, func_name,
+                 gadget_dir, func_name,
+                 gadget_dir, func_name,
+                 gadget_dir, func_name,
+                 gadget_dir, gadget_dir,
+                 gadget_dir);
     } else {
         snprintf(switch_cmd, sizeof(switch_cmd),
                  "su -c '"
@@ -680,12 +728,14 @@ int adb_update_mass_storage_file(adb_session_t *session, const char *iso_path, c
              "DONE=0; "
              "for M in /config/usb_gadget/*/functions/mass_storage* /sys/kernel/config/usb_gadget/*/functions/mass_storage*; do "
              "  if [ -d \"$M\" ]; then "
+             "    echo 1 > \"$M/lun.0/removable\" 2>/dev/null; "
              "    echo \"\" > \"$M/lun.0/file\" 2>/dev/null; "
              "    echo $CDROM > \"$M/lun.0/cdrom\" 2>/dev/null; "
              "    echo $RO > \"$M/lun.0/ro\" 2>/dev/null; "
              "    echo \"$F\" > \"$M/lun.0/file\" 2>/dev/null; "
              "    if [ -n \"$PROF\" ] && [ -f \"$PROF\" ]; then "
              "      mkdir -p \"$M/lun.1\" 2>/dev/null; "
+             "      echo 1 > \"$M/lun.1/removable\" 2>/dev/null; "
              "      echo \"\" > \"$M/lun.1/file\" 2>/dev/null; "
              "      echo 0 > \"$M/lun.1/cdrom\" 2>/dev/null; "
              "      echo 0 > \"$M/lun.1/ro\" 2>/dev/null; "
@@ -753,7 +803,7 @@ int adb_scan_persistence_profiles(adb_session_t *session, struct os_entry *entry
         if (*s == '/' || *s == '\\') p_iso = s + 1;
     }
     int stem_len = 0;
-    while (p_iso[stem_len] && stem_len < 40) {
+    while (p_iso[stem_len] && stem_len < 47) {
         iso_stem[stem_len] = p_iso[stem_len];
         stem_len++;
     }
@@ -792,6 +842,23 @@ int adb_scan_persistence_profiles(adb_session_t *session, struct os_entry *entry
                 if (*label_part == '_') label_part++;
             } else if (entry->iso_files.is_casper && (adb_str_eq_nocase(base, "casper-rw") || adb_str_starts_with_nocase(base, "casper-rw_"))) {
                 matches = true;
+            } else if (entry->iso_files.is_casper) {
+                // Broad Casper/Ubuntu match: any .casper-rw file that contains
+                // "ubuntu" or the volume label in its name is associated.
+                bool has_casper_ext = false;
+                for (const char *x = base; *x; x++) {
+                    if (x[0] == '.' && adb_str_eq_nocase(x, ".casper-rw")) {
+                        has_casper_ext = true;
+                        break;
+                    }
+                }
+                if (has_casper_ext) {
+                    if (adb_str_contains_nocase(base, "ubuntu") ||
+                        adb_str_contains_nocase(base, "casper") ||
+                        (entry->iso_files.volume_id[0] && adb_str_contains_nocase(base, entry->iso_files.volume_id))) {
+                        matches = true;
+                    }
+                }
             }
 
             if (!matches) {

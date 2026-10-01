@@ -128,7 +128,7 @@ int usb_control_transfer(usb_device_t *dev, usb_setup_packet_t *setup, void *dat
     if (idx >= EP_RING_TRBS - 1) { idx = 0; dev->ep0_cycle_state ^= 1; }
     trb_status->parameter = 0;
     trb_status->status = 0;
-    uint32_t status_dir = (len > 0 && !(setup->bmRequestType & 0x80)) ? (1U << 16) : 0; // Status IN for OUT transfers
+    uint32_t status_dir = (len == 0 || !(setup->bmRequestType & 0x80)) ? (1U << 16) : 0; // Status IN for No-Data or OUT transfers
     trb_status->control = TRB_TYPE(TRB_STATUS) | TRB_IOC | status_dir | (dev->ep0_cycle_state ? 1U : 0U);
 
     dev->ep0_enqueue_idx = idx;
@@ -556,9 +556,11 @@ int usb_probe_port(xhci_controller_t *ctrl, uint8_t port_num, usb_device_t *out_
         if (msc_cfg == 0) {
             usb_msc_init_device(out_dev);
         }
-    } else if (out_dev->has_adb) {
+    }
+    if (out_dev->has_adb) {
         usb_configure_adb_endpoints(out_dev);
-    } else if (out_dev->has_mtp) {
+    }
+    if (out_dev->has_mtp) {
         usb_configure_mtp_endpoints(out_dev);
     }
 
@@ -604,6 +606,8 @@ int usb_configure_bulk_endpoints(usb_device_t *dev, uint8_t in_ep, uint16_t in_m
         }
     }
     uint32_t *slot_ctx = (uint32_t *)slot_ctx_bytes;
+    uint8_t cur_entries = (uint8_t)((slot_ctx[0] >> 27) & 0x1F);
+    if (cur_entries > max_ep_idx) max_ep_idx = cur_entries;
     slot_ctx[0] = (slot_ctx[0] & ~(0x1FU << 27)) | ((uint32_t)max_ep_idx << 27);
 
     // Bulk IN Endpoint Context
@@ -611,50 +615,58 @@ int usb_configure_bulk_endpoints(usb_device_t *dev, uint8_t in_ep, uint16_t in_m
     ep_in_ctx[0] = 0;
     ep_in_ctx[1] = (3U << 1) | (6U << 3) | ((uint32_t)in_max_packet << 16); // CErr=3, EP Type = 6 (Bulk IN)
 
-    // Allocate Bulk IN Ring
-    dev->bulk_in_ring = (xhci_trb_t *)kmalloc_aligned(64 * sizeof(xhci_trb_t), 64);
-    for (int i = 0; i < 64; i++) {
-        dev->bulk_in_ring[i].parameter = 0;
-        dev->bulk_in_ring[i].status = 0;
-        dev->bulk_in_ring[i].control = 0;
+    // Allocate Bulk IN Ring if not already present
+    if (in_ep_ctx_idx < 32 && dev->ep_rings[in_ep_ctx_idx]) {
+        dev->bulk_in_ring = dev->ep_rings[in_ep_ctx_idx];
+    } else {
+        dev->bulk_in_ring = (xhci_trb_t *)kmalloc_aligned(64 * sizeof(xhci_trb_t), 64);
+        for (int i = 0; i < 64; i++) {
+            dev->bulk_in_ring[i].parameter = 0;
+            dev->bulk_in_ring[i].status = 0;
+            dev->bulk_in_ring[i].control = 0;
+        }
+        dev->bulk_in_ring[63].parameter = (uintptr_t)dev->bulk_in_ring;
+        dev->bulk_in_ring[63].control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE_CYCLE;
+        dev->bulk_in_enqueue_idx = 0;
+        dev->bulk_in_cycle_state = 1;
+
+        if (in_ep_ctx_idx < 32) {
+            dev->ep_rings[in_ep_ctx_idx] = dev->bulk_in_ring;
+            dev->ep_enqueue_idx[in_ep_ctx_idx] = 0;
+            dev->ep_cycle_state[in_ep_ctx_idx] = 1;
+        }
     }
-    dev->bulk_in_ring[63].parameter = (uintptr_t)dev->bulk_in_ring;
-    dev->bulk_in_ring[63].control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE_CYCLE;
-    dev->bulk_in_enqueue_idx = 0;
-    dev->bulk_in_cycle_state = 1;
     *(uint64_t *)(&ep_in_ctx[2]) = (uintptr_t)dev->bulk_in_ring | 1U;
     ep_in_ctx[4] = in_max_packet;
-
-    if (in_ep_ctx_idx < 32) {
-        dev->ep_rings[in_ep_ctx_idx] = dev->bulk_in_ring;
-        dev->ep_enqueue_idx[in_ep_ctx_idx] = 0;
-        dev->ep_cycle_state[in_ep_ctx_idx] = 1;
-    }
 
     // Bulk OUT Endpoint Context
     uint32_t *ep_out_ctx = (uint32_t *)(input_ctx + (out_ep_ctx_idx + 1) * ctx_sz);
     ep_out_ctx[0] = 0;
     ep_out_ctx[1] = (3U << 1) | (2U << 3) | ((uint32_t)out_max_packet << 16); // CErr=3, EP Type = 2 (Bulk OUT)
 
-    // Allocate Bulk OUT Ring
-    dev->bulk_out_ring = (xhci_trb_t *)kmalloc_aligned(64 * sizeof(xhci_trb_t), 64);
-    for (int i = 0; i < 64; i++) {
-        dev->bulk_out_ring[i].parameter = 0;
-        dev->bulk_out_ring[i].status = 0;
-        dev->bulk_out_ring[i].control = 0;
+    // Allocate Bulk OUT Ring if not already present
+    if (out_ep_ctx_idx < 32 && dev->ep_rings[out_ep_ctx_idx]) {
+        dev->bulk_out_ring = dev->ep_rings[out_ep_ctx_idx];
+    } else {
+        dev->bulk_out_ring = (xhci_trb_t *)kmalloc_aligned(64 * sizeof(xhci_trb_t), 64);
+        for (int i = 0; i < 64; i++) {
+            dev->bulk_out_ring[i].parameter = 0;
+            dev->bulk_out_ring[i].status = 0;
+            dev->bulk_out_ring[i].control = 0;
+        }
+        dev->bulk_out_ring[63].parameter = (uintptr_t)dev->bulk_out_ring;
+        dev->bulk_out_ring[63].control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE_CYCLE;
+        dev->bulk_out_enqueue_idx = 0;
+        dev->bulk_out_cycle_state = 1;
+
+        if (out_ep_ctx_idx < 32) {
+            dev->ep_rings[out_ep_ctx_idx] = dev->bulk_out_ring;
+            dev->ep_enqueue_idx[out_ep_ctx_idx] = 0;
+            dev->ep_cycle_state[out_ep_ctx_idx] = 1;
+        }
     }
-    dev->bulk_out_ring[63].parameter = (uintptr_t)dev->bulk_out_ring;
-    dev->bulk_out_ring[63].control = TRB_TYPE(TRB_LINK) | TRB_TOGGLE_CYCLE;
-    dev->bulk_out_enqueue_idx = 0;
-    dev->bulk_out_cycle_state = 1;
     *(uint64_t *)(&ep_out_ctx[2]) = (uintptr_t)dev->bulk_out_ring | 1U;
     ep_out_ctx[4] = out_max_packet;
-
-    if (out_ep_ctx_idx < 32) {
-        dev->ep_rings[out_ep_ctx_idx] = dev->bulk_out_ring;
-        dev->ep_enqueue_idx[out_ep_ctx_idx] = 0;
-        dev->ep_cycle_state[out_ep_ctx_idx] = 1;
-    }
 
     // Send Configure Endpoint Command
     xhci_trb_t cfg_cmd;
@@ -1037,9 +1049,10 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
     *enqueue_idx_ptr = idx;
 
     uintptr_t trb_phys = (uintptr_t)trb;
+    uintptr_t db_reg = ctrl->db_regs + slot_id * 4;
+
 
     // Ring endpoint doorbell
-    uintptr_t db_reg = ctrl->db_regs + slot_id * 4;
     xhci_write32(db_reg, doorbell_target);
 
     // Poll Event Ring for Transfer Event
@@ -1050,6 +1063,8 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
 
         if (cycle == ctrl->event_cycle_state) {
             uint32_t type = (evt->control >> TRB_TYPE_SHIFT) & 0x3F;
+            uint8_t cc = (uint8_t)((evt->status >> 24) & 0xFF);
+
             if (type == TRB_TRANSFER_EVENT) {
                 if (evt->parameter == trb_phys) {
                     ctrl->event_dequeue_idx++;
@@ -1061,7 +1076,6 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
                     uintptr_t erdp = (uintptr_t)&ctrl->event_ring[ctrl->event_dequeue_idx];
                     xhci_write64(intr0 + XHCI_INTR_ERDP, erdp | XHCI_ERDP_EHB);
 
-                    uint8_t cc = (uint8_t)((evt->status >> 24) & 0xFF);
                     uint32_t rem = evt->status & 0xFFFFFF;
                     if (transferred_out) {
                         *transferred_out = len - rem;
@@ -1092,7 +1106,8 @@ int usb_bulk_transfer(usb_device_t *dev, uint8_t ep_addr, void *data, uint32_t l
         for (int w = 0; w < 50; w++) io_wait();
     }
 
-    log_error("USB", "Bulk transfer timed out on EP 0x%02X!", ep_addr);
+    log_error("USB", "Bulk transfer timed out on EP 0x%02X! (trb_phys=0x%08X, deq_idx=%u, evt_cycle=%u)",
+              ep_addr, (uint32_t)trb_phys, ctrl->event_dequeue_idx, ctrl->event_cycle_state);
     usb_abort_bulk_endpoint(dev, ep_addr);
     return -100;
 }
@@ -1413,20 +1428,40 @@ int usb_probe_hub_downstream(xhci_controller_t *ctrl, usb_device_t *hub_dev, usb
     }
 
     // 4. Power on all downstream ports
-    for (uint8_t p = 1; p <= num_ports; p++) {
-        usb_setup_packet_t req_pwr;
-        req_pwr.bmRequestType = 0x23; // Host-to-Device, Class, Other/Port
-        req_pwr.bRequest = USB_REQ_SET_FEATURE;
-        req_pwr.wValue = HUB_FEATURE_PORT_POWER;
-        req_pwr.wIndex = p;
-        req_pwr.wLength = 0;
-        usb_control_transfer(hub_dev, &req_pwr, NULL, 0);
+    // Inspect wHubCharacteristics (bytes [3..4] of Hub Descriptor) to determine
+    // power switching mode. Internal laptop hubs with ganged power will STALL on
+    // SET_FEATURE(PORT_POWER) because they don't support per-port switching.
+    //   Bits 0-1: 00 = Ganged power, 01 = Per-port power, 1x = No power switching
+    uint16_t hub_chars = (uint16_t)hub_desc_buf[3] | ((uint16_t)hub_desc_buf[4] << 8);
+    uint8_t power_mode = hub_chars & 0x03;
+
+    if (power_mode == 0x01) {
+        // Per-port power switching: send SET_FEATURE(PORT_POWER) to each port
+        for (uint8_t p = 1; p <= num_ports; p++) {
+            usb_setup_packet_t req_pwr;
+            req_pwr.bmRequestType = 0x23; // Host-to-Device, Class, Other/Port
+            req_pwr.bRequest = USB_REQ_SET_FEATURE;
+            req_pwr.wValue = HUB_FEATURE_PORT_POWER;
+            req_pwr.wIndex = p;
+            req_pwr.wLength = 0;
+            int pwr_res = usb_control_transfer(hub_dev, &req_pwr, NULL, 0);
+            if (pwr_res != 0) {
+                log_warn("HUB", "Port %u: SET_FEATURE(PORT_POWER) returned %d (stall? continuing...)", p, pwr_res);
+            }
+        }
+    } else {
+        // Ganged power or no power switching: ports are always powered.
+        // Skip SET_FEATURE(PORT_POWER) to avoid stall cascade.
+        log_info("HUB", "Hub wHubCharacteristics=0x%04X: %s power. Skipping SET_FEATURE(PORT_POWER).",
+                 hub_chars,
+                 (power_mode == 0x00) ? "Ganged" : "No");
     }
 
     // Wait for power stabilization
     uint32_t settle_ms = (pwr_good > 0) ? (uint32_t)pwr_good * 2 : 50;
     if (settle_ms < 50) settle_ms = 50;
     mdelay(settle_ms);
+
 
     // 5. Probe each downstream port
     for (uint8_t p = 1; p <= num_ports; p++) {

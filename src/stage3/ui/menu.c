@@ -7,6 +7,7 @@
 #include "../memory/memory.h"
 #include "../pci/pci.h"
 #include "../core/rtc.h"
+#include "../usb/usb_hid.h"
 
 extern uint16_t bios_int16_call(uint8_t cmd);
 
@@ -63,26 +64,19 @@ static void console_puts(const char *s) {
 }
 
 static int poll_input_char(void) {
-    // 1. Poll BIOS INT 16h Keyboard Service (universal for laptop built-in and USB keyboards)
-    uint16_t k = bios_int16_call(0x01);
-    if (k != 0) {
-        uint8_t ascii = (uint8_t)(k & 0xFF);
-        uint8_t sc = (uint8_t)(k >> 8);
-        if (ascii != 0) {
-            if (ascii == '\r') return '\n';
-            return (int)ascii;
+    // 0. Poll USB HID Boot Keyboard (external keyboard via xHCI)
+    if (usb_keyboard_is_available()) {
+        int usb_key;
+        if (usb_keyboard_poll(&usb_key) == 0) {
+            return usb_key;
         }
-        // Extended keys without ASCII
-        if (sc == 0x48) return KEY_UP;
-        if (sc == 0x50) return KEY_DOWN;
-        if (sc == 0x4B) return KEY_LEFT;
-        if (sc == 0x4D) return KEY_RIGHT;
-        if (sc == 0x1C) return '\n';
-        if (sc == 0x01) return KEY_ESC;
-        if (sc == 0x0E) return KEY_BACKSPACE;
-        if (sc == 0x4F) return '1';
-        if (sc == 0x51) return '3';
     }
+
+    // Note: BIOS INT 16h is intentionally NOT called here because jumping to
+    // 16-bit real mode while xHCI is active causes BIOS (SeaBIOS) to poll USB
+    // and overwrite xHCI controller event ring registers (e.g. ERDP).
+    // Native USB HID keyboard, PS/2 keyboard controller, and COM1 serial provide
+    // 100% full keyboard support in 32-bit protected mode.
 
     // 2. Poll COM1 Serial UART (only if physical UART is actually present)
     if (serial_is_present() && (inb(0x3F8 + 5) & 0x01)) {

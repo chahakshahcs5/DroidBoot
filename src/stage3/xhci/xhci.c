@@ -394,7 +394,13 @@ void xhci_abort_command_ring(xhci_controller_t *ctrl) {
     log_warn("XHCI", "Aborting stuck Command Ring via CRCR.CA...");
 
     // 1. Trigger Command Abort (CA bit 2 in CRCR)
-    xhci_write32(ctrl->op_regs + XHCI_OP_CRCR, XHCI_CRCR_CA);
+    // CRITICAL: CRCR is a 64-bit register. The upper 32 bits contain the Command Ring
+    // pointer. Using xhci_write32 would zero the upper 32 bits, destroying the ring
+    // pointer and bricking all subsequent commands. We must read the full 64-bit value,
+    // preserve the ring base address (bits 6-63), clear control bits (0-3), and set CA.
+    uint64_t crcr = xhci_read64(ctrl->op_regs + XHCI_OP_CRCR);
+    crcr = (crcr & ~0x0FULL) | XHCI_CRCR_CA;
+    xhci_write64(ctrl->op_regs + XHCI_OP_CRCR, crcr);
 
     // 2. Wait up to 200ms for Command Ring Running (CRR, bit 3) to clear
     int timeout = 2000;
@@ -555,6 +561,25 @@ int xhci_disable_slot(xhci_controller_t *ctrl, uint8_t slot_id) {
         log_info("XHCI", "Slot %u disabled cleanly.", slot_id);
     }
     return res;
+}
+
+void xhci_mask_interrupts(xhci_controller_t *ctrl) {
+    if (!ctrl || !ctrl->op_regs) return;
+
+    // 1. Disable Interrupter 0 (IMAN.IE = 0)
+    if (ctrl->rt_regs) {
+        uintptr_t intr0 = ctrl->rt_regs + 0x20;
+        uint32_t iman = xhci_read32(intr0 + XHCI_INTR_IMAN);
+        iman &= ~XHCI_IMAN_IE;
+        xhci_write32(intr0 + XHCI_INTR_IMAN, iman & ~XHCI_IMAN_IP);
+    }
+
+    // 2. Clear USBCMD.INTE (Interrupter Enable)
+    uint32_t cmd = xhci_read32(ctrl->op_regs + XHCI_OP_USBCMD);
+    cmd &= ~XHCI_CMD_INTE;
+    xhci_write32(ctrl->op_regs + XHCI_OP_USBCMD, cmd);
+
+    log_info("XHCI", "xHCI hardware interrupts masked (controller remains running for polled I/O).");
 }
 
 void xhci_stop(xhci_controller_t *ctrl) {

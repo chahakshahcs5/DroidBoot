@@ -82,13 +82,24 @@ static int mtp_recv_resp(mtp_session_t *s, ptp_container_t *resp) {
 }
 
 int mtp_init_session(usb_device_t *dev, mtp_session_t *session) {
-    if (!dev || !session) return -1;
+    if (!dev || !session || !dev->has_mtp) return -1;
 
     session->usb_dev = dev;
     session->session_id = 1;
     session->transaction_id = 1;
     session->active_storage_id = 0;
     session->session_active = false;
+
+    uint8_t mtp_in_idx = ((dev->mtp_bulk_in_ep & 0x0F) * 2) + 1;
+    uint8_t mtp_out_idx = ((dev->mtp_bulk_out_ep & 0x0F) * 2);
+    if (!dev->ep_rings[mtp_in_idx] || !dev->ep_rings[mtp_out_idx]) {
+        log_info("MTP", "Configuring USB endpoints for MTP communication...");
+        int cfg_res = usb_configure_mtp_endpoints(dev);
+        if (cfg_res != 0) {
+            log_error("MTP", "Failed to configure MTP endpoints (code %d)!", cfg_res);
+            return cfg_res;
+        }
+    }
 
     log_info("MTP", "Sending OpenSession command (Session ID: 1)...");
     int res = mtp_send_cmd(session, PTP_OC_OpenSession, 1, session->session_id, 0, 0);

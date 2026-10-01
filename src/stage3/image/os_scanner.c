@@ -172,13 +172,18 @@ static void scan_usb_msc_device(usb_device_t *msc_dev, os_registry_t *reg) {
 
     // Probe ISO9660 filesystem on the block device
     iso_boot_files_t files;
+    k_memset(&files, 0, sizeof(files));
     int iso_res = iso_find_boot_files(msc_src, &files);
     if (iso_res == 0 && (files.found_kernel || files.is_windows)) {
         os_entry_t *entry = &reg->entries[reg->count];
         k_memset(entry, 0, sizeof(os_entry_t));
 
         if (files.is_windows) {
-            copy_str(entry->title, "Windows 10/11 Installer", sizeof(entry->title));
+            if (files.title[0] != '\0') {
+                copy_str(entry->title, files.title, sizeof(entry->title));
+            } else {
+                copy_str(entry->title, "Windows 10/11 Installer", sizeof(entry->title));
+            }
             copy_str(entry->filename, "windows.iso", sizeof(entry->filename));
             entry->is_windows = true;
             entry->approach = BOOT_APPROACH_CHAINLOAD;
@@ -186,7 +191,7 @@ static void scan_usb_msc_device(usb_device_t *msc_dev, os_registry_t *reg) {
             if (files.title[0] != '\0') {
                 copy_str(entry->title, files.title, sizeof(entry->title));
             } else {
-                copy_str(entry->title, "Kali Linux Installer", sizeof(entry->title));
+                copy_str(entry->title, "Kali Linux", sizeof(entry->title));
             }
             copy_str(entry->filename, "kali-linux-2026.2-installer-amd64.iso", sizeof(entry->filename));
         } else if (files.title[0] != '\0') {
@@ -462,7 +467,12 @@ static void scan_sd_storage(uint8_t boot_drive, os_registry_t *reg) {
                 copy_str(entry->storage_desc, "SD Card FAT32 Partition", sizeof(entry->storage_desc));
                 entry->file_size = fsize;
                 entry->storage_type = OS_STORAGE_BLOCK_SD;
-                entry->approach = BOOT_APPROACH_BLOCK_ON_DEMAND;
+                if (str_contains_nocase(candidate_images[i], "windows") || str_contains_nocase(candidate_images[i], "win10") || str_contains_nocase(candidate_images[i], "win11")) {
+                    entry->is_windows = true;
+                    entry->approach = BOOT_APPROACH_CHAINLOAD;
+                } else {
+                    entry->approach = BOOT_APPROACH_BLOCK_ON_DEMAND;
+                }
                 entry->partition_lba = part1_lba;
 
                 populate_os_persistence_profiles(entry);
@@ -557,6 +567,7 @@ static void scan_ram_storage(os_registry_t *reg) {
         mem_src_obj.src.close = mem_src_close;
 
         iso_boot_files_t iso_files;
+        k_memset(&iso_files, 0, sizeof(iso_files));
         if (iso_find_boot_files(&mem_src_obj.src, &iso_files) == 0 && iso_files.found_kernel) {
             os_entry_t *entry = &reg->entries[reg->count];
             k_memset(entry, 0, sizeof(os_entry_t));
@@ -572,9 +583,9 @@ static void scan_ram_storage(os_registry_t *reg) {
                 if (iso_files.title[0] != '\0') {
                     copy_str(entry->title, iso_files.title, sizeof(entry->title));
                 } else {
-                    copy_str(entry->title, "Kali Linux Installer (In-RAM)", sizeof(entry->title));
+                    copy_str(entry->title, "Kali Linux (In-RAM)", sizeof(entry->title));
                 }
-                copy_str(entry->filename, "kali-linux-installer.iso (In-RAM)", sizeof(entry->filename));
+                copy_str(entry->filename, "kali-linux.iso (In-RAM)", sizeof(entry->filename));
             } else if (str_contains_nocase(vol_id, "alpine") || str_contains_nocase(iso_files.title, "alpine") || str_contains_nocase(iso_files.title, "lts") || !iso_files.is_casper) {
                 copy_str(entry->title, "Alpine Linux Standard", sizeof(entry->title));
                 copy_str(entry->filename, "alpine-standard.iso (In-RAM)", sizeof(entry->filename));
@@ -661,7 +672,12 @@ static void scan_adb_storage(adb_session_t *session, os_registry_t *reg) {
         copy_str(entry->filename, fn, sizeof(entry->filename));
         snprintf(entry->storage_desc, sizeof(entry->storage_desc), "Phone Storage (Root UMS On-Demand)");
         entry->storage_type = OS_STORAGE_MTP_ANDROID;
-        entry->approach = BOOT_APPROACH_MTP_IN_RAM;
+        if (str_contains_nocase(fn, "windows") || str_contains_nocase(fn, "win10") || str_contains_nocase(fn, "win11")) {
+            entry->is_windows = true;
+            entry->approach = BOOT_APPROACH_CHAINLOAD;
+        } else {
+            entry->approach = BOOT_APPROACH_MTP_IN_RAM;
+        }
 
         populate_os_persistence_profiles(entry);
 

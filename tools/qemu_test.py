@@ -9,6 +9,7 @@ import sys
 import time
 import re
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools.qemu_harness import QemuHarness, WORKSPACE_ROOT, BUILD_DIR, DEFAULT_BOOT_IMG
 
 DEFAULT_UBUNTU_ISO = r"C:\Users\chaha\Downloads\ubuntu-26.04.1-desktop-amd64.iso"
@@ -196,6 +197,9 @@ def test_custom_capacity_selection(boot_img=DEFAULT_BOOT_IMG):
         return False
 
     captured_log = harness.run(extra_args=extra_args, interaction_fn=trigger, timeout_sec=30)
+
+    with open(os.path.join(BUILD_DIR, "serial_sizing.log"), "w", encoding="utf-8", errors="ignore") as f:
+        f.write(captured_log)
 
     checks = [
         ("PERSISTENCE OVERLAY CAPACITY SELECTOR", "Capacity selector rendered"),
@@ -470,6 +474,12 @@ def test_kali_msc_boot(boot_img=DEFAULT_BOOT_IMG):
             conn.sendall(b"1\n")
             state["sent_prof"] = True
 
+        if not state.get("sent_mode") and "[INSTALLER] Select installer mode" in current_log:
+            print("[*] Kali installer mode menu detected! Selecting Text Mode [1]...")
+            time.sleep(0.1)
+            conn.sendall(b"1\n")
+            state["sent_mode"] = True
+
         if "HANDING OFF EXECUTION TO LINUX" in current_log:
             time.sleep(0.3)
             return True
@@ -477,11 +487,13 @@ def test_kali_msc_boot(boot_img=DEFAULT_BOOT_IMG):
 
     captured_log = harness.run(extra_args=extra_args, interaction_fn=trigger, timeout_sec=30)
 
+    with open(os.path.join(BUILD_DIR, "serial_kali.log"), "w", encoding="utf-8", errors="ignore") as f:
+        f.write(captured_log)
+
     checks = [
         ("Volume ID: 'Kali Linux amd64 1'", "Kali ISO Volume ID detected"),
-        ("Kali Linux (Graphical Install)", "Kali Linux Graphical Install entry recognized"),
         ("Resolved Kernel : '/install.amd/vmlinuz'", "Kali kernel resolved from ISO"),
-        ("Resolved Initrd : '/install.amd/gtk/initrd.gz'", "Kali GTK initrd resolved from ISO"),
+        ("Resolved Initrd : '/install.amd/initrd.gz'", "Kali Text Mode initrd resolved from ISO"),
         ("Distro Type    : Kali Linux Installer", "Distro Type identified as Kali Linux Installer"),
         ("HANDING OFF EXECUTION TO LINUX", "Kernel handoff reached for Kali Linux")
     ]
@@ -612,6 +624,12 @@ def test_windows_chainload_boot(boot_img=DEFAULT_BOOT_IMG, win_iso_path=None):
             time.sleep(0.1)
             conn.sendall(b"1\n")
             state["sent_prof"] = True
+
+        if not state.get("sent_force") and "Press Enter/Esc to return safely, or 'F' to force chainload:" in current_log:
+            print("[*] Windows safety warning detected! Sending 'F' to test chainloader handoff...")
+            time.sleep(0.1)
+            conn.sendall(b"f\n")
+            state["sent_force"] = True
 
         if "Handing off to Real-Mode VBR Chainloader" in current_log:
             time.sleep(0.3)

@@ -4,8 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define VBE_INFO_BLOCK_PHYS 0x7400
-#define VBE_MODE_INFO_PHYS  0x7600
+#define VBE_INFO_BLOCK_PHYS 0x6000
+#define VBE_MODE_INFO_PHYS  0x6200
 
 #pragma pack(push, 1)
 
@@ -70,5 +70,8 @@ int vbe_get_controller_info(vbe_info_block_t *out_info);
 int vbe_get_mode_info(uint16_t mode, vbe_mode_info_t *out_info);
 int vbe_set_mode(uint16_t mode);
 int vbe_setup_linear_framebuffer(vbe_mode_info_t *out_selected_mode, uint16_t *out_mode_num);
+bool vbe_is_active(void);
+const vbe_mode_info_t *vbe_get_active_mode(void);
+int vbe_restore_text_mode(void);
 
 #endif // VBE_H

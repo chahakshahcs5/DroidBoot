@@ -46,6 +46,7 @@ int  xhci_send_command(xhci_controller_t *ctrl, xhci_trb_t *cmd, xhci_trb_t *eve
 void xhci_abort_command_ring(xhci_controller_t *ctrl);
 int  xhci_enable_slot(xhci_controller_t *ctrl, uint8_t *slot_id_out);
 int  xhci_disable_slot(xhci_controller_t *ctrl, uint8_t slot_id);
+void xhci_mask_interrupts(xhci_controller_t *ctrl);
 void xhci_stop(xhci_controller_t *ctrl);
 
 const char *xhci_cc_to_string(uint8_t cc);
